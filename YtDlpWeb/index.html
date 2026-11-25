@@ -70,7 +70,7 @@ label.chk input{width:16px;height:16px;accent-color:var(--primary)}
 
 /* ---------- 结果列表 ---------- */
 .results{max-height:320px;overflow:auto;border:1px solid var(--border);border-radius:8px}
-.res-head,.res-row{display:grid;grid-template-columns:34px minmax(0,1fr) auto;gap:8px;align-items:center;padding:8px 10px}
+.res-head,.res-row{display:grid;grid-template-columns:34px minmax(0,1fr) auto auto;gap:8px;align-items:center;padding:8px 10px}
 .res-head{background:#fafbfc;border-bottom:1px solid var(--border);font-size:11px;color:var(--muted);font-weight:600}
 .res-row{border-bottom:1px solid #f1f3f5}
 .res-row:last-child{border-bottom:none}
@@ -120,6 +120,7 @@ pre .err{color:var(--err)} pre .warn{color:var(--warn)} pre .ok{color:var(--ok)}
   .res-row{grid-template-columns:34px minmax(0,1fr);row-gap:2px;padding:10px}
   .metas{grid-column:2;grid-template-columns:repeat(4,auto);justify-content:start;gap:10px}
   .metas .m-up{display:none}
+  .pv-btn{grid-column:2;justify-self:start}
   .row-actions .btn{flex:1 1 auto;min-height:44px}
   .btn{min-height:44px}
   .btn.sm{min-height:38px}
@@ -208,6 +209,18 @@ table.ft td.note{white-space:normal;color:var(--muted)}
       <input type="text" id="filter" placeholder="筛选标题…" style="width:150px;font-size:13px;padding:5px 8px">
       <span class="muted" id="count">尚未探测</span></div>
     <div class="results" id="results"><div class="empty">还没有探测结果</div></div>
+    <div id="preview" style="display:none;margin-top:10px;padding:10px;border:1px solid var(--bd,#d0d7de);border-radius:8px">
+      <div style="display:flex;gap:12px;align-items:flex-start">
+        <img id="pvImg" alt="封面" style="width:320px;max-width:45%;border-radius:6px;background:#f6f8fa">
+        <div style="flex:1;min-width:0">
+          <div id="pvMeta" class="muted" style="line-height:1.7"></div>
+          <div style="margin-top:8px;display:flex;gap:8px">
+            <button class="btn sm" id="pvOpen">打开原网页</button>
+            <button class="btn sm" id="pvClose">收起</button>
+          </div>
+        </div>
+      </div>
+    </div>
     <div class="row-actions">
       <button class="btn sm" id="btnAll">全选</button>
       <button class="btn sm" id="btnNone">全不选</button>
@@ -220,6 +233,7 @@ table.ft td.note{white-space:normal;color:var(--muted)}
   <section class="card">
     <div class="card-h"><span class="num">3</span><h2>进度</h2>
       <span class="spacer"></span>
+      <button class="btn sm" id="btnPlay" disabled title="还没有开始下载">边下边播</button>
       <button class="btn sm" id="btnOpen">打开文件夹</button>
       <button class="btn sm danger" id="btnStop" disabled>停止</button></div>
     <div class="progress" id="progress"><div class="bar" id="bar"></div></div>
@@ -302,8 +316,10 @@ table.ft td.note{white-space:normal;color:var(--muted)}
           <div class="chk-list">
             <label class="chk"><input type="checkbox" id="open_after"> 完成后打开文件夹</label>
             <label class="chk"><input type="checkbox" id="net_hard"> 失败后自动换姿势重试</label>
+            <label class="chk"><input type="checkbox" id="play_while"> 边下边播（不影响下载速度）</label>
           </div>
-          <div class="muted" style="margin-top:6px">连接被掐断（10054）时会自动换一套请求方式重来（浏览器指纹 / 分块传输）；关掉后只按当前设置试一次。</div>
+          <div class="muted" style="margin-top:6px">连接被掐断（10054）时会自动换一套请求方式重来（浏览器指纹 / 分块传输）；关掉后只按当前设置试一次。
+            边下边播只对能流式播放的源有效（HLS / mkv / webm）；音视频分离的源与 aria2c 会置灰并说明原因。</div>
         </div>
         <div class="group" style="grid-column:1/-1">
           <h3>访问与身份（解决「探测不到」的关键）</h3>
@@ -419,10 +435,12 @@ const els = {
   btnTrouble:$('btnTrouble'), btnUpdate:$('btnUpdate'), diagBox:$('diagBox'), uaPreset:$('uaPreset'),
   fmtMask:$('fmtMask'), fmtFor:$('fmtFor'), fmtTip:$('fmtTip'), fmtTable:$('fmtTable'),
   fmtBody:$('fmtBody'), fmtLog:$('fmtLog'), fmtLogWrap:$('fmtLogWrap'),
-  fmtClose:$('fmtClose'), fmtUseBest:$('fmtUseBest')
+  fmtClose:$('fmtClose'), fmtUseBest:$('fmtUseBest'),
+  preview:$('preview'), pvImg:$('pvImg'), pvMeta:$('pvMeta'), pvOpen:$('pvOpen'), pvClose:$('pvClose'),
+  btnPlay:$('btnPlay')
 };
 const FIELDS = ['outdir','tpl','mode','merge','fmt','sub','sublang','embedsub','thumb','meta',
-  'pl','items','ignore','open_after','net_hard','rate','proxy','cookie','conc','conc_n','aria','aria_args','flat','extra',
+  'pl','items','ignore','open_after','net_hard','play_while','rate','proxy','cookie','conc','conc_n','aria','aria_args','flat','extra',
   'browser','browser_profile','referer','ua','headers','generic','extractor_args','retries'];
 // UA 预设与模式格式表都来自 /api/config 的 env 段（唯一来源是 ytdlp_core），
 // 页面不再抄一份，避免两端各自漂移；cfg 未到位时按空表处理即可。
@@ -451,6 +469,7 @@ function setBusy(v, kind){
   $('btnTrouble').disabled = v; $('btnUpdate').disabled = v;
   $('btnDownload').disabled = v || checked.size===0; $('mDownload').disabled = v || checked.size===0;
   $('btnStop').disabled = !v;
+  if(!v) setPlayable(false, '还没有开始下载');
   // 移动端底部：任务进行中把「下载」换成「停止」
   $('mDownload').style.display = v ? 'none' : '';
   $('mStop').style.display = v ? '' : 'none';
@@ -458,6 +477,10 @@ function setBusy(v, kind){
   clearInterval(tick);
   if(v){ t0 = Date.now(); tick = setInterval(updateElapsed, 1000); updateElapsed(); }
   else{ els.elapsed.textContent = ''; }
+}
+function setPlayable(ok, reason){
+  els.btnPlay.disabled = !ok;
+  els.btnPlay.title = ok ? '用系统播放器打开正在下载的文件' : (reason || '此源不支持边下边播');
 }
 function updateElapsed(){
   const s = Math.floor((Date.now()-t0)/1000);
@@ -563,6 +586,7 @@ function rowHtml(i){
           <span>${esc(r.dur)}</span><span>${esc(r.res)}</span><span>${esc(r.size)}</span>
           <span class="m-up" title="${esc(r.up)}">${esc(r.up||'-')}</span>
         </div>
+        <button class="btn sm pv-btn" data-i="${i}" title="看封面与详情">预览</button>
       </div>`;
 }
 function renderResults(){
@@ -570,7 +594,7 @@ function renderResults(){
     els.results.innerHTML = '<div class="empty">还没有探测结果</div>';
   }else{
     const head = '<div class="res-head"><span></span><span>标题</span>' +
-      '<div class="metas"><span>时长</span><span>清晰度</span><span>大小</span><span class="m-up">上传者</span></div></div>';
+      '<div class="metas"><span>时长</span><span>清晰度</span><span>大小</span><span class="m-up">上传者</span></div><span></span></div>';
     const idx = visibleIdx();
     const body = idx.length ? idx.map(rowHtml).join('')
       : `<div class="empty">没有匹配「${esc((els.filter.value||'').trim())}」的条目</div>`;
@@ -583,6 +607,12 @@ function renderResults(){
     });
     els.results.querySelectorAll('input[type=checkbox]').forEach(cb=>{
       cb.addEventListener('change', ()=>toggleCheck(+cb.dataset.i));
+    });
+    els.results.querySelectorAll('.pv-btn').forEach(btn=>{
+      btn.addEventListener('click', e=>{
+        e.stopPropagation();   // 行点击是勾选，预览按钮不能顺带切换勾选
+        showPreview(+btn.dataset.i);
+      });
     });
   }
   updateCount();
@@ -603,6 +633,36 @@ function setAll(on){
   renderResults();
 }
 function esc(s){ return String(s??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+/* ---------- 预浏览 ---------- */
+let pvUrl = '';
+function hidePreview(){ els.preview.style.display='none'; pvUrl=''; }
+async function showPreview(i){
+  const r = results[i]; if(!r) return;
+  pvUrl = r.url || '';
+  els.preview.style.display='';
+  els.pvMeta.innerHTML = `<b>${esc(r.title)}</b><br>时长 ${esc(r.dur)} · 清晰度 ${esc(r.res)} · 大小 ${esc(r.size)}<br>上传者 ${esc(r.up||'-')}`;
+  els.pvImg.removeAttribute('src');
+  els.pvImg.alt = '封面加载中…';
+  if(!r.thumb_id){ els.pvImg.alt = '这个条目没有封面地址'; return; }
+  try{
+    const res = await fetch('/api/thumb?id=' + encodeURIComponent(r.thumb_id));
+    if(!res.ok){
+      const j = await res.json().catch(()=>({}));
+      els.pvImg.alt = '封面取不到：' + (j.error || res.status);
+      return;
+    }
+    const blob = await res.blob();
+    els.pvImg.src = await new Promise((ok, no)=>{
+      // 页面 CSP 是 img-src 'self' data:，blob: 会被拦掉，所以转成 data URL
+      const fr = new FileReader();
+      fr.onload = ()=>ok(fr.result);
+      fr.onerror = ()=>no(fr.error);
+      fr.readAsDataURL(blob);
+    });
+    els.pvImg.alt = '封面';
+  }catch(e){ els.pvImg.alt = '封面取不到：' + String(e.message||e); }
+}
 
 /* ---------- SSE ---------- */
 async function stream(url, body, onEvent){
@@ -631,6 +691,7 @@ async function doDetect(silent){
   if(!urls.length){ if(!silent) toast('请先粘贴链接'); return; }
   if(busy){ toast('有任务正在运行'); return; }
   results = []; checked = new Set(); renderResults();
+  hidePreview();
   clearLog(); setBusy(true,'detect'); setStatus('busy','探测中…');
   els.curfile.textContent = '正在解析链接信息…';
   let n = 0;
@@ -672,6 +733,7 @@ async function doDownload(urls, noPlaylist){
         els.detail.textContent = bits.join(' · ') || '—';
         if(ev.file) els.curfile.textContent = '正在下载：'+ev.file;
       }
+      else if(ev.type==='playable'){ setPlayable(ev.ok, ev.reason); }
       else if(ev.type==='log') addLog(ev.text, ev.level);
       else if(ev.type==='cmd') addLog('> '+ev.text, 'cmd');
       else if(ev.type==='error'){ addLog(ev.text,'err'); toast(ev.text); }
@@ -906,6 +968,16 @@ els.btnOpen.addEventListener('click', doOpen);
 els.btnReset.addEventListener('click', doReset);
 els.btnTrouble.addEventListener('click', doTroubleshoot);
 els.btnUpdate.addEventListener('click', doUpdate);
+els.pvClose.addEventListener('click', hidePreview);
+els.pvOpen.addEventListener('click', ()=>{ if(pvUrl) window.open(pvUrl, '_blank', 'noopener'); });
+els.btnPlay.addEventListener('click', async ()=>{
+  try{
+    const res = await fetch('/api/play', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+    const j = await res.json().catch(()=>({}));
+    if(!res.ok){ toast(j.error || '无法播放'); return; }
+    toast('已交给系统播放器');
+  }catch(e){ toast(String(e.message||e)); }
+});
 // User-Agent 快速填充（选项表由服务端下发，见 /api/config 的 env.ua_presets）
 function fillUaPresets(){
   const p = uaPresets();
