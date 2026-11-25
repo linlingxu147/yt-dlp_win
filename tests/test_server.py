@@ -139,6 +139,19 @@ class TestSniffItems(unittest.TestCase):
         items = server.sniff_items_json()["items"]
         self.assertEqual(items[0]["url"], "https://cdn/b.mp4")
 
+    def test_segment_and_manifest_flags_follow_core_rules(self):
+        """网页版靠这两个字段把 HLS 分片折叠掉，判定口径必须和核心一致。"""
+        server.register_sniff_items([
+            {"url": "https://cdn/a.m3u8"}, {"url": "https://cdn/a-1.ts"},
+            {"url": "https://cdn/a.mp4"},
+        ])
+        got = {it["url"]: it for it in server.sniff_items_json()["items"]}
+        self.assertTrue(got["https://cdn/a.m3u8"]["manifest"])
+        self.assertFalse(got["https://cdn/a.m3u8"]["seg"])
+        self.assertTrue(got["https://cdn/a-1.ts"]["seg"])
+        self.assertFalse(got["https://cdn/a.mp4"]["seg"])
+        self.assertFalse(got["https://cdn/a.mp4"]["manifest"])
+
 
 class TestPreviewTokens(unittest.TestCase):
     def setUp(self):

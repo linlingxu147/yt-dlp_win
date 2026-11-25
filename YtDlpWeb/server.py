@@ -28,7 +28,6 @@ import json
 import os
 import re
 import secrets
-import shutil
 import sys
 import tempfile
 import threading
@@ -49,7 +48,7 @@ INDEX_FILE = os.path.join(APP_DIR, "index.html")
 
 PORT_RANGE = core.PORT_RANGE
 APP_ID = "yt-dlp-web"          # 扩展靠它确认「端口上跑的是本项目」，而不是别的服务
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 
 # 唯一被放行的扩展 ID——由 sniffer_extension\manifest.json 里的 "key" 决定（打包后固定不变）。
 # 以前这里是「任何 chrome-extension:// 都放行」，等于让本机的其它扩展也能改配置、
@@ -130,8 +129,8 @@ def save_config(cfg, warn=None):
     return core.save_config(CONFIG_FILE, cfg, warn=warn)
 
 
-def build_download_cmd(cfg, urls, no_playlist=False):
-    return core.build_download_cmd(cfg, urls, no_playlist=no_playlist)
+def build_download_cmd(cfg, urls, no_playlist=False, warn=None):
+    return core.build_download_cmd(cfg, urls, no_playlist=no_playlist, warn=warn)
 
 
 def build_detect_cmd(cfg, urls):
@@ -409,7 +408,10 @@ def run_download(cfg, urls, emit, no_playlist=False, abort=None, keepalive=None)
 
 def _download_attempt(cfg, urls, emit, no_playlist, abort, outdir, keepalive=None):
     """跑一次 yt-dlp，返回 (退出码, 末尾输出, 是否被客户端断开中断, 已完成文件数)。"""
-    cmd = build_download_cmd(cfg, urls, no_playlist=no_playlist)
+    warns = []
+    cmd = build_download_cmd(cfg, urls, no_playlist=no_playlist, warn=warns)
+    for w in warns:
+        emit({"type": "log", "level": "warn", "text": w})
     emit({"type": "cmd", "text": command_text(cmd)})
     if not RUNNER.launch(cmd, outdir, "download", emit, adopt=True):
         return None, "", False, 0
@@ -588,6 +590,10 @@ def register_sniff_items(items, page_url=""):
                 continue
             rec = SNIFF_ITEMS.get(url) or {"url": url, "first_ts": now}
             rec.update({
+                # 分片/清单的判定只有一份定义（ytdlp_core），扩展也照同一套扩展名走；
+                # 网页版据此默认把「有清单时的分片」折叠起来。
+                "seg": core.looks_like_segment(url),
+                "manifest": core.looks_like_manifest(url),
                 "kind": str(it.get("kind") or rec.get("kind") or "")[:16],
                 "size": int(it.get("size") or 0),
                 "source": str(it.get("source") or "")[:80],
@@ -1162,7 +1168,7 @@ class Handler(BaseHTTPRequestHandler):
                 "yt_dlp_path": find_tool("yt-dlp.exe"),
                 "yt_dlp_version": yt_dlp_version(),
                 "ffmpeg": os.path.isfile(os.path.join(BASE_DIR, "ffmpeg.exe")),
-                "aria2c": shutil.which("aria2c") is not None,
+                "aria2c": bool(core.which_tool("aria2c.exe")),
                 # 下载模式、UA 预设只有一份定义（ytdlp_core）：页面按这里的键渲染，
                 # 不再自带一张中文表，改文案不会让两端判据分叉。
                 "modes": [{"key": k, "label": lb} for k, lb in core.MODE_LABELS],
@@ -1300,8 +1306,11 @@ class Handler(BaseHTTPRequestHandler):
             # 只构建不执行：供界面「复制命令」使用
             cfg = load_config()
             urls, bad = sanitize_urls(body.get("urls") or [])
-            cmd = build_download_cmd(cfg, urls, no_playlist=bool(body.get("no_playlist")))
-            return self._json({"cmd": cmd, "text": command_text(cmd), "ignored": bad})
+            warns = []
+            cmd = build_download_cmd(cfg, urls, no_playlist=bool(body.get("no_playlist")),
+                                     warn=warns)
+            return self._json({"cmd": cmd, "text": command_text(cmd), "ignored": bad,
+                               "notes": warns})
 
         if p == "/api/reset":
             cfg = dict(DEFAULT_CONFIG)

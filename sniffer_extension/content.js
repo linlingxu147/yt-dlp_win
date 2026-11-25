@@ -141,6 +141,12 @@
                 addItem(it.url, guessKind(it.url), it.size || 0,
                         msg.type === "net_items" ? "网络响应" : "iframe");
             }
+        } else if (msg.type === "net_items_gone") {
+            let hit = 0;
+            for (const u of (msg.urls || [])) {
+                if (items[u]) { delete items[u]; hit++; }
+            }
+            if (hit) render();
         } else if (msg.type === "toggle_panel") {
             togglePanel(true);
         }

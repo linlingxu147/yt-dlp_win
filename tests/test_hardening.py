@@ -328,5 +328,74 @@ class TestStreamPreviewHelpers(unittest.TestCase):
         self.assertIn("找不到 ffmpeg", msg)
 
 
+class TestToolProbe(unittest.TestCase):
+    """find_tool 找不到时原样返回名字，曾被当成「装好了」用；which_tool 才是可判定的。"""
+
+    def test_which_tool_finds_bundled_binary(self):
+        self.assertTrue(core.which_tool("ffmpeg.exe"))
+
+    def test_which_tool_returns_empty_when_absent(self):
+        self.assertEqual(core.which_tool("definitely-not-a-real-tool-xyz.exe"), "")
+
+
+class TestSegmentRecognition(unittest.TestCase):
+    """HLS/DASH 分片不能当正片下载，清单才是入口。"""
+
+    def test_segments(self):
+        for url in ("https://x/a/seg-1.ts", "https://x/a/seg-1.ts?token=1",
+                    "https://x/v/1.m4s", "https://x/v/1.f4v", "https://x/v/1.m2ts",
+                    "https://x/a/seg.ts#t=3"):
+            self.assertTrue(core.looks_like_segment(url), url)
+
+    def test_non_segments(self):
+        for url in ("https://x/v.mp4", "https://x/p.m3u8", "https://x/v.mp4?x=.ts",
+                    "https://x/mp4", ""):
+            self.assertFalse(core.looks_like_segment(url), url)
+
+    def test_manifests(self):
+        for url in ("https://x/p.m3u8", "https://x/p.mpd", "https://x/p.m3u8?a=1"):
+            self.assertTrue(core.looks_like_manifest(url), url)
+        for url in ("https://x/v.mp4", "https://x/a.ts", ""):
+            self.assertFalse(core.looks_like_manifest(url), url)
+
+
+class TestConcurrencyDefaults(unittest.TestCase):
+    """-N 4 是实测甜点（本机 4.88→6.36 MiB/s，再高反而回落）。"""
+
+    def test_defaults(self):
+        self.assertTrue(core.DEFAULT_CONFIG["conc"])
+        self.assertEqual(str(core.DEFAULT_CONFIG["conc_n"]), "4")
+
+    def test_schema3_migration_upgrades_untouched_config(self):
+        out, _warns = core.coerce_config({"schema_version": 2, "conc": False, "conc_n": "8"})
+        self.assertTrue(out["conc"])
+        self.assertEqual(str(out["conc_n"]), "4")
+        self.assertEqual(int(out["schema_version"]), core.CONFIG_SCHEMA_VERSION)
+
+    def test_schema3_migration_keeps_user_tuned_value(self):
+        out, _warns = core.coerce_config({"schema_version": 2, "conc": True, "conc_n": "12"})
+        self.assertEqual(str(out["conc_n"]), "12")
+
+
+class TestAria2cFallback(unittest.TestCase):
+    """没装 aria2c 时以前会拼出必然失败的 --external-downloader。"""
+
+    def test_missing_aria2c_drops_external_downloader_and_warns(self):
+        warns = []
+        with mock.patch.object(core, "which_tool", return_value=""):
+            cmd = core.build_download_cmd(dict(core.DEFAULT_CONFIG, aria=True),
+                                          ["https://x/v.mp4"], warn=warns)
+        self.assertNotIn("--external-downloader", cmd)
+        self.assertTrue(any("aria2c" in w for w in warns), warns)
+
+    def test_present_aria2c_still_used(self):
+        warns = []
+        with mock.patch.object(core, "which_tool", return_value=r"C:\bin\aria2c.exe"):
+            cmd = core.build_download_cmd(dict(core.DEFAULT_CONFIG, aria=True),
+                                          ["https://x/v.mp4"], warn=warns)
+        self.assertIn("--external-downloader", cmd)
+        self.assertEqual(warns, [])
+
+
 if __name__ == "__main__":
     unittest.main()

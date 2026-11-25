@@ -14,6 +14,11 @@ const APP_ID = "yt-dlp-web";          // 服务端 /api/status 的 app 标识
 const MIME_RE = /^(video\/|audio\/|application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml|ogg))/i;
 const NON_MEDIA_RE = /^(image\/|text\/html|text\/css|application\/javascript|text\/javascript|font\/|text\/plain)/i;
 const MEDIA_EXT = /\.(m3u8|mpd|mp4|flv|ts|m4s|f4v|m2ts|webm|mkv|mov|avi|wmv|mpg|mpeg|mp3|m4a|aac|flac|wav|ogg|opus)(\?|#|$)/i;
+// HLS/DASH 把整片切成几秒一个的分片（.ts/.m4s…），播放器逐个请求，webRequest 全看得见。
+// 分片单独下载没有意义（多数还要 key 解密），真正的入口是 .m3u8/.mpd 清单——
+// 所以「同一标签里已经有清单」时，后续分片直接不收，列表只留能下整片的那条。
+const MANIFEST_RE = /\.(m3u8|mpd)(\?|#|$)/i;
+const SEGMENT_RE = /\.(ts|m4s|f4v|m2ts)(\?|#|$)/i;
 
 // MV3 的 Service Worker 空闲约 30 秒就会被回收，模块级变量随之清零。
 // 所以嗅探结果以 chrome.storage.session 为准，TAB_ITEMS 只是读缓存：
@@ -24,6 +29,28 @@ const DIRTY_TABS = new Set();         // 有改动待落盘的标签页
 const STORE_PREFIX = "sniff_tab_";
 
 function storeKey(tabId) { return STORE_PREFIX + tabId; }
+
+function isManifest(url) { return MANIFEST_RE.test(String(url).split("#")[0]); }
+function isSegment(url) { return SEGMENT_RE.test(String(url).split("#")[0]); }
+
+/** 这个标签页里是否已经嗅到能下整片的清单。 */
+function hasManifest(items) {
+    for (const u in items) if (isManifest(u)) return true;
+    return false;
+}
+
+/** 清单到手后，把之前零散记下的分片清掉（否则列表里还挂着一堆死条目）。 */
+function dropSegments(tabId, items) {
+    const gone = [];
+    for (const u in items) if (isSegment(u)) { delete items[u]; gone.push(u); }
+    if (gone.length) {
+        try {
+            chrome.tabs.sendMessage(tabId, { type: "net_items_gone", urls: gone },
+                                    { frameId: 0 }, () => void chrome.runtime.lastError);
+        } catch (e) { /* ignore */ }
+    }
+    return gone.length;
+}
 
 function prune(tabId) {
     const items = TAB_ITEMS.get(tabId);
@@ -103,8 +130,13 @@ async function dropTab(tabId) {
 async function addItem(tabId, url, mime, size) {
     if (!/^https?:\/\//i.test(url)) return;
     const items = await ensureTab(tabId);
+    const seg = isSegment(url);
+    if (seg && hasManifest(items)) return;      // 有清单就只要清单
+    const manifest = isManifest(url);
+    if (manifest) dropSegments(tabId, items);   // 清单来得晚：把先到的分片清掉
     const existed = !!items[url];
     items[url] = { url: url, mime: mime || "", size: size || 0, ts: Date.now() };
+    if (seg) items[url].seg = true;
     prune(tabId);
     markDirty(tabId);
     if (!existed) {

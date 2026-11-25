@@ -215,6 +215,7 @@ table.ft td.note{white-space:normal;color:var(--muted)}
   <section class="card" id="sniffCard">
     <div class="card-h"><h2>浏览器扩展嗅探结果</h2>
       <span class="spacer"></span>
+      <button class="btn sm" id="btnSniffSeg" style="display:none">显示分片</button>
       <button class="btn sm" id="btnSniffRefresh">刷新</button>
       <span class="muted" id="sniffCount">未加载</span></div>
     <div id="sniffPlayer">
@@ -701,6 +702,7 @@ async function showPreview(i){
    试播走服务端的 /api/sniff/preview：m3u8 之类先抓 6 秒片段，mp4 直链直接给
    原地址；缩略图也由服务端 ffmpeg 截帧后按 token 提供（不用把源站 URL 交给页面）。 */
 let sniffItems = [];
+let sniffShowSeg = false;      // 是否展开被清单取代的 HLS/DASH 分片
 let sniffChecked = new Set();
 const sniffPv = {};          // url -> {thumb, clip, duration, native}
 
@@ -740,12 +742,29 @@ async function sniffLoad() {
   sniffRender();
 }
 
+// HLS/DASH 是几秒一个分片的流：扩展会把 .m3u8/.mpd 清单和几百个 .ts 一起报上来。
+// 分片单独下载没有意义（多半还要 key 解密），所以有清单时默认只显示清单。
+function sniffHasManifest() { return sniffItems.some((it) => it && it.manifest); }
+function sniffSegCount() { return sniffItems.filter((it) => it && it.seg).length; }
+function sniffVisibleIdx() {
+  const hiding = sniffHasManifest() && !sniffShowSeg;
+  const out = [];
+  sniffItems.forEach((it, i) => { if (!(hiding && it && it.seg)) out.push(i); });
+  return out;
+}
+
 function sniffRender() {
   const el = $('sniffList');
-  if (!sniffItems.length) {
+  const vis = sniffVisibleIdx();
+  const segN = sniffSegCount();
+  const btnSeg = $('btnSniffSeg');
+  btnSeg.style.display = sniffHasManifest() && segN ? '' : 'none';
+  btnSeg.textContent = (sniffShowSeg ? '隐藏分片' : '显示分片') + ' (' + segN + ')';
+  if (!vis.length) {
     el.innerHTML = '<div class="empty">还没有收到扩展的嗅探结果。在浏览器里用扩展嗅探视频后，点右上角「刷新」。</div>';
   } else {
-    el.innerHTML = sniffItems.map((it, i) => {
+    el.innerHTML = vis.map((i) => {
+      const it = sniffItems[i];
       const pv = sniffPv[it.url] || {};
       const thumb = pv.thumb
         ? `<img class="sn-thumb" src="${pv.thumb}" alt="封面">`
@@ -774,8 +793,21 @@ function sniffRender() {
       });
     });
   }
-  els.sniffCount.textContent = sniffItems.length ? `共 ${sniffItems.length} 条` : '暂无';
-  $('btnSniffDownload').disabled = busy || sniffChecked.size === 0;
+  els.sniffCount.textContent = !sniffItems.length ? '暂无'
+    : (segN && sniffHasManifest() && !sniffShowSeg)
+      ? `共 ${vis.length} 条（另有 ${segN} 个分片已折叠）`
+      : `共 ${vis.length} 条`;
+  sniffSyncDownloadBtn();
+}
+
+// 被折叠（或压根没显示）的条目不该让人误以为「已勾选可下载」
+function sniffPickedCount() {
+  const vis = new Set(sniffVisibleIdx());
+  return [...sniffChecked].filter((i) => vis.has(i)).length;
+}
+
+function sniffSyncDownloadBtn() {
+  $('btnSniffDownload').disabled = busy || sniffPickedCount() === 0;
 }
 
 function sniffToggle(i) {
@@ -785,7 +817,7 @@ function sniffToggle(i) {
     row.classList.toggle('on', sniffChecked.has(i));
     row.querySelector('input').checked = sniffChecked.has(i);
   }
-  $('btnSniffDownload').disabled = busy || sniffChecked.size === 0;
+  sniffSyncDownloadBtn();
 }
 
 async function sniffPreview(i, btn) {
@@ -833,8 +865,16 @@ $('sniffPvClose').addEventListener('click', () => {
   $('sniffPlayer').style.display = 'none';
 });
 $('btnSniffRefresh').addEventListener('click', sniffLoad);
+$('btnSniffSeg').addEventListener('click', () => {
+  sniffShowSeg = !sniffShowSeg;
+  // 被折叠的条目已经看不见了，别让它们还留在「已勾选」里被一起下载
+  if (!sniffShowSeg) {
+    sniffItems.forEach((it, i) => { if (it && it.seg) sniffChecked.delete(i); });
+  }
+  sniffRender();
+});
 $('btnSniffAll').addEventListener('click', () => {
-  sniffItems.forEach((_, i) => sniffChecked.add(i));
+  sniffVisibleIdx().forEach((i) => sniffChecked.add(i));
   sniffRender();
 });
 $('btnSniffNone').addEventListener('click', () => { sniffChecked = new Set(); sniffRender(); });

@@ -235,6 +235,19 @@ def find_tool(name):
     return p if os.path.isfile(p) else name
 
 
+def which_tool(name):
+    """真的能把 name 跑起来吗？返回可执行文件路径，找不到返回空串。
+
+    find_tool 找不到时会原样返回名字（让 yt-dlp 自己报错），适合「交给 PATH」；
+    但 aria2c 这种可选外部程序必须先确认存在，否则命令行一定失败。
+    """
+    p = os.path.join(BASE_DIR, name)
+    if os.path.isfile(p):
+        return p
+    stem = os.path.splitext(name)[0]
+    return shutil.which(stem) or shutil.which(name) or ""
+
+
 def decode_bytes(b):
     try:
         return b.decode("utf-8")
@@ -641,6 +654,10 @@ def real_download_path(raw_path):
 # 扩展嗅探到的多是 .mp4 / .m3u8 直链，yt-dlp 的 generic 提取器不会给它缩略图，
 # 所以封面只能自己截；而 m3u8 浏览器原生播不了，只能先抓一小段再交给 <video>。
 SNIFF_CLIP_SECONDS = 6
+# HLS/DASH 把整片切成几秒一个的分片，播放器逐个请求：这些 URL 单独下载没有意义
+# （多数还要 key 解密），嗅探结果里要能认出来、别和「完整视频」混在一起。
+SEGMENT_EXT = (".ts", ".m4s", ".f4v", ".m2ts")
+MANIFEST_EXT = (".m3u8", ".mpd")
 SNIFF_FRAME_TIMEOUT = 40
 SNIFF_CLIP_TIMEOUT = 90
 
@@ -688,6 +705,24 @@ def _run_stream_tool(cmd, timeout):
         except Exception:
             pass
         return False, "超时"
+
+
+def looks_like_segment(url):
+    """这是不是一个分片（而不是一门完整的视频/清单）。"""
+    try:
+        path = urlsplit(url).path.lower()
+    except Exception:
+        return False
+    return os.path.splitext(path)[1] in SEGMENT_EXT
+
+
+def looks_like_manifest(url):
+    """这是不是 HLS/DASH 的播放清单（拿到它就能下整片）。"""
+    try:
+        path = urlsplit(url).path.lower()
+    except Exception:
+        return False
+    return os.path.splitext(path)[1] in MANIFEST_EXT
 
 
 def browser_can_play_url(url):
@@ -916,7 +951,7 @@ def command_text(cmd):
 
 
 # ---------------- 配置读写 ----------------
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
 
 DEFAULT_CONFIG = {
     "outdir": os.path.join(BASE_DIR, "downloads"),
@@ -929,7 +964,7 @@ DEFAULT_CONFIG = {
     "pl": True, "items": "", "ignore": True,
     "open_after": True,
     "rate": "", "proxy": "", "cookie": "", "cookie_header": "",
-    "conc": False, "conc_n": "8", "aria": False, "aria_args": "aria2c:-x 16 -s 16 -k 1M",
+    "conc": True, "conc_n": "4", "aria": False, "aria_args": "aria2c:-x 16 -s 16 -k 1M",
     "flat": False, "extra": "",
     "browser": "（不使用）", "browser_profile": "",
     "referer": "", "ua": "", "headers": "",
@@ -997,6 +1032,13 @@ def coerce_config(cfg, defaults=None):
                 warnings.append(f"配置项「{k}」已改名为「{new_k}」")
             continue
         merged[k] = v
+    # v3：分片并发改成默认开（-N 4 是实测甜点）。只升级「从没动过」的旧配置：
+    # 用户自己调过 conc_n 的，说明他有意为之，不覆盖。
+    if int(str(src.get("schema_version") or 0) or 0) < 3:
+        if src.get("conc") in (False, 0, "false", "0", None) and \
+                str(src.get("conc_n") or "8").strip() in ("", "8"):
+            merged["conc"] = True
+            merged["conc_n"] = "4"
     merged["schema_version"] = CONFIG_SCHEMA_VERSION
     if not str(merged.get("browser") or "").strip():
         merged["browser"] = "（不使用）"
@@ -1267,7 +1309,7 @@ def _exe(cfg):
     return cfg.get("yt_dlp_path") or find_tool("yt-dlp.exe")
 
 
-def build_download_cmd(cfg, urls, no_playlist=False):
+def build_download_cmd(cfg, urls, no_playlist=False, warn=None):
     cmd = [_exe(cfg), "--newline", "--progress-template", PROGRESS_TEMPLATE]
     if os.path.isfile(os.path.join(BASE_DIR, "ffmpeg.exe")):
         cmd += ["--ffmpeg-location", BASE_DIR]
@@ -1316,9 +1358,13 @@ def build_download_cmd(cfg, urls, no_playlist=False):
             n = 8
         cmd += ["-N", str(n)]
     if cfg.get("aria"):
-        cmd += ["--external-downloader", "aria2c"]
-        if cfg.get("aria_args") and not unsafe_arg_in(cfg["aria_args"]):
-            cmd += ["--external-downloader-args", str(cfg["aria_args"])]
+        # 没装 aria2c 还硬加这个参数，yt-dlp 会直接退出：确认存在再加
+        if which_tool("aria2c.exe"):
+            cmd += ["--external-downloader", "aria2c"]
+            if cfg.get("aria_args") and not unsafe_arg_in(cfg["aria_args"]):
+                cmd += ["--external-downloader-args", str(cfg["aria_args"])]
+        elif isinstance(warn, list):
+            warn.append("没有找到 aria2c.exe（放到程序目录或加入 PATH），本次改用 yt-dlp 自带下载器")
     if cfg.get("extra"):
         cmd += safe_extra_args(cfg["extra"])
     # 调用方（界面/HTTP 路由）负责把非法项提示给用户，这里只保证命令行里

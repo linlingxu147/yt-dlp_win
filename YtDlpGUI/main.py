@@ -10,7 +10,6 @@ import json
 import os
 import queue
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -93,7 +92,7 @@ class App:
         self.detecting = False
         self.diag_buf = ""      # 上一次任务的原始输出，用于失败时诊断
 
-        self.has_aria2c = shutil.which("aria2c") is not None
+        self.has_aria2c = bool(core.which_tool("aria2c.exe"))
         self.pstate = new_progress_state()      # 进度解析状态（与网页版共用核心）
 
         # 失败自愈（与网页版同一套阶梯）：记录本任务的链接、已试过的招、本轮覆盖项
@@ -686,12 +685,17 @@ class App:
         return s if len(s) <= n else s[:n - 3] + "..."
 
     # ---------------- 命令构建 ----------------
-    def build_cmd(self, urls=None, no_playlist=False, cfg=None):
-        """下载命令行：统一交给共用核心（凭据、附加参数过滤、"--" 分隔都在里面）。"""
+    def build_cmd(self, urls=None, no_playlist=False, cfg=None, warn=None):
+        """下载命令行：统一交给共用核心（凭据、附加参数过滤、"--" 分隔都在里面）。
+
+        warn 传一个 list 进来，核心会往里塞「本可以做到但环境缺东西」的提示
+        （比如勾了 aria2c 却没装）。
+        """
         if cfg is None:
             cfg = self._collect_cfg()
         return core.build_download_cmd(
-            cfg, urls if urls is not None else self.get_urls(), no_playlist=no_playlist)
+            cfg, urls if urls is not None else self.get_urls(),
+            no_playlist=no_playlist, warn=warn)
 
     def copy_cmd(self):
         self._guard_extra_args()          # 危险参数只提示，复制出的命令已在核心里过滤
@@ -727,8 +731,9 @@ class App:
         if self.var_aria.get() and not self.has_aria2c:
             if not messagebox.askokcancel(
                     "未检测到 aria2c",
-                    "系统里找不到 aria2c.exe，yt-dlp 会报错。\n"
-                    "请先安装 aria2c 并加入 PATH，或取消勾选「外部下载器 aria2c」。\n\n仍要继续吗？"):
+                    "程序目录和 PATH 里都没有 aria2c.exe。\n"
+                    "这次会改用 yt-dlp 自带下载器继续（功能不缺，只是少了多连接分段）。\n\n"
+                    "要继续吗？"):
                 return
         try:
             os.makedirs(outdir, exist_ok=True)
@@ -736,7 +741,10 @@ class App:
             messagebox.showerror("错误", f"无法创建输出目录：\n{e}")
             return
 
-        cmd = self.build_cmd(urls, no_playlist=no_playlist)
+        warns = []
+        cmd = self.build_cmd(urls, no_playlist=no_playlist, warn=warns)
+        for w in warns:
+            self.log_line("! " + w + "\n", "warn")
         self._save_config()
         self.dl_urls, self.dl_no_playlist, self.dl_outdir = list(urls), no_playlist, outdir
         self.net_tried, self.net_name = set(), "normal"
