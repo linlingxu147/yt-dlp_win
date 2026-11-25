@@ -4,6 +4,7 @@
 事件出口是注入的 emit 回调（默认空操作）；main.py 把它接成 evaluate_js。
 工作线程只往队列投事件，泵统一合并/节流后推出，绝不碰 UI。
 """
+import base64
 import json
 import os
 import queue
@@ -469,13 +470,93 @@ class Host:
         except Exception:
             pass
 
-    # 占位（Task 5/6 补全）
+    # ---------------- 封面预览 ----------------
+    def get_thumb(self, url, cfg):
+        if not core.is_public_http_url(url):
+            return {"ok": False, "err": "封面地址不合法（非公网 http/https）"}
+        path, err = fetch_thumb(url, cfg)
+        if err or not path:
+            return {"ok": False, "err": err or "未知原因"}
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            return {"ok": False, "err": str(e)}
+        ext = os.path.splitext(path)[1].lower()
+        mime = {".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
+                ".bmp": "image/bmp"}.get(ext, "image/jpeg")
+        return {"ok": True,
+                "data_url": "data:%s;base64,%s" % (mime, base64.b64encode(data).decode())}
+
+    # ---------------- 边下边播 ----------------
     def _maybe_start_play_probe(self):
-        pass
+        cfg = self._task_cfg()
+        raw = self.pstate.get("raw_path") or ""
+        if not raw or not cfg.get("play_while") or raw == self._play_raw:
+            return
+        self._play_raw = raw
+        if self._web_mod:
+            with self._web_mod.PLAY_LOCK:
+                self._web_mod.PLAY_STATE.update({"raw_path": raw, "outdir": self.dl_outdir,
+                                                 "cfg": dict(cfg), "ok": False,
+                                                 "reason": "正在判断能否边下边播…"})
+        self._set_playable(False, "正在判断能否边下边播…")
+        threading.Thread(target=self._play_probe_loop, args=(raw, dict(cfg)), daemon=True).start()
+
+    def _play_probe_loop(self, raw, cfg):
+        if fmt_is_separated(cfg):
+            self._set_playable(False, "此源音视频分离，边下边播不适用")
+            return
+        if cfg.get("aria"):
+            self._set_playable(False, "aria2c 外部下载器不支持边下边播")
+            return
+        reason = "文件还没写出来"
+        deadline = time.time() + 3
+        for _ in range(3):
+            while time.time() < deadline:
+                p = real_download_path(raw)
+                try:
+                    if p and os.path.getsize(p) >= 256 * 1024:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.5)
+            p = real_download_path(raw)
+            if p:
+                v = probe_playable(p)
+                if v["ok"]:
+                    self._set_playable(True, "")
+                    return
+                reason = v["reason"]
+            deadline = time.time() + 5
+        self._set_playable(False, "此源要下完才能播：%s" % reason)
 
     def _set_playable(self, ok, reason):
         self._play_ok = bool(ok)
         self._put({"type": "playable", "ok": bool(ok), "reason": reason})
+        if self.ext_emit:
+            self.ext_emit({"type": "playable", "ok": bool(ok), "reason": reason})
+        if self._web_mod:
+            with self._web_mod.PLAY_LOCK:
+                self._web_mod.PLAY_STATE["ok"] = bool(ok)
+                self._web_mod.PLAY_STATE["reason"] = reason
+
+    def play_now(self):
+        if not self._play_ok:
+            return {"ok": False, "error": "此源不支持边下边播"}
+        cfg = self._task_cfg()
+        outdir = cfg.get("outdir") or os.path.join(core.BASE_DIR, "downloads")
+        real = real_download_path(self._play_raw)
+        if not real:
+            return {"ok": False, "error": "文件还没写出来，稍等再试"}
+        link, err = make_preview_link(real, outdir)
+        if err:
+            return {"ok": False, "error": err}
+        try:
+            os.startfile(link)
+        except Exception as e:
+            return {"ok": False, "error": "打开播放器失败：%s（建议安装 VLC 或 PotPlayer）" % e}
+        return {"ok": True}
 
     # ---------------- 探测 ----------------
     def detect(self, urls, cfg):

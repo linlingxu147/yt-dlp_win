@@ -289,5 +289,55 @@ class DetectTroubleTest(unittest.TestCase):
         self.assertTrue(any(e["type"] == "trodone" for e in self.events))
 
 
+class PreviewPlayTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load_host()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.events = []
+        self.host = self.mod.Host(os.path.join(self.tmp.name, "config.json"),
+                                  emit=self.events.append)
+        self.host.mark_ready()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_thumb_returns_data_url(self):
+        png = os.path.join(self.tmp.name, "t.png")
+        with open(png, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\nfake")
+        with mock.patch.object(self.mod, "fetch_thumb", return_value=(png, None)):
+            r = self.host.get_thumb("https://cdn.example/x.png", {})
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["data_url"].startswith("data:image/png;base64,"))
+
+    def test_thumb_private_url_rejected_without_network(self):
+        r = self.host.get_thumb("https://127.0.0.1/x.png", {})
+        self.assertFalse(r["ok"])
+
+    def test_thumb_failure_degrades(self):
+        with mock.patch.object(self.mod, "fetch_thumb", return_value=("", "403")):
+            r = self.host.get_thumb("https://cdn.example/x.png", {})
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["err"], "403")
+
+    def test_play_disabled_when_not_playable(self):
+        r = self.host.play_now()
+        self.assertFalse(r["ok"])
+
+    def test_separated_source_verdict(self):
+        self.host._play_probe_loop("raw", {"fmt": "bv*+ba/b"})
+        self.host.pump_once()
+        ev = [e for e in self.events if e["type"] == "playable"][-1]
+        self.assertFalse(ev["ok"])
+        self.assertIn("分离", ev["reason"])
+
+    def test_aria_verdict(self):
+        self.host._play_probe_loop("raw", {"fmt": "b", "aria": True})
+        self.host.pump_once()
+        ev = [e for e in self.events if e["type"] == "playable"][-1]
+        self.assertFalse(ev["ok"])
+        self.assertIn("aria2c", ev["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()
