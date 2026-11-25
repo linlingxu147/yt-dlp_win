@@ -787,6 +787,14 @@ git commit -m "核心：可播性探测与硬链接预览
 
 ### Task 4: 核心 — play_while 配置键与命令构建分支
 
+> **执行偏差（2026-11-25，T8 实测后修正）：本任务的命令分支已全部删除。**
+> 真实 H.264 HLS 实测证明 `--hls-use-mpegts` 不但没必要（`.part` 本来就是 mpegts），
+> 还会关掉 yt-dlp 收尾的 `FixupM3u8`，把 mpegts 留在 `.mp4` 名字里；
+> `--remux-video <merge>` 则会把平时产出 mp4 的单格式源强行改容器。
+> 现在 `play_while` 只影响界面与 `.part` 读取，**不改任何下载参数**。
+> 下面的测试与实现代码块保留作过程记录，实际落地见 spec 6.1 的修正说明与
+> `tests/test_core.py::TestPlayWhileCmd`（7 例，断言命令与开关取值无关）。
+
 **Files:**
 - Modify: `ytdlp_core.py:442-463`（`DEFAULT_CONFIG`）、`538-539`（`_BOOL_FIELDS`）、`718-773`（`build_download_cmd`）
 - Test: `tests/test_core.py`
@@ -1780,9 +1788,12 @@ Tkinter 的 PhotoImage 只认 PNG/GIF，所以封面经随包 ffmpeg 转一次 P
 - 开了 aria2c 外部下载器——文件布局不可控；
 - ffprobe 读不到流——例如渐进式 mp4 的索引在文件末尾，要下完才能播。
 
-HLS 源会加 `--hls-use-mpegts`（下载中是 `.ts`，能播），下完按「合并容器」设置 remux 回去，
-最终产物与不开这个开关时一致。**推荐 VLC 或 PotPlayer**；`.preview\` 子目录里的链接在任务结束时删除。
+这个开关**不改任何下载参数**：HLS 的 `.part` 本来就是 mpegts（下载途中就能播），
+收尾仍由 yt-dlp 自己的 `FixupM3u8` 修回 mp4。实测开关开/关的最终文件 sha256 相同。
+**推荐 VLC 或 PotPlayer**；`.preview\` 子目录里的链接在任务结束时删除。
 ```
+
+> 上面这段已按 T8 实测修正（原稿写的是「加 `--hls-use-mpegts` + 按合并容器 remux」，见 Task 4 的偏差说明）。
 
 在「常用键」那行末尾补 `play_while`，并把测试数量从 102 改成实际数字（跑完全量后填）。
 

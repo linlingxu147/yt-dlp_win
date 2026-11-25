@@ -1096,49 +1096,48 @@ class TestProbePlayableReal(unittest.TestCase):
 
 
 class TestPlayWhileCmd(unittest.TestCase):
+    """边下边播只读 .part，不许改动下载命令，产物必须与关掉开关时逐字节一致。"""
+
     URLS = ["https://example.com/v"]
 
     def test_off_by_default(self):
         self.assertFalse(core.DEFAULT_CONFIG["play_while"])
 
-    def test_command_byte_identical_when_off(self):
-        cfg = core.default_config()
-        base = core.build_download_cmd(cfg, self.URLS)
-        cfg["play_while"] = False
-        self.assertEqual(core.build_download_cmd(cfg, self.URLS), base)
-        self.assertNotIn("--hls-use-mpegts", base)
-        self.assertNotIn("--remux-video", base)
+    def test_command_identical_for_every_mode_and_merge(self):
+        for mode in ("single", "best", "audio_mp3", "audio_raw", "custom"):
+            for merge in ("", "不转换", "mp4", "mkv", "webm"):
+                off = dict(core.default_config(), mode=mode, merge=merge,
+                           play_while=False)
+                on = dict(off, play_while=True)
+                self.assertEqual(
+                    core.build_download_cmd(on, self.URLS),
+                    core.build_download_cmd(off, self.URLS),
+                    "mode=%s merge=%s" % (mode, merge))
 
     def test_never_adds_no_part(self):
         for pw in (False, True):
             cfg = dict(core.default_config(), play_while=pw)
             self.assertNotIn("--no-part", core.build_download_cmd(cfg, self.URLS))
 
-    def test_on_adds_mpegts(self):
-        cfg = dict(core.default_config(), play_while=True, mode="single")
-        cmd = core.build_download_cmd(cfg, self.URLS)
-        self.assertIn("--hls-use-mpegts", cmd)
-
-    def test_on_remuxes_to_merge_target(self):
-        cfg = dict(core.default_config(), play_while=True, mode="single", merge="mkv")
-        cmd = core.build_download_cmd(cfg, self.URLS)
-        i = cmd.index("--remux-video")
-        self.assertEqual(cmd[i + 1], "mkv")
-
-    def test_no_remux_when_merge_disabled(self):
-        for merge in ("", "不转换"):
-            cfg = dict(core.default_config(), play_while=True, mode="single", merge=merge)
-            self.assertNotIn("--remux-video", core.build_download_cmd(cfg, self.URLS))
-
-    def test_no_remux_for_audio_modes(self):
-        for mode in ("audio_mp3", "audio_raw"):
+    def test_never_adds_hls_use_mpegts(self):
+        # 实测：HLS 的 .part 本来就是 mpegts，无需这个开关；加了反而会关掉
+        # yt-dlp 收尾的 FixupM3u8，把 mpegts 留在 .mp4 名字里。
+        for mode in ("single", "best", "audio_raw"):
             cfg = dict(core.default_config(), play_while=True, mode=mode)
-            self.assertNotIn("--remux-video", core.build_download_cmd(cfg, self.URLS))
+            self.assertNotIn("--hls-use-mpegts",
+                             core.build_download_cmd(cfg, self.URLS))
 
-    def test_flags_come_before_url_separator(self):
-        cfg = dict(core.default_config(), play_while=True, mode="single")
+    def test_never_adds_remux_video(self):
+        for merge in ("", "不转换", "mp4", "mkv"):
+            cfg = dict(core.default_config(), play_while=True, mode="single",
+                       merge=merge)
+            self.assertNotIn("--remux-video",
+                             core.build_download_cmd(cfg, self.URLS))
+
+    def test_merge_output_format_still_honoured(self):
+        cfg = dict(core.default_config(), play_while=True, mode="best", merge="mkv")
         cmd = core.build_download_cmd(cfg, self.URLS)
-        self.assertLess(cmd.index("--hls-use-mpegts"), cmd.index("--"))
+        self.assertEqual(cmd[cmd.index("--merge-output-format") + 1], "mkv")
 
     def test_type_coercion(self):
         cfg, warns = core.coerce_config({"play_while": "false"})

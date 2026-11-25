@@ -154,13 +154,26 @@ def fmt_is_separated(cfg) -> bool
 
 ### 6.1 命令改动（仅 `play_while` 为真时）
 
-1. 加 `--hls-use-mpegts`。**无条件加**——它只影响 HLS 源，对别的源无副作用，不需要先判断协议。
-2. 当 `merge` 非空、不等于 `"不转换"`、且 mode 不是 `audio_*` 时，加 `--remux-video <merge>`，下完 remux 回目标容器，**最终产物与平时一致**。`merge` 为空或 `"不转换"` 时不 remux，产物为 `.ts`，界面需说明。
+> **2026-11-25 实测修正：本节 1、2 两条已作废，`play_while` 不改任何下载参数。**
+> 用真实 H.264 HLS 素材实测发现：
+> - 不加 `--hls-use-mpegts` 时，下载中的 `<name>.mp4.part` **本来就是 mpegts**，ffprobe 可读、可播；
+>   下完 yt-dlp 自己跑 `[FixupM3u8] Fixing MPEG-TS in MP4 container` 修回真 mp4。
+> - 加了 `--hls-use-mpegts` 会**关掉这道收尾**，把 mpegts 留在 `.mp4` 名字里。
+>   `--fixup force` 救不回来；`--remux-video mp4` 按扩展名判断，直接报「already is in target format」跳过。
+> - 第 2 条的「产物与平时一致」推断本身也不成立：单格式下载不触发合并，
+>   `--merge-output-format` 不生效，所以 `--remux-video <merge>` 会把平时产出 mp4 的源强行变成 mkv。
+>
+> 结论：删掉整个命令分支，边下边播只读 `.part`。修正后实测开关开/关最终文件 sha256 相同。
+> 下面两条保留作为设计过程记录。
+
+1. ~~加 `--hls-use-mpegts`。**无条件加**——它只影响 HLS 源，对别的源无副作用，不需要先判断协议。~~
+2. ~~当 `merge` 非空、不等于 `"不转换"`、且 mode 不是 `audio_*` 时，加 `--remux-video <merge>`，下完 remux 回目标容器，**最终产物与平时一致**。`merge` 为空或 `"不转换"` 时不 remux，产物为 `.ts`，界面需说明。~~
 3. **不加 `--no-part`**。
 
 其余参数、重试阶梯（`NET_HARD_PLANS`）、看门狗（`iter_lines_watch`）、进度解析全不变。
 
-**关键回归要求**：`play_while` 为假时，`build_download_cmd` 的输出与改动前**逐字节相同**。
+**关键回归要求**（修正后加强）：`build_download_cmd` 的输出**与 `play_while` 取值无关**——
+5 种 mode × 5 种 merge 组合下，开关开/关的命令必须完全相同。
 
 ### 6.2 置灰规则（三条，任一命中即不可播）
 
@@ -221,7 +234,7 @@ TDD：先写测试再写实现。核心单测 102 → 约 130 例。
 - `make_preview_link` / `clear_preview_links`：建立、清理、清理不影响源文件、不支持时的错误。
 - `fmt_is_separated`：`bv*+ba/b` 为真，`b` / `best[acodec!=none]` 为假，手填 fmt 优先。
 - `progress_event`：`raw_path` 保留完整路径与 `.f137` 标记；**显示名不变**（回归）。
-- `build_download_cmd`：`play_while` 关闭时命令逐字节不变；开启时含 `--hls-use-mpegts`；`merge` 有效时含 `--remux-video`，`"不转换"` / 空 / audio 模式时不含；**任何情况下都不出现 `--no-part`**。
+- `build_download_cmd`：命令**与 `play_while` 取值无关**（5 种 mode × 5 种 merge 全覆盖）；不出现 `--hls-use-mpegts`、`--remux-video`；`mode=best` 时 `--merge-output-format` 照常生效；**任何情况下都不出现 `--no-part`**。（见 6.1 的实测修正）
 - 配置：`play_while` 进 `_BOOL_FIELDS`、类型校正、原子写、`save_config` 回传警告。
 - 端点守卫：`/api/thumb` 拒绝未知 token 与 url 参数；`/api/play` 拒绝 path 参数、无任务时 409；Host / Origin 校验沿用现有测试。
 

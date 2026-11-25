@@ -981,15 +981,9 @@ def build_download_cmd(cfg, urls, no_playlist=False):
             cmd += ["--merge-output-format", str(cfg["merge"])]
     elif mode == "audio_mp3":
         cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
-    if cfg.get("play_while"):
-        # 可流式容器：HLS 分片写成 mpegts，下载途中就能被播放器读。
-        # 这个开关只影响 HLS 源，对别的源无副作用，所以不必先判断协议。
-        cmd.append("--hls-use-mpegts")
-        merge = str(cfg.get("merge") or "").strip()
-        if merge and merge != "不转换" and not mode.startswith("audio"):
-            # 下完 remux 回目标容器，最终产物与不开这个开关时一致；
-            # remux 发生在下载结束后，不占下载带宽。
-            cmd += ["--remux-video", merge]
+    # play_while 不改命令：HLS 的 .part 本来就是 mpegts，下完由 yt-dlp 的
+    # FixupM3u8 修回 mp4。加 --hls-use-mpegts 会关掉这道收尾，把 mpegts
+    # 留在 .mp4 名字里，所以边下边播只读 .part，不碰下载参数。
     if cfg.get("sub"):
         cmd += ["--write-subs", "--write-auto-subs",
                 "--sub-langs", str(cfg.get("sublang") or "zh-Hans,zh,en")]
