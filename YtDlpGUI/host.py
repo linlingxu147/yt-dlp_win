@@ -11,6 +11,18 @@ import threading
 import time
 
 import ytdlp_core as core
+from ytdlp_core import (
+    MODE_CHOICES, MODE_FMT, MODE_NAME, mode_key, TEMPLATES, BROWSERS,
+    diagnose, diagnose_pairs, find_tool, fmt_dur, fmt_size, info_from_json_raw,
+    normalize_headers, sanitize_urls, unsafe_arg_in,
+    build_detect_cmd, build_formats_cmd, build_probe_cmd, PROBE_VARIANTS,
+    spawn, iter_lines_watch, kill_tree, command_text,
+    new_progress_state, progress_event, progress_text, classify_line,
+    is_net_failure, next_net_plan, next_cookie_plan,
+    NET_PLAN_LABEL, COOKIE_PLAN_LABEL, PROG_MARK,
+    fetch_thumb, real_download_path, probe_playable, make_preview_link,
+    clear_preview_links, fmt_is_separated, path_inside,
+)
 
 HISTORY_MAX = 500
 PUMP_SECONDS = 0.1
@@ -98,6 +110,12 @@ class Host:
                 if logs:
                     self.emit({"type": "logbatch", "items": logs})
                     logs = []
+                if t == "done" and self.running:
+                    self.on_done(ev["code"])
+                    continue
+                if t == "exttask":
+                    self.start_external(ev["task"])
+                    continue
                 self.emit(ev)
         if logs:
             self.emit({"type": "logbatch", "items": logs})
@@ -164,3 +182,291 @@ class Host:
             core.atomic_write_text(self.history_file, "[]")
         except Exception:
             pass
+
+    # ---------------- 闸门 ----------------
+    def _reserve(self, kind):
+        if self.task_kind:
+            return False
+        if self._web_mod and not self._web_mod.RUNNER.reserve(kind):
+            return False
+        self.task_kind = kind
+        return True
+
+    def _release_runner(self):
+        if self._web_mod:
+            self._web_mod.RUNNER.finish()
+
+    def _task_cfg(self):
+        return dict(self.ext_cfg) if self.ext_cfg is not None else dict(self.cfg)
+
+    def _busy(self):
+        return {"ok": False, "busy": True,
+                "error": "「%s」正在进行，请先停止或等待结束"
+                         % TASK_LABELS.get(self.task_kind, "任务")}
+
+    # ---------------- 下载 ----------------
+    def start_download(self, urls, cfg, no_playlist=False):
+        if self.task_kind:
+            return self._busy()
+        bad = unsafe_arg_in(cfg.get("extra", "")) or unsafe_arg_in(cfg.get("aria_args", ""))
+        if bad:
+            return {"ok": False, "error": "附加参数里有被禁用的参数 %s（会执行命令或读本机文件），已阻止" % bad}
+        good, bad_urls = sanitize_urls(urls or [])
+        if not good:
+            return {"ok": False, "error": "没有可用的下载链接"}
+        outdir = (cfg.get("outdir") or "").strip()
+        if not outdir:
+            return {"ok": False, "error": "请先选择输出目录"}
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except Exception as e:
+            return {"ok": False, "error": "无法创建输出目录：%s" % e}
+        if bad_urls:
+            self._log("[提示] 已忽略 %d 个无法识别的链接\n" % len(bad_urls), "warn")
+        self.save_config(cfg)
+        if not self._reserve("download"):
+            return self._busy()
+        self._begin_download(good, cfg, no_playlist, outdir, source="gui")
+        return {"ok": True}
+
+    def _begin_download(self, urls, cfg, no_playlist, outdir, source):
+        self.ext_cfg = dict(cfg) if source != "gui" else None
+        self.dl_urls, self.dl_no_playlist, self.dl_outdir = list(urls), no_playlist, outdir
+        self.dl_source = source
+        self.net_tried, self.net_name = set(), "normal"
+        self.user_stopped = False
+        self.running = True
+        self.pstate = new_progress_state()
+        self.t_start = time.time()
+        self._task_ev()
+        self._status("下载中…", "run")
+        warns = []
+        cmd = core.build_download_cmd(cfg, urls, no_playlist=no_playlist, warn=warns)
+        for w in warns:
+            self._log("! " + w + "\n", "warn")
+        self._log("> " + command_text(cmd) + "\n", "cmd")
+        self._worker = threading.Thread(target=self._run, args=(cmd, outdir), daemon=True)
+        self._worker.start()
+
+    def submit_server_task(self, task):
+        if not self._reserve("download"):
+            return False
+        self._put({"type": "exttask", "task": task})
+        return True
+
+    def start_external(self, task):
+        cfg = dict(task.get("cfg") or {})
+        urls = list(task.get("urls") or ([task["url"]] if task.get("url") else []))
+        emit = task.get("emit")
+        if not urls:
+            self._release_runner()
+            self.task_kind = None
+            return
+        outdir = cfg.get("outdir") or os.path.join(core.BASE_DIR, "downloads")
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except Exception as e:
+            if emit:
+                emit({"type": "log", "level": "err", "text": "无法创建输出目录：%s" % e})
+                emit({"type": "done", "code": -1})
+            self._release_runner()
+            self.task_kind = None
+            return
+        self.ext_emit, self.ext_cfg = emit, cfg
+        self.ext_cookie_file = cfg.get("_sniff_cookie_file")
+        self.dl_urls = urls
+        self.dl_no_playlist = bool(task.get("no_playlist", True))
+        self.dl_outdir = outdir
+        self.dl_source = "ext"
+        self.net_tried, self.net_name = set(), "normal"
+        self.user_stopped = False
+        self.running = True
+        self.task_kind = "download"
+        self.pstate = new_progress_state()
+        self.t_start = time.time()
+        self._task_ev()
+        self._status("下载中…（浏览器扩展）", "run")
+        warns = []
+        cmd = core.build_download_cmd(cfg, urls, no_playlist=self.dl_no_playlist, warn=warns)
+        for w in warns:
+            self._log("! " + w + "\n", "warn")
+        self._log("[浏览器扩展] 嗅探地址交给桌面版下载\n", "ok")
+        self._log("> " + command_text(cmd) + "\n", "cmd")
+        self._worker = threading.Thread(target=self._run, args=(cmd, outdir), daemon=True)
+        self._worker.start()
+
+    def _run(self, cmd, outdir):
+        try:
+            proc = spawn(cmd, outdir)
+        except FileNotFoundError:
+            self._log("找不到 yt-dlp：%s\n" % cmd[0], "err")
+            self._put({"type": "done", "code": -1})
+            return
+        except Exception as e:
+            self._log("启动失败：%s\n" % e, "err")
+            self._put({"type": "done", "code": -1})
+            return
+        self.proc = proc
+        buf = []
+        why = {}
+        try:
+            for line in iter_lines_watch(proc, abort=lambda: self.user_stopped,
+                                         stall_seconds=GUI_STALL_SECONDS, why=why):
+                buf.append(line)
+                self._handle_line(line)
+        except Exception as e:
+            self._log("读取输出出错：%s\n" % e, "err")
+        finally:
+            if why.get("reason") == "stall":
+                self._log("[长时间没有输出，已自动终止本次任务]\n", "warn")
+            self.diag_buf = "\n".join(buf[-300:])
+            self.proc = None
+            self._put({"type": "done", "code": proc.wait()})
+
+    def _handle_line(self, line):
+        ev = progress_event(self.pstate, line)
+        if ev:
+            st = self.pstate
+            self._put({"type": "progress", "pct": st["pct"], "speed": st["speed"],
+                       "eta": st["eta"], "size": st["size"], "file": st["file"],
+                       "item_i": st["item_i"], "item_total": st["item_total"],
+                       "done_count": len(st["done"])})
+            if self.ext_emit:
+                self.ext_emit({"type": "progress", "pct": st["pct"], "speed": st["speed"],
+                               "eta": st["eta"], "size": st["size"], "file": st["file"],
+                               "item_i": st["item_i"], "item_total": st["item_total"]})
+            if ev["kind"] == "file":
+                self._log((progress_text(st) if PROG_MARK in line else line) + "\n", "ok")
+                self._maybe_start_play_probe()
+            elif ev["kind"] == "item":
+                self._log(line + "\n", None)
+            else:
+                self._log(progress_text(st) + "\n", "prog")
+            return
+        tag = classify_line(line)
+        self._log(line + "\n", tag)
+
+    def stop(self):
+        proc = self.proc
+        if not proc or proc.poll() is not None:
+            self._status("当前没有进行中的任务", "idle")
+            return False
+        self.user_stopped = True
+        kill_tree(proc)
+        self._status("已停止", "err")
+        self._log("[已手动停止：%s]\n" % TASK_LABELS.get(self.task_kind, "任务"), "warn")
+        return True
+
+    def _finish_task(self, code):
+        self._release_runner()
+        emit, cookie = self.ext_emit, self.ext_cookie_file
+        self.ext_emit = self.ext_cfg = self.ext_cookie_file = None
+        if self._web_mod:
+            with self._web_mod.PLAY_LOCK:
+                self._web_mod.PLAY_STATE.update({"raw_path": "", "ok": False,
+                                                 "reason": "还没有开始下载"})
+        if emit:
+            emit({"type": "done", "code": code})
+        if cookie and os.path.isfile(cookie):
+            try:
+                os.remove(cookie)
+            except Exception:
+                pass
+
+    def on_done(self, code):
+        base = self._task_cfg()
+        was_ext = self.ext_cfg is not None
+        clear_preview_links(base.get("outdir") or os.path.join(core.BASE_DIR, "downloads"))
+        self._play_raw = ""
+        self._set_playable(False, "还没有开始下载")
+        self.running = False
+        self.proc = None
+        self.task_kind = None
+        elapsed = time.time() - getattr(self, "t_start", 0) if getattr(self, "t_start", 0) else 0
+        done_count = len(self.pstate.get("done") or [])
+        if code == 0:
+            self._status("完成", "ok")
+            self._log("=== 完成 · 耗时 %d 秒 ===\n" % int(elapsed), "ok")
+            self.record_history({"urls": self.dl_urls, "outdir": self.dl_outdir,
+                                 "status": "ok", "code": 0, "elapsed": round(elapsed, 1),
+                                 "done_count": done_count, "mode": base.get("mode", ""),
+                                 "source": "ext" if was_ext else getattr(self, "dl_source", "gui")})
+            self._finish_task(code)
+            self._task_ev()
+            if base.get("open_after"):
+                self.open_outdir(base.get("outdir"))
+        else:
+            if self._net_heal():
+                return
+            status = "stopped" if self.user_stopped else "failed"
+            self._status("已停止" if self.user_stopped else "已结束（退出码 %s）" % code, "err")
+            self._log("=== 结束，退出码 %s ===\n" % code, "err")
+            self._log_diag()
+            self.record_history({"urls": self.dl_urls, "outdir": self.dl_outdir,
+                                 "status": status, "code": code, "elapsed": round(elapsed, 1),
+                                 "done_count": done_count, "mode": base.get("mode", ""),
+                                 "source": "ext" if was_ext else getattr(self, "dl_source", "gui")})
+            self._finish_task(code)
+            self._task_ev()
+        self._put({"type": "done", "code": code, "elapsed": round(elapsed, 1),
+                   "done_count": done_count})
+
+    def _net_heal(self):
+        if self.user_stopped or not self.dl_urls:
+            return False
+        cfg = self._task_cfg()
+        if not cfg.get("net_hard", True):
+            return False
+        tail = self.diag_buf or ""
+        self.net_tried.add(self.net_name)
+        nxt = next_cookie_plan(tail, self.net_tried, cfg)
+        if not nxt:
+            if not is_net_failure(tail):
+                return False
+            nxt = next_net_plan(tail, self.net_tried, cfg, url=self.dl_urls[0])
+        if not nxt:
+            return False
+        self.net_name, extra = nxt
+        self._log("[自动重试] 换用%s重试（已下载部分会续传）\n"
+                  % (NET_PLAN_LABEL.get(self.net_name) or COOKIE_PLAN_LABEL), "warn")
+        cfg2 = dict(cfg, **extra)
+        self.ext_cfg = cfg2 if self.ext_cfg is not None else None
+        cmd = core.build_download_cmd(cfg2, self.dl_urls, no_playlist=self.dl_no_playlist)
+        self._log("> " + command_text(cmd) + "\n", "cmd")
+        self.pstate = new_progress_state()
+        self.t_start = time.time()
+        self.running = True
+        self.task_kind = "download"
+        self._task_ev()
+        self._status("下载中…（自动重试）", "run")
+        self._worker = threading.Thread(target=self._run, args=(cmd, self.dl_outdir), daemon=True)
+        self._worker.start()
+        return True
+
+    def _log_diag(self):
+        diag = diagnose_pairs(self.diag_buf or "")
+        if not diag:
+            return
+        self._log("\n=== 可能的原因与建议 ===\n", "warn")
+        for title, advices in diag:
+            self._log("· " + title + "\n", "warn")
+            for a in advices:
+                self._log("    - " + a + "\n", None)
+
+    def open_outdir(self, path=None):
+        d = (path or self.cfg.get("outdir") or "").strip()
+        if not d:
+            return
+        os.makedirs(d, exist_ok=True)
+        try:
+            os.startfile(d)
+        except Exception:
+            pass
+
+    # 占位（Task 5/6 补全）
+    def _maybe_start_play_probe(self):
+        pass
+
+    def _set_playable(self, ok, reason):
+        self._play_ok = bool(ok)
+        self._put({"type": "playable", "ok": bool(ok), "reason": reason})

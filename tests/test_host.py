@@ -133,5 +133,107 @@ class HistoryTest(unittest.TestCase):
         self.assertEqual(again.history, [])
 
 
+class FakeProc:
+    def __init__(self, code):
+        self._code = code
+    def poll(self):
+        return self._code
+    def wait(self):
+        return self._code
+
+
+def fake_iter(lines):
+    def it(proc, abort=None, keepalive=None, **kw):
+        for ln in lines:
+            yield ln
+    return it
+
+
+class DownloadTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load_host()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.events = []
+        self.host = self.mod.Host(os.path.join(self.tmp.name, "config.json"),
+                                  emit=self.events.append)
+        self.host.mark_ready()
+        self.cfg = dict(self.host.cfg, outdir=os.path.join(self.tmp.name, "out"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run_download(self, lines, code):
+        with mock.patch.object(self.mod, "spawn", return_value=FakeProc(code)), \
+             mock.patch.object(self.mod, "iter_lines_watch", fake_iter(lines)):
+            r = self.host.start_download(["https://x/v"], self.cfg)
+            self.assertTrue(r["ok"], r)
+            self.host._worker.join(5)
+        self.host.pump_once()
+
+    def test_success_emits_done_and_history(self):
+        self._run_download(["[download] Destination: v.mp4"], 0)
+        done = [e for e in self.events if e["type"] == "done"]
+        self.assertEqual(done[0]["code"], 0)
+        self.assertEqual(self.host.history[0]["status"], "ok")
+        self.assertIsNone(self.host.task_kind)
+
+    def test_unsafe_extra_arg_blocked(self):
+        cfg = dict(self.cfg, extra="--exec rm")
+        r = self.host.start_download(["https://x/v"], cfg)
+        self.assertFalse(r["ok"])
+        self.assertIn("禁用", r["error"])
+
+    def test_busy_gate(self):
+        self.host.task_kind = "detect"
+        r = self.host.start_download(["https://x/v"], self.cfg)
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["busy"])
+
+    def test_net_heal_retries_once(self):
+        calls = []
+        def spawn2(cmd, cwd=None):
+            calls.append(cmd)
+            return FakeProc(1 if len(calls) == 1 else 0)
+        lines = ["ERROR: unable to download: ConnectionResetError 10054"]
+        with mock.patch.object(self.mod, "spawn", side_effect=spawn2), \
+             mock.patch.object(self.mod, "iter_lines_watch", fake_iter(lines)):
+            r = self.host.start_download(["https://x/v"], dict(self.cfg, net_hard=True))
+            self.assertTrue(r["ok"], r)
+            self.host._worker.join(5)
+            self.host.pump_once()      # 路由 done → 自愈起新 worker
+            self.host._worker.join(5)
+            self.host.pump_once()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.host.history[-1]["status"], "ok")
+
+    def test_stop_marks_stopped_history(self):
+        def stopped_iter(proc, abort=None, keepalive=None, **kw):
+            self.host.user_stopped = True   # 模拟用户点了停止
+            yield "ERROR: aborted"
+        with mock.patch.object(self.mod, "spawn", return_value=FakeProc(1)), \
+             mock.patch.object(self.mod, "iter_lines_watch", stopped_iter):
+            r = self.host.start_download(["https://x/v"], self.cfg)
+            self.assertTrue(r["ok"], r)
+            self.host._worker.join(5)
+        self.host.pump_once()
+        self.assertEqual(self.host.history[-1]["status"], "stopped")
+
+    def test_submit_server_task_busy(self):
+        self.host.task_kind = "download"
+        self.assertFalse(self.host.submit_server_task({"urls": ["https://x"]}))
+
+    def test_external_task_mirrors_and_records_ext_source(self):
+        emitted = []
+        task = {"urls": ["https://x/v"], "cfg": dict(self.cfg),
+                "emit": emitted.append, "no_playlist": True}
+        with mock.patch.object(self.mod, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod, "iter_lines_watch", fake_iter([])):
+            self.host.start_external(task)
+            self.host._worker.join(5)
+        self.host.pump_once()
+        self.assertEqual(self.host.history[-1]["source"], "ext")
+        self.assertTrue(any(e.get("type") == "done" for e in emitted))
+
+
 if __name__ == "__main__":
     unittest.main()
