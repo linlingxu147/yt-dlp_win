@@ -49,7 +49,7 @@ INDEX_FILE = os.path.join(APP_DIR, "index.html")
 
 PORT_RANGE = core.PORT_RANGE
 APP_ID = "yt-dlp-web"          # 扩展靠它确认「端口上跑的是本项目」，而不是别的服务
-APP_VERSION = "1.7.2"
+APP_VERSION = "1.8.0"
 
 # 唯一被放行的扩展 ID——由 sniffer_extension\manifest.json 里的 "key" 决定（打包后固定不变）。
 # 以前这里是「任何 chrome-extension:// 都放行」，等于让本机的其它扩展也能改配置、
@@ -482,6 +482,19 @@ SNIFF_STATE = {
 }
 SNIFF_LOCK = threading.Lock()
 SNIFF_MAX_LINES = 200
+
+# ---------------- 桌面版宿主：把下载交还桌面版执行 ----------------
+# 桌面版内嵌本服务时在这里登记钩子：下载任务改由桌面版自己的流水线执行
+# （进度、日志、「停止」按钮都在桌面版窗口里），本服务只负责接请求、
+# 镜像状态、供扩展轮询。独立运行时钩子为空，保留自己的执行通路。
+TASK_SINK = None
+STOP_HOOK = None
+
+
+def set_task_sink(sink, stop=None):
+    global TASK_SINK, STOP_HOOK
+    TASK_SINK = sink
+    STOP_HOOK = stop
 
 
 def sniff_emit(obj, token=None):
@@ -1301,6 +1314,28 @@ class Handler(BaseHTTPRequestHandler):
             urls, bad = sanitize_urls(body.get("urls") or [])
             if not urls:
                 return self._json({"error": bad_urls_msg(bad, "请先选择要下载的内容")}, 400)
+            if TASK_SINK is not None:
+                self._sse_headers()
+                sse = SSE(self)
+
+                def emit(obj):
+                    sse.send(obj)
+                    if obj.get("type") == "done":
+                        sse.close()
+
+                def beat():
+                    while not sse.is_closed():
+                        sse.heartbeat()
+                        time.sleep(5)
+
+                threading.Thread(target=beat, daemon=True).start()
+                warn_bad_urls(emit, bad)
+                task = {"urls": urls, "cfg": cfg, "emit": emit,
+                        "no_playlist": bool(body.get("no_playlist"))}
+                if not TASK_SINK(task):
+                    emit({"type": "error", "text": "桌面版已有任务正在进行，请先停止或等待结束"})
+                    emit({"type": "done", "code": -1})   # 收尾事件不能少，否则前端状态栏卡住
+                return
             if not RUNNER.reserve("download"):
                 return self._busy_json()
             self._sse_headers()
@@ -1420,6 +1455,27 @@ class Handler(BaseHTTPRequestHandler):
                     cookie = scrub_header_value(body.get("cookie"))
                     if cookie:
                         cfg["cookie_header"] = cookie
+            if TASK_SINK is not None:
+                # 桌面版是宿主：任务交给桌面版流水线，本服务只镜像状态
+                if kind == "media":
+                    cfg.update({"thumb": False, "meta": False, "sub": False, "embedsub": False})
+                cfg.update({"fmt": "b", "play_while": True})
+                token = RUNNER.task_id + 1
+                with SNIFF_LOCK:
+                    SNIFF_STATE.update({"lines": [], "prog": None,
+                                        "last_text": "已接收，桌面版准备下载…",
+                                        "done": False, "code": None, "token": token,
+                                        "url": url, "title": str(body.get("title") or "")[:200],
+                                        "kind": kind})
+                task = {"url": url, "kind": kind, "cfg": cfg,
+                        "emit": lambda obj: sniff_emit(obj, token)}
+                if not TASK_SINK(task):
+                    with SNIFF_LOCK:
+                        if SNIFF_STATE.get("token") == token:
+                            SNIFF_STATE["done"] = True
+                    return self._json({"ok": False, "busy": True, "running_kind": RUNNER.kind,
+                                       "error": "桌面版已有任务正在进行，请先停止或等待结束"}, 409)
+                return self._json({"ok": True, "busy": False, "url": url})
             if not RUNNER.reserve("download"):
                 return self._json({"ok": False, "busy": True, "running_kind": RUNNER.kind,
                                    "error": "已有任务正在运行（%s），请先停止或等待结束" % (RUNNER.kind or "")}, 409)
@@ -1436,7 +1492,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(sniff_log_json())
 
         if p == "/api/stop":
-            ok = RUNNER.stop()
+            ok = STOP_HOOK() if STOP_HOOK is not None else RUNNER.stop()
             return self._json({"ok": ok})
 
         if p == "/api/play":

@@ -379,5 +379,78 @@ class TestPortProbe(unittest.TestCase):
         self.assertEqual(skipped, [port])
 
 
+class TestTaskSink(unittest.TestCase):
+    """桌面版是宿主时，下载交还桌面版执行：服务端只接请求、镜像状态。"""
+
+    def setUp(self):
+        import json
+        import urllib.request
+        import urllib.error
+        self.json = json
+        self.req = urllib.request
+        self.err = urllib.error
+        try:
+            self.svc = server.start_service(port=8899)
+        except OSError as e:
+            self.skipTest("端口 8899 被占用：%s" % e)
+        self.addCleanup(self.svc.shutdown)
+        self.addCleanup(server.set_task_sink, None, None)
+        self.addCleanup(server.RUNNER.finish)
+
+    def _post(self, path, body):
+        req = self.req.Request(self.svc.url + path, data=self.json.dumps(body).encode(),
+                               headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with self.req.urlopen(req, timeout=5) as r:
+                return r.status, self.json.loads(r.read())
+        except self.err.HTTPError as e:
+            return e.code, self.json.loads(e.read())
+
+    def test_sniff_task_is_handed_to_sink_and_state_mirrored(self):
+        got = {}
+
+        def sink(task):
+            got.update(task)
+            return server.RUNNER.reserve("download")
+
+        server.set_task_sink(sink)
+        st, j = self._post("/api/sniff", {"url": "https://example.com/v.mp4",
+                                          "kind": "media", "title": "T"})
+        self.assertEqual(st, 200)
+        self.assertTrue(j["ok"])
+        self.assertEqual(got["url"], "https://example.com/v.mp4")
+        self.assertEqual(got["cfg"]["fmt"], "b")
+        self.assertTrue(got["cfg"]["play_while"])
+        self.assertFalse(got["cfg"]["thumb"])
+        # 桌面版占住槽位，服务端 busy 跟着一致
+        self.assertTrue(server.RUNNER.busy())
+        got["emit"]({"type": "log", "text": "桌面版日志"})
+        got["emit"]({"type": "progress", "pct": 42.0, "speed": "1MiB/s"})
+        got["emit"]({"type": "done", "code": 0})
+        server.RUNNER.finish()
+        d = server.sniff_log_json()
+        self.assertTrue(d["done"])
+        self.assertEqual(d["code"], 0)
+        self.assertIn("桌面版日志", d["lines"])
+        self.assertEqual(d["prog"]["pct"], 42.0)
+        self.assertEqual(d["title"], "T")
+
+    def test_sink_busy_gives_409_and_restores_done(self):
+        server.RUNNER.reserve("download")
+        server.set_task_sink(lambda task: False)
+        st, j = self._post("/api/sniff", {"url": "https://example.com/v.mp4"})
+        self.assertEqual(st, 409)
+        self.assertTrue(j["busy"])
+        self.assertTrue(server.SNIFF_STATE["done"])
+
+    def test_stop_goes_through_hook(self):
+        calls = []
+        server.set_task_sink(lambda task: True, stop=lambda: calls.append(1) or True)
+        st, j = self._post("/api/stop", {})
+        self.assertEqual(st, 200)
+        self.assertTrue(j["ok"])
+        self.assertEqual(calls, [1])
+
+
 if __name__ == "__main__":
     unittest.main()

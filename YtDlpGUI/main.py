@@ -91,6 +91,10 @@ class App:
         self.proc = None
         self.web_svc = None            # 内嵌的浏览器扩展服务（后台线程）
         self._want_service = ext_service
+        self._web_mod = None           # 内嵌服务模块（与桌面版共用 RUNNER 闸门）
+        self.ext_emit = None           # 非空=当前任务来自扩展服务，事件镜像回服务端
+        self.ext_cfg = None            # 扩展任务的配置快照（不读界面控件）
+        self.ext_cookie_file = None    # 扩展带来的 Netscape 临时文件，任务结束删除
         self.running = False
         self.task_kind = None     # 当前占用子进程的任务名，见 TASK_LABELS
         self.cfg = self._load_config()
@@ -617,8 +621,8 @@ class App:
         if p:
             self.var_cookie.set(p)
 
-    def open_outdir(self):
-        d = self.var_outdir.get().strip()
+    def open_outdir(self, path=None):
+        d = (path or self.var_outdir.get()).strip()
         if not d:
             return
         os.makedirs(d, exist_ok=True)
@@ -685,6 +689,8 @@ class App:
         self.log.insert("end", text, tag)
         self.log.see("end")
         self.log.configure(state="disabled")
+        if self.ext_emit:
+            self.ext_emit({"type": "log", "text": text.rstrip("\n")})
 
     def set_status(self, text, color="#1f2328"):
         self.lbl_status.config(text=text, foreground=color)
@@ -786,7 +792,9 @@ class App:
         self.net_tried, self.net_name = set(), "normal"
         self.user_stopped = False
         self.running = True
-        self.task_kind = "download"
+        if not self._reserve("download"):
+            messagebox.showinfo("提示", "已有任务正在进行，请先点「停止」或等待结束。")
+            return
         self.btn_start.config(state="disabled")
         self.btn_detect.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -815,6 +823,92 @@ class App:
         messagebox.showinfo("提示", "「%s」正在进行，请先点「停止」或等待结束。"
                             % TASK_LABELS.get(self.task_kind, "任务"))
         return True
+
+    def _reserve(self, kind):
+        """统一闸门：桌面版自己的任务与扩展服务共用一个槽位，不并行跑 yt-dlp。"""
+        if self.task_kind:
+            return False
+        if self._web_mod and not self._web_mod.RUNNER.reserve(kind):
+            return False
+        self.task_kind = kind
+        return True
+
+    def _release_runner(self):
+        if self._web_mod:
+            self._web_mod.RUNNER.finish()
+
+    def _task_cfg(self):
+        """当前任务的配置：扩展任务用服务带来的快照，自有任务读界面。"""
+        return dict(self.ext_cfg) if self.ext_cfg is not None else self._collect_cfg()
+
+    def submit_server_task(self, task):
+        """扩展服务把下载交还桌面版的入口（HTTP 线程调用）。
+
+        同步占住闸门立即返回；忙则返回 False，由服务端回 409。
+        真正启动经队列回到 UI 线程（_pump），复用自有下载流水线。
+        """
+        if not self._reserve("download"):
+            return False
+        # 不在 HTTP 线程碰 Tcl：投进队列，由 _pump 在 UI 线程启动
+        self.q.put(("exttask", task))
+        return True
+
+    def _start_external(self, task):
+        cfg = dict(task.get("cfg") or {})
+        urls = list(task.get("urls") or ([task["url"]] if task.get("url") else []))
+        emit = task.get("emit")
+        if not urls:
+            self._release_runner()
+            self.task_kind = None
+            return
+        outdir = cfg.get("outdir") or os.path.join(BASE_DIR, "downloads")
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except Exception as e:
+            if emit:
+                emit({"type": "log", "level": "err", "text": "无法创建输出目录：%s" % e})
+                emit({"type": "done", "code": -1})
+            self._release_runner()
+            self.task_kind = None
+            return
+        self.ext_emit, self.ext_cfg = emit, cfg
+        self.ext_cookie_file = cfg.get("_sniff_cookie_file")
+        self.dl_urls = urls
+        self.dl_no_playlist = bool(task.get("no_playlist", True))
+        self.dl_outdir = outdir
+        self.net_tried, self.net_name = set(), "normal"
+        self.user_stopped = False
+        self.running = True
+        self.task_kind = "download"
+        self.btn_start.config(state="disabled")
+        self.btn_detect.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self._reset_progress()
+        self.set_status("下载中…（浏览器扩展）", "#0550ae")
+        warns = []
+        cmd = self.build_cmd(urls, no_playlist=self.dl_no_playlist, cfg=cfg, warn=warns)
+        for w in warns:
+            self.log_line("! " + w + "\n", "warn")
+        self.log_line("[浏览器扩展] 嗅探地址交给桌面版下载：%s\n" % self._short(urls[0]), "ok")
+        self.log_line("> " + command_text(cmd) + "\n", "cmd")
+        threading.Thread(target=self._run, args=(cmd, outdir), daemon=True).start()
+
+    def _finish_task(self, code):
+        """任务真正结束：放行共享槽位、把结果镜像回扩展、清掉临时 cookie。"""
+        self._release_runner()
+        emit, cookie = self.ext_emit, self.ext_cookie_file
+        self.ext_emit = self.ext_cfg = self.ext_cookie_file = None
+        if self._web_mod:
+            with self._web_mod.PLAY_LOCK:
+                self._web_mod.PLAY_STATE.update({"raw_path": "", "ok": False,
+                                                 "reason": "还没有开始下载"})
+        if emit:
+            emit({"type": "done", "code": code})
+        if cookie and os.path.isfile(cookie):
+            try:
+                os.remove(cookie)
+            except Exception:
+                pass
 
     def _run(self, cmd, outdir):
         try:
@@ -847,11 +941,12 @@ class App:
         proc, kind = self.proc, self.task_kind
         if not proc or proc.poll() is not None:
             self.set_status("当前没有进行中的任务", "#57606a")
-            return
+            return False
         self.user_stopped = True
         kill_tree(proc)
         self.set_status("已停止", "#cf222e")
         self.log_line("[已手动停止：%s]\n" % TASK_LABELS.get(kind, "任务"), "warn")
+        return True
 
     def _pump(self):
         try:
@@ -876,6 +971,8 @@ class App:
                                      rest[2] if len(rest) > 2 else None)
                 elif kind == "playable":
                     self._set_playable(rest[0], rest[1] if len(rest) > 1 else "")
+                elif kind == "exttask":
+                    self._start_external(rest[0])
         except queue.Empty:
             pass
         self.root.after(100, self._pump)
@@ -892,6 +989,10 @@ class App:
             self.cur_file = st["file"]
             self.item_i, self.item_total = st["item_i"], st["item_total"]
             self.files_done = {x for x in st["done"] if x}
+            if self.ext_emit:
+                self.ext_emit({"type": "progress", "pct": st["pct"], "speed": st["speed"],
+                               "eta": st["eta"], "size": st["size"], "file": st["file"],
+                               "item_i": st["item_i"], "item_total": st["item_total"]})
             if ev["kind"] == "file":
                 self.lbl_file.config(text="正在下载：" + self._short(self.cur_file), foreground="#0550ae")
                 self._refresh_progress()
@@ -923,7 +1024,9 @@ class App:
         self.log.configure(state="disabled")
 
     def _on_done(self, code):
-        core.clear_preview_links(self.cfg.get("outdir") or os.path.join(BASE_DIR, "downloads"))
+        base = self._task_cfg()
+        was_ext = self.ext_cfg is not None
+        core.clear_preview_links(base.get("outdir") or os.path.join(BASE_DIR, "downloads"))
         self._play_raw = ""
         self._set_playable(False, "还没有开始下载")
         self.running = False
@@ -947,8 +1050,10 @@ class App:
             self.lbl_file.config(text="全部完成", foreground="#1a7f37")
             self.set_status("完成", "#1a7f37")
             self.log_line(f"=== 完成 · {tail} ===\n", "ok")
-            if self.var_open.get():
-                self.open_outdir()
+            open_flag = base.get("open_after") if was_ext else self.var_open.get()
+            self._finish_task(code)
+            if open_flag:
+                self.open_outdir(base.get("outdir"))
         else:
             if self._net_heal():
                 return
@@ -956,6 +1061,7 @@ class App:
             self.lbl_file.config(text="出错或中断 — 见日志中的原因与建议", foreground="#cf222e")
             self.log_line(f"=== 结束，退出码 {code} ===\n", "err")
             self._log_diag()
+            self._finish_task(code)
 
     def _net_heal(self):
         """连接层失败后按「直连 → 浏览器指纹 → 分块传输」阶梯自动重试一次姿势。
@@ -965,7 +1071,7 @@ class App:
         """
         if self.user_stopped or not self.dl_urls:
             return False
-        cfg = self._collect_cfg()
+        cfg = self._task_cfg()
         if not cfg.get("net_hard", True):
             return False
         tail = self.diag_buf or ""
@@ -1012,7 +1118,8 @@ class App:
         self.clear_log()
         self.log_line("=== 自动排障：依次尝试 4 套访问配置（每套最多 25 秒）===\n", "cmd")
         self.user_stopped = False
-        self.task_kind = "trouble"
+        if not self._reserve("trouble"):
+            return
         self.btn_trouble.config(state="disabled")
         self.btn_detect.config(state="disabled")
         self.btn_start.config(state="disabled")
@@ -1121,6 +1228,7 @@ class App:
 
     def _on_trouble_done(self, ok, task="trouble"):
         self.task_kind = None
+        self._release_runner()
         self._end()
         self.btn_trouble.config(state="normal")
         self.btn_detect.config(state="normal")
@@ -1153,7 +1261,8 @@ class App:
         self.clear_log()
         self.log_line("> " + command_text(cmd) + "\n", "cmd")
         self.user_stopped = False
-        self.task_kind = "update"
+        if not self._reserve("update"):
+            return
         self.btn_update.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.set_status("更新 yt-dlp…", "#0550ae")
@@ -1201,7 +1310,8 @@ class App:
         self.clear_results()
         self.detecting = True
         self.user_stopped = False
-        self.task_kind = "detect"
+        if not self._reserve("detect"):
+            return
         self.btn_detect.config(state="disabled")
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -1317,11 +1427,16 @@ class App:
             webbrowser.open(self._preview_url)
 
     def _maybe_start_play_probe(self):
-        cfg = self._collect_cfg()
+        cfg = self._task_cfg()
         raw = self.pstate.get("raw_path") or ""
         if not raw or not cfg.get("play_while") or raw == self._play_raw:
             return
         self._play_raw = raw
+        if self._web_mod:
+            with self._web_mod.PLAY_LOCK:
+                self._web_mod.PLAY_STATE.update({"raw_path": raw, "outdir": self.dl_outdir,
+                                                 "cfg": dict(cfg), "ok": False,
+                                                 "reason": "正在判断能否边下边播…"})
         self._set_playable(False, "正在判断能否边下边播…")
 
         def work():
@@ -1358,11 +1473,17 @@ class App:
         self._play_ok = bool(ok)
         self.btn_play.config(state="normal" if ok else "disabled")
         self.lbl_play.config(text=reason or ("可以边下边播" if ok else "此源不支持边下边播"))
+        if self.ext_emit:
+            self.ext_emit({"type": "playable", "ok": bool(ok), "reason": reason})
+        if self._web_mod:
+            with self._web_mod.PLAY_LOCK:
+                self._web_mod.PLAY_STATE["ok"] = bool(ok)
+                self._web_mod.PLAY_STATE["reason"] = reason
 
     def _play_now(self):
         if not self._play_ok:
             return
-        cfg = self._collect_cfg()
+        cfg = self._task_cfg()
         outdir = cfg.get("outdir") or os.path.join(BASE_DIR, "downloads")
         real = core.real_download_path(self._play_raw)
         if not real:
@@ -1439,6 +1560,7 @@ class App:
         self.detecting = False
         self.proc = None
         self.task_kind = None
+        self._release_runner()
         self.bar.stop()
         self.bar.config(mode="determinate")
         self.btn_detect.config(state="normal")
@@ -1477,7 +1599,8 @@ class App:
             return
         url = urls[0]
         # 占住任务闸门：格式表读取也是同一个 yt-dlp 的单任务，不能再和下载并行
-        self.task_kind = "formats"
+        if not self._reserve("formats"):
+            return
         self.user_stopped = False
         win = tk.Toplevel(self.root)
         win.title("可用格式")
@@ -1543,6 +1666,7 @@ class App:
             self._end()
             if self.task_kind == "formats":
                 self.task_kind = None
+                self._release_runner()
             try:
                 win.after(0, finish, out, code)
             except Exception:
@@ -1576,9 +1700,12 @@ class App:
                 return
             # 两边共用桌面版这份配置：扩展触发的下载和界面上的设置才是一回事
             mod.set_config_file(CONFIG_FILE)
+            self._web_mod = mod
             self.web_svc = mod.start_service()
+            mod.set_task_sink(self.submit_server_task, stop=self.stop)
         except Exception as e:
             self.web_svc = None
+            self._web_mod = None
             self._set_svc_label("扩展服务启动失败", ok=False)
             self.log_line("[扩展服务] 启动失败：%s\n" % e, "warn")
             return
@@ -1588,11 +1715,14 @@ class App:
     def _stop_ext_service(self):
         if self.web_svc is None:
             return
+        if self._web_mod:
+            self._web_mod.set_task_sink(None, stop=None)
         try:
             self.web_svc.shutdown()
         except Exception:
             pass
         self.web_svc = None
+        self._web_mod = None
         self._set_svc_label("扩展服务：已停止", ok=False)
 
     def _toggle_ext_service(self):
