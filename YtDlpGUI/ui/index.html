@@ -3,19 +3,261 @@
 <head>
 <meta charset="utf-8">
 <meta name="color-scheme" content="light dark">
-<title>yt-dlp 下载器</title>
+<script>
+try {
+  document.querySelector('meta[name="color-scheme"]').content =
+    localStorage.getItem('color-scheme') || 'light dark';
+} catch (e) {}
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>yt-dlp 下载器 · 可视化界面</title>
+<link rel="stylesheet" href="css/app.css">
 </head>
 <body>
-<h1>桥探针</h1>
-<pre id="out">等待…</pre>
-<script type="module" src="js/bridge.js"></script>
-<script type="module">
-import { call, ready, on } from './js/bridge.js';
-await ready;
-const r = await call('ping');
-document.getElementById('out').textContent = 'ping → ' + r;
-on('probe', ev => document.getElementById('out').textContent += ' / probe ' + ev.n);
-window.__probeDone = true;
-</script>
+<header class="top">
+  <h1>yt-dlp 下载器</h1>
+  <span id="env" class="muted"></span>
+  <span id="svc" class="muted">扩展服务：启动中…</span>
+</header>
+
+<div class="tabs">
+  <div role="tablist" aria-label="功能页签">
+    <button type="button" role="tab" id="tab-download" data-panel="panel-download"
+            aria-selected="true" tabindex="0">下载</button>
+    <button type="button" role="tab" id="tab-sniff" data-panel="panel-sniff"
+            aria-selected="false" tabindex="-1">扩展嗅探</button>
+    <button type="button" role="tab" id="tab-history" data-panel="panel-history"
+            aria-selected="false" tabindex="-1">下载历史</button>
+  </div>
+
+  <section role="tabpanel" id="panel-download" aria-labelledby="tab-download" tabindex="0">
+    <div class="panel-body">
+      <div class="cols">
+        <div class="col">
+          <fieldset>
+            <legend>① 下载链接</legend>
+            <textarea id="url" rows="4" placeholder="每行一个链接，可一次粘贴多个；也可以是播放列表地址"></textarea>
+            <div class="row">
+              <button type="button" id="btn-paste">剪贴板粘贴</button>
+              <button type="button" id="btn-url-clear">清空</button>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>② 保存位置</legend>
+            <label>输出目录 <input id="outdir" type="text"></label>
+            <div class="row">
+              <button type="button" id="btn-browse-outdir">浏览…</button>
+              <button type="button" id="btn-open-outdir">打开</button>
+            </div>
+            <label>文件名 <select id="tpl"></select></label>
+            <p class="hint">占位符：title 标题、id 编号、uploader 作者、upload_date 日期、playlist_index 列表序号</p>
+          </fieldset>
+          <fieldset>
+            <legend>③ 内容与格式</legend>
+            <label>下载模式 <select id="mode"></select></label>
+            <label>合并容器
+              <select id="merge">
+                <option>mp4</option><option>mkv</option><option>webm</option><option>不转换</option>
+              </select>
+            </label>
+            <label>格式代码 <input id="fmt" type="text"></label>
+            <div class="row">
+              <button type="button" id="btn-formats">查看可用格式…</button>
+            </div>
+            <p class="hint">自定义模式下可填 137+140 这样的组合；其他模式由程序自动填好</p>
+          </fieldset>
+          <fieldset>
+            <legend>④ 访问与身份（解决探测不到）</legend>
+            <label>浏览器 Cookies <select id="browser"></select></label>
+            <label>配置 <input id="browser_profile" type="text"></label>
+            <label>User-Agent <input id="ua" type="text" list="ua-list"></label>
+            <datalist id="ua-list"></datalist>
+            <label>Referer <input id="referer" type="text"></label>
+            <label>请求头 <textarea id="headers" rows="3" placeholder="每行一条 Key: Value"></textarea></label>
+            <label class="check"><input id="generic" type="checkbox"> 通用提取器兜底</label>
+            <label>提取器参数 <input id="extractor_args" type="text" placeholder="youtube:player_client=web"></label>
+            <label>重试 <input id="retries" type="text" size="6"></label>
+            <p class="hint">从浏览器读登录态（读取时请关闭该浏览器）</p>
+          </fieldset>
+        </div>
+        <div class="col">
+          <fieldset>
+            <legend>⑤ 播放列表与容错</legend>
+            <label class="check"><input id="pl" type="checkbox"> 下载整个播放列表</label>
+            <label>范围 <input id="items" type="text" placeholder="1-5 或 1,3,7 或 2-"></label>
+            <label class="check"><input id="ignore" type="checkbox"> 出错继续下一个</label>
+            <label class="check"><input id="open_after" type="checkbox"> 完成后打开文件夹</label>
+            <label class="check"><input id="net_hard" type="checkbox"> 失败后自动换姿势重试（浏览器指纹 / 分块传输）</label>
+            <label class="check"><input id="play_while" type="checkbox"> 边下边播（不影响下载速度）</label>
+            <p class="hint">只对能流式播放的源有效（HLS / mkv / webm）；分离源与 aria2c 会置灰并说明原因</p>
+          </fieldset>
+          <fieldset>
+            <legend>⑥ 附加内容</legend>
+            <label class="check"><input id="sub" type="checkbox"> 下载字幕（含自动字幕）</label>
+            <label>字幕语言 <input id="sublang" type="text" placeholder="zh-Hans,zh,en"></label>
+            <label class="check"><input id="embedsub" type="checkbox"> 字幕嵌入视频</label>
+            <label class="check"><input id="thumb" type="checkbox"> 嵌入封面缩略图</label>
+            <label class="check"><input id="meta" type="checkbox"> 写入元数据</label>
+          </fieldset>
+          <fieldset>
+            <legend>⑦ 网络与加速</legend>
+            <label>限速 <input id="rate" type="text" placeholder="500K / 5M，留空不限速"></label>
+            <label>代理 <input id="proxy" type="text" placeholder="http://127.0.0.1:7890"></label>
+            <label>Cookies 文件 <input id="cookie" type="text"></label>
+            <div class="row"><button type="button" id="btn-browse-cookie">选择…</button></div>
+            <label class="check"><input id="conc" type="checkbox"> 分片并发加速（-N）</label>
+            <label>分片数 <input id="conc_n" type="number" min="1" max="32" size="5"></label>
+            <label class="check"><input id="aria" type="checkbox"> 外部下载器 aria2c <span id="aria-state" class="hint"></span></label>
+            <label>aria2c 参数 <input id="aria_args" type="text"></label>
+          </fieldset>
+          <fieldset>
+            <legend>⑧ 高级</legend>
+            <label class="check"><input id="flat" type="checkbox"> 快速探测（--flat-playlist，不解析清晰度）</label>
+            <label>附加参数 <input id="extra" type="text" placeholder="--download-archive archive.txt"></label>
+            <label class="check"><input id="ext_service" type="checkbox"> 启用浏览器扩展支持（本机 127.0.0.1:8765）</label>
+            <label>界面主题
+              <select id="theme">
+                <option value="system">跟随系统</option>
+                <option value="light">浅色</option>
+                <option value="dark">深色</option>
+              </select>
+            </label>
+          </fieldset>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <button type="button" id="btn-start" class="primary">开始下载</button>
+        <button type="button" id="btn-detect">探测资源</button>
+        <button type="button" id="btn-stop" disabled>停止</button>
+        <button type="button" id="btn-trouble">自动排障</button>
+        <button type="button" id="btn-update">更新 yt-dlp</button>
+        <button type="button" id="btn-copy">复制命令</button>
+        <button type="button" id="btn-clearlog">清空日志</button>
+        <span id="status" aria-live="polite">就绪</span>
+      </div>
+
+      <fieldset class="progress">
+        <legend>下载进度</legend>
+        <div id="prog-file" class="muted">等待开始</div>
+        <div class="row">
+          <progress id="prog-bar" max="100" value="0"></progress>
+          <span id="prog-pct">0%</span>
+        </div>
+        <div id="prog-detail" class="muted">—</div>
+        <div class="row">
+          <button type="button" id="btn-play" disabled>边下边播</button>
+          <span id="play-reason" class="hint">还没有开始下载</span>
+        </div>
+      </fieldset>
+
+      <fieldset class="results">
+        <legend>探测结果（点 ✓ 列勾选要下载的条目）</legend>
+        <div class="table-wrapper" tabindex="0" role="region" aria-label="探测结果表">
+          <table>
+            <thead>
+              <tr><th>✓</th><th>标题</th><th>时长</th><th>清晰度</th><th>大小</th><th>上传者</th></tr>
+            </thead>
+            <tbody id="results-body"></tbody>
+          </table>
+        </div>
+        <div class="row">
+          <button type="button" id="btn-all">全选</button>
+          <button type="button" id="btn-none">全不选</button>
+          <button type="button" id="btn-dl-sel" disabled>下载选中项</button>
+          <button type="button" id="btn-clear-results">清空列表</button>
+          <span id="result-count" class="hint">尚未探测</span>
+        </div>
+        <div class="preview row">
+          <img id="pv-img" alt="" hidden>
+          <span id="pv-img-text" class="hint">选中一行看封面</span>
+          <div>
+            <div id="pv-meta"></div>
+            <button type="button" id="btn-pv-open" disabled>打开原网页</button>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset class="logbox">
+        <legend>运行日志</legend>
+        <div id="log" tabindex="0" role="log" aria-label="运行日志"></div>
+      </fieldset>
+    </div>
+  </section>
+
+  <section role="tabpanel" id="panel-sniff" aria-labelledby="tab-sniff" tabindex="0" hidden>
+    <div class="panel-body">
+      <div class="toolbar">
+        <span class="hint">浏览器扩展嗅探到的媒体地址（开着扩展的页面会自动出现在这里）</span>
+        <label class="check"><input id="sn-fold" type="checkbox" checked> 折叠分片</label>
+        <button type="button" id="btn-sn-refresh">刷新</button>
+        <button type="button" id="btn-sn-clear">清空列表</button>
+      </div>
+      <div class="table-wrapper" tabindex="0" role="region" aria-label="嗅探列表">
+        <table>
+          <thead>
+            <tr><th></th><th>标题</th><th>地址</th><th>类型</th><th>大小</th><th>来源</th><th>页面</th><th>时间</th></tr>
+          </thead>
+          <tbody id="sniff-body"></tbody>
+        </table>
+      </div>
+      <div class="toolbar">
+        <button type="button" id="btn-sn-download">下载选中</button>
+        <button type="button" id="btn-sn-preview">预览选中</button>
+        <span id="sn-count" class="hint"></span>
+      </div>
+      <fieldset>
+        <legend>预览（缩略图 / 时长 / 短片段）</legend>
+        <div class="row">
+          <img id="sn-img" alt="" hidden>
+          <div>
+            <div id="sn-pv" class="hint">选中一条后点「预览选中」</div>
+            <button type="button" id="btn-sn-play" disabled>播放片段</button>
+          </div>
+        </div>
+      </fieldset>
+    </div>
+  </section>
+
+  <section role="tabpanel" id="panel-history" aria-labelledby="tab-history" tabindex="0" hidden>
+    <div class="panel-body">
+      <div class="toolbar">
+        <span class="hint">本机下载记录（最多 500 条，仅存本机）</span>
+        <button type="button" id="btn-history-clear">清空历史</button>
+      </div>
+      <div class="table-wrapper" tabindex="0" role="region" aria-label="下载历史">
+        <table>
+          <thead>
+            <tr><th>时间</th><th>标题</th><th>结果</th><th>耗时</th><th>来源</th><th>操作</th></tr>
+          </thead>
+          <tbody id="history-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+</div>
+
+<dialog id="dlg-formats" aria-labelledby="formats-title">
+  <h1 id="formats-title">可用格式</h1>
+  <pre id="formats-text" class="mono"></pre>
+  <p class="hint">双击某一行可选中该格式</p>
+  <form method="dialog" class="row">
+    <button value="best" id="btn-fmt-best">最佳画质</button>
+    <button value="audio" id="btn-fmt-audio">最佳音频</button>
+    <button value="close">关闭</button>
+  </form>
+</dialog>
+
+<dialog id="dlg-confirm" aria-labelledby="confirm-title">
+  <h1 id="confirm-title">确认</h1>
+  <p id="confirm-text"></p>
+  <form method="dialog" class="row">
+    <button value="cancel" id="btn-confirm-cancel" autofocus>取消</button>
+    <button value="ok" id="btn-confirm-ok">确定</button>
+  </form>
+</dialog>
+
+<div id="toast" aria-live="polite"></div>
+<script type="module" src="js/app.js"></script>
 </body>
 </html>
