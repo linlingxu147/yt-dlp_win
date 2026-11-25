@@ -11,10 +11,13 @@ import os
 import queue
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import ttk, filedialog, messagebox
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -297,6 +300,12 @@ class App:
         ttk.Label(lf, text="连接被掐断（10054）时会自动换一套请求方式重来；关掉后只按当前设置试一次",
                   foreground="#8c959f", font=FONT_S, wraplength=470, justify="left").grid(
             row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
+        self.var_playwhile = tk.BooleanVar()
+        ttk.Checkbutton(lf, text="边下边播（不影响下载速度）", variable=self.var_playwhile).grid(
+            row=6, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 2))
+        ttk.Label(lf, text="只对能流式播放的源有效（HLS / mkv / webm）；音视频分离的源与 aria2c 会置灰并说明原因",
+                  foreground="#8c959f", font=FONT_S, wraplength=470, justify="left").grid(
+            row=7, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
 
     def _build_extras(self, parent, row):
         lf = ttk.LabelFrame(parent, text=" ⑥ 附加内容 ")
@@ -401,6 +410,14 @@ class App:
         self.lbl_pct.grid(row=1, column=1, padx=(0, 8), pady=2)
         self.lbl_detail = ttk.Label(lf, text="—", font=FONT_S, foreground="#57606a")
         self.lbl_detail.grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+        pf = ttk.Frame(lf)
+        pf.grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
+        self.btn_play = ttk.Button(pf, text="边下边播", state="disabled", command=self._play_now)
+        self.btn_play.pack(side="left")
+        self.lbl_play = ttk.Label(pf, text="还没有开始下载", font=FONT_S, foreground="#8c959f")
+        self.lbl_play.pack(side="left", padx=8)
+        self._play_raw = ""
+        self._play_ok = False
 
     def _build_results(self, row):
         lf = ttk.LabelFrame(self.root, text=" 探测结果（点 ✓ 列勾选要下载的条目） ")
@@ -433,6 +450,21 @@ class App:
         ttk.Button(bf, text="清空列表", width=10, command=self.clear_results).pack(side="left")
         self.lbl_count = ttk.Label(bf, text="尚未探测", font=FONT_S, foreground="#8c959f")
         self.lbl_count.pack(side="right")
+
+        pf = ttk.Frame(lf)
+        pf.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        self.pv_img = ttk.Label(pf, text="选中一行看封面", font=FONT_S, foreground="#8c959f")
+        self.pv_img.pack(side="left", padx=(0, 10))
+        right = ttk.Frame(pf)
+        right.pack(side="left", fill="both", expand=True)
+        self.pv_meta = ttk.Label(right, text="", font=FONT_S, justify="left", wraplength=420)
+        self.pv_meta.pack(anchor="w")
+        self.btn_pv_open = ttk.Button(right, text="打开原网页", state="disabled",
+                                      command=self._open_preview_url)
+        self.btn_pv_open.pack(anchor="w", pady=(4, 0))
+        self._preview_url = ""
+        self._photo = None
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
     def _build_log(self, row):
         lf = ttk.LabelFrame(self.root, text=" 运行日志 ")
@@ -486,6 +518,7 @@ class App:
             "aria": self.var_aria.get(), "aria_args": self.var_aria_args.get().strip(),
             "flat": self.var_flat.get(),
             "net_hard": self.var_nethard.get(),
+            "play_while": self.var_playwhile.get(),
             "browser": self.var_browser.get(), "browser_profile": self.var_browser_profile.get().strip(),
             "ua": self.var_ua.get().strip(), "referer": self.var_referer.get().strip(),
             "headers": normalize_headers(self.txt_headers.get("1.0", "end")),
@@ -524,6 +557,7 @@ class App:
         self.var_aria.set(self.cfg["aria"]); self.var_flat.set(self.cfg["flat"])
         self.var_generic.set(self.cfg["generic"])
         self.var_nethard.set(self.cfg.get("net_hard", True))
+        self.var_playwhile.set(self.cfg.get("play_while", False))
         self._sync_mode(keep_fmt=True)
 
     def _sync_mode(self, keep_fmt=False):
@@ -792,6 +826,10 @@ class App:
                     self._apply_probe_fix(rest[0])
                 elif kind == "trodone":
                     self._on_trouble_done(rest[0], rest[1] if len(rest) > 1 else "trouble")
+                elif kind == "preview":
+                    self._on_preview(rest[0], rest[1] if len(rest) > 1 else None)
+                elif kind == "playable":
+                    self._set_playable(rest[0], rest[1] if len(rest) > 1 else "")
         except queue.Empty:
             pass
         self.root.after(100, self._pump)
@@ -813,6 +851,7 @@ class App:
                 self._refresh_progress()
                 # 「Destination:」那行照旧显示原文；PROG| 机器行换成人类可读文本
                 self.log_line((progress_text(st) if core.PROG_MARK in line else line) + "\n", "ok")
+                self._maybe_start_play_probe()
             elif ev["kind"] == "item":
                 self._refresh_progress()
                 self.log_line(line + "\n", None)
@@ -838,6 +877,9 @@ class App:
         self.log.configure(state="disabled")
 
     def _on_done(self, code):
+        core.clear_preview_links(self.cfg.get("outdir") or os.path.join(BASE_DIR, "downloads"))
+        self._play_raw = ""
+        self._set_playable(False, "还没有开始下载")
         self.running = False
         self.proc = None
         self.task_kind = None    # 自愈重试会由 _net_heal 重新占住闸门
@@ -1147,6 +1189,125 @@ class App:
         code = proc.wait()
         self.diag_buf = "\n".join(buf[-300:])
         self.q.put(("detdone", code))
+
+    def _on_tree_select(self, _event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        try:
+            i = int(sel[0])
+        except ValueError:
+            return
+        if 0 <= i < len(self.results):
+            self._show_preview(i)
+
+    def _show_preview(self, i):
+        info = self.results[i]
+        self._preview_url = info.get("url") or ""
+        self.btn_pv_open.config(state="normal" if self._preview_url else "disabled")
+        self.pv_meta.config(text="%s\n时长 %s · 清晰度 %s · 大小 %s\n上传者 %s" % (
+            info.get("title") or "", fmt_dur(info.get("dur")), info.get("res") or "-",
+            fmt_size(info.get("size")), info.get("up") or "-"))
+        url = info.get("thumb") or ""
+        if not url:
+            self._set_preview_image(None, "这个条目没有封面地址")
+            return
+        self._set_preview_image(None, "封面加载中…")
+        cfg = self._collect_cfg()
+
+        def work():
+            path, err = core.fetch_thumb(url, cfg)
+            self.q.put(("preview", path, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_preview_image(self, photo, text):
+        self._photo = photo          # 持有引用，否则 Tkinter 会把图回收掉
+        if photo is not None:
+            self.pv_img.config(image=photo, text="")
+        else:
+            self.pv_img.config(image="", text=text or "")
+
+    def _on_preview(self, path, err):
+        if err or not path:
+            self._set_preview_image(None, "封面取不到：%s" % (err or "未知原因"))
+            return
+        png = os.path.join(tempfile.gettempdir(), "ytdlp_preview_%d.png" % os.getpid())
+        cmd = [find_tool("ffmpeg.exe"), "-hide_banner", "-loglevel", "error", "-y",
+               "-i", path, "-vf", "scale=320:-1", "-frames:v", "1", png]
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=core.CREATE_NO_WINDOW, timeout=30)
+            photo = tk.PhotoImage(file=png)
+        except Exception as e:
+            self._set_preview_image(None, "封面格式无法显示：%s" % e)
+            return
+        self._set_preview_image(photo, "")
+
+    def _open_preview_url(self):
+        if self._preview_url:
+            webbrowser.open(self._preview_url)
+
+    def _maybe_start_play_probe(self):
+        cfg = self._collect_cfg()
+        raw = self.pstate.get("raw_path") or ""
+        if not raw or not cfg.get("play_while") or raw == self._play_raw:
+            return
+        self._play_raw = raw
+        self._set_playable(False, "正在判断能否边下边播…")
+
+        def work():
+            if core.fmt_is_separated(cfg):
+                self.q.put(("playable", False, "此源音视频分离，边下边播不适用"))
+                return
+            if cfg.get("aria"):
+                self.q.put(("playable", False, "aria2c 外部下载器不支持边下边播"))
+                return
+            reason = "文件还没写出来"
+            deadline = time.time() + 3
+            for _ in range(3):
+                while time.time() < deadline:
+                    p = core.real_download_path(raw)
+                    try:
+                        if p and os.path.getsize(p) >= 256 * 1024:
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(0.5)
+                p = core.real_download_path(raw)
+                if p:
+                    v = core.probe_playable(p)
+                    if v["ok"]:
+                        self.q.put(("playable", True, ""))
+                        return
+                    reason = v["reason"]
+                deadline = time.time() + 5
+            self.q.put(("playable", False, "此源要下完才能播：%s" % reason))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_playable(self, ok, reason):
+        self._play_ok = bool(ok)
+        self.btn_play.config(state="normal" if ok else "disabled")
+        self.lbl_play.config(text=reason or ("可以边下边播" if ok else "此源不支持边下边播"))
+
+    def _play_now(self):
+        if not self._play_ok:
+            return
+        cfg = self._collect_cfg()
+        outdir = cfg.get("outdir") or os.path.join(BASE_DIR, "downloads")
+        real = core.real_download_path(self._play_raw)
+        if not real:
+            messagebox.showwarning("提示", "文件还没写出来，稍等再试。")
+            return
+        link, err = core.make_preview_link(real, outdir)
+        if err:
+            messagebox.showwarning("无法边下边播", err)
+            return
+        try:
+            os.startfile(link)
+        except Exception as e:
+            messagebox.showerror("打开播放器失败", "%s\n建议安装 VLC 或 PotPlayer。" % e)
 
     def _add_result(self, info):
         i = len(self.results)
