@@ -232,5 +232,101 @@ class TestFormatLine(unittest.TestCase):
         self.assertEqual(ev["file"], "a|b.mp4")
 
 
+def _write(path, data):
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+class _FakeProc(object):
+    """替身进程：communicate() 直接回预置输出，可选在「跑」的时候造个文件。"""
+
+    def __init__(self, out=b"", rc=0, side=None):
+        self._out = out
+        self.returncode = rc
+        self._side = side
+
+    def communicate(self, timeout=None):
+        if self._side:
+            self._side()
+        return self._out, b""
+
+
+class TestStreamPreviewHelpers(unittest.TestCase):
+    def test_headers_carry_referer_ua_and_cookie(self):
+        h = core.stream_http_headers({
+            "referer": "https://site/watch",
+            "ua": "UA/1.0",
+            "cookie_header": "k=v",
+        })
+        self.assertEqual(h, "Referer: https://site/watch\r\nUser-Agent: UA/1.0\r\nCookie: k=v\r\n")
+
+    def test_headers_are_empty_without_any_value(self):
+        self.assertEqual(core.stream_http_headers({}), "")
+        self.assertEqual(core.stream_http_headers(None), "")
+
+    def test_header_injection_is_scrubbed(self):
+        # 换行被抹掉后整段退回成「一个 Referer 值」的一部分，不会多出头部行
+        h = core.stream_http_headers({"referer": "https://a/\r\nX-Evil: 1"})
+        self.assertEqual(h.count("\r\n"), 1)          # 只有结尾那一个
+        self.assertTrue(h.startswith("Referer: "))
+        line = h.split("\r\n")[0]
+        self.assertNotIn("\r", line)
+        self.assertNotIn("\n", line)
+
+    def test_browser_can_play_only_native_containers(self):
+        for url in ("https://cdn/a.mp4", "https://cdn/a.M4V?x=1", "https://cdn/a.webm",
+                    "https://cdn/a.mp3", "https://cdn/a.m4a"):
+            self.assertTrue(core.browser_can_play_url(url), url)
+        for url in ("https://cdn/a.m3u8", "https://cdn/a.mpd", "https://cdn/a.flv",
+                    "https://cdn/stream", "not a url"):
+            self.assertFalse(core.browser_can_play_url(url), url)
+
+    def test_duration_is_parsed_from_ffprobe_csv(self):
+        with mock.patch.object(core, "spawn", return_value=_FakeProc(b"1800.00059\n")):
+            self.assertAlmostEqual(core.stream_duration("https://cdn/a.m3u8"), 1800.00059)
+
+    def test_duration_is_none_for_live_streams(self):
+        with mock.patch.object(core, "spawn", return_value=_FakeProc(b"N/A\n")):
+            self.assertIsNone(core.stream_duration("https://cdn/a.m3u8"))
+        with mock.patch.object(core, "spawn", return_value=_FakeProc(b"", rc=1)):
+            self.assertIsNone(core.stream_duration("https://cdn/a.m3u8"))
+
+    def test_frame_requires_a_non_empty_file(self):
+        d = tempfile.mkdtemp()
+        out = os.path.join(d, "t.png")
+        with mock.patch.object(core, "spawn", return_value=_FakeProc()):
+            # 进程说成功，但没产出文件 —— 不能当成有封面
+            self.assertFalse(core.grab_stream_frame("https://cdn/a.m3u8", {}, out))
+        with mock.patch.object(core, "spawn",
+                               return_value=_FakeProc(side=lambda: _write(out, b"\x89PNG"))):
+            self.assertTrue(core.grab_stream_frame("https://cdn/a.m3u8", {}, out))
+
+    def test_clip_falls_back_to_video_only(self):
+        d = tempfile.mkdtemp()
+        out = os.path.join(d, "t.mp4")
+        first = _FakeProc(rc=1)                                     # -c copy 失败
+        second = _FakeProc(side=lambda: _write(out, b"xxxx"))  # 只留视频轨成功
+        with mock.patch.object(core, "spawn", side_effect=[first, second]) as sp:
+            self.assertTrue(core.grab_stream_clip("https://cdn/a.m3u8", {}, out))
+        self.assertEqual(sp.call_count, 2)
+        self.assertIn("-an", sp.call_args_list[1][0][0])
+
+    def test_stream_tool_timeout_kills_process(self):
+        proc = _FakeProc()
+        proc.communicate = mock.Mock(side_effect=subprocess.TimeoutExpired(cmd="ffmpeg", timeout=1))
+        with mock.patch.object(core, "spawn", return_value=proc), \
+             mock.patch.object(core, "kill_tree") as kt:
+            ok, msg = core._run_stream_tool(["ffmpeg"], 1)
+        self.assertFalse(ok)
+        self.assertEqual(msg, "超时")
+        kt.assert_called_once_with(proc)
+
+    def test_missing_ffmpeg_is_reported_not_raised(self):
+        with mock.patch.object(core, "spawn", side_effect=FileNotFoundError()):
+            ok, msg = core._run_stream_tool(["ffmpeg"], 5)
+        self.assertFalse(ok)
+        self.assertIn("找不到 ffmpeg", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

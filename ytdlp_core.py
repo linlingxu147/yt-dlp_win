@@ -637,6 +637,127 @@ def real_download_path(raw_path):
     return p if os.path.isfile(p) else ""
 
 
+# ---------------- 直链预览：截帧 / 短片段 / 时长 ----------------
+# 扩展嗅探到的多是 .mp4 / .m3u8 直链，yt-dlp 的 generic 提取器不会给它缩略图，
+# 所以封面只能自己截；而 m3u8 浏览器原生播不了，只能先抓一小段再交给 <video>。
+SNIFF_CLIP_SECONDS = 6
+SNIFF_FRAME_TIMEOUT = 40
+SNIFF_CLIP_TIMEOUT = 90
+
+# 这些容器浏览器能直接播，原地址就能塞进 <video>；其余（m3u8/mpd/ts）得先转一份
+BROWSER_NATIVE_EXT = (".mp4", ".m4v", ".webm", ".m4a", ".mp3", ".ogg", ".oga", ".wav")
+
+
+def stream_http_headers(cfg):
+    """把 UA / Referer / Cookie 拼成 ffmpeg、ffprobe 的 -headers 值。
+
+    直链站点多半靠 Referer 防盗链：不带它，服务器回 403 或一段错误页，
+    ffmpeg 就会「读到了但不是视频」。
+    """
+    cfg = cfg or {}
+    lines = []
+    for name, key in (("Referer", "referer"), ("User-Agent", "ua"),
+                      ("Cookie", "cookie_header")):
+        val = scrub_header_value(cfg.get(key) or "", limit=0)
+        if val:
+            lines.append("%s: %s" % (name, val))
+    if not lines:
+        return ""
+    # ffmpeg 要求多行头用 CRLF 分隔，末尾也要有一个
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _run_stream_tool(cmd, timeout):
+    """跑一次 ffmpeg/ffprobe，返回 (是否成功, 合并输出)。
+
+    超时必须 kill_tree：ffmpeg 会挂住等切片的子请求，terminate 常常杀不干净。
+    """
+    try:
+        proc = spawn(cmd)
+    except FileNotFoundError:
+        return False, "找不到 ffmpeg / ffprobe"
+    except Exception as e:
+        return False, str(e)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        return proc.returncode == 0, (out or "")
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        return False, "超时"
+
+
+def browser_can_play_url(url):
+    """这个地址能不能直接塞进 <video>（不转码、不额外等待）。"""
+    try:
+        path = urlsplit(url).path.lower()
+    except Exception:
+        return False
+    return os.path.splitext(path)[1] in BROWSER_NATIVE_EXT
+
+
+def stream_duration(url, cfg=None, timeout=20):
+    """问一下流有多长（秒）；问不出来返回 None（m3u8 直播流就会是 None）。"""
+    h = stream_http_headers(cfg)
+    cmd = [find_tool("ffprobe.exe"), "-v", "error",
+           "-show_entries", "format=duration", "-of", "csv=p=0"]
+    if h:
+        cmd += ["-headers", h]
+    cmd += ["-i", url]
+    ok, out = _run_stream_tool(cmd, timeout)
+    if not ok:
+        return None
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line == "N/A":
+            continue
+        try:
+            return float(line)
+        except ValueError:
+            continue
+    return None
+
+
+def grab_stream_frame(url, cfg, out_path, at=1.0, timeout=SNIFF_FRAME_TIMEOUT):
+    """截一张缩略图。直链没有元数据，这是「像预浏览那样有封面」的唯一办法。"""
+    h = stream_http_headers(cfg)
+    cmd = [find_tool("ffmpeg.exe"), "-hide_banner", "-loglevel", "error", "-y"]
+    if h:
+        cmd += ["-headers", h]
+    cmd += ["-ss", "%.2f" % at, "-i", url, "-frames:v", "1",
+            "-vf", "scale=320:-1", "-f", "image2", out_path]
+    ok, _ = _run_stream_tool(cmd, timeout)
+    return ok and os.path.isfile(out_path) and os.path.getsize(out_path) > 0
+
+
+def grab_stream_clip(url, cfg, out_path, seconds=SNIFF_CLIP_SECONDS,
+                     timeout=SNIFF_CLIP_TIMEOUT):
+    """抓前几秒存成 mp4，让浏览器能播 m3u8 这种它自己解不了的流。
+
+    用 -c copy 而不是重编码：转码 6 秒 1080p 要几十秒，copy 只花下载时间。
+    copy 失败（音轨是 ac3/eac3 这类塞不进 mp4 的）就退一步只留视频轨。
+    """
+    h = stream_http_headers(cfg)
+    base = [find_tool("ffmpeg.exe"), "-hide_banner", "-loglevel", "error", "-y"]
+    if h:
+        base += ["-headers", h]
+    base += ["-i", url, "-t", "%.2f" % seconds, "-movflags", "+faststart"]
+
+    for codec_args in (["-c", "copy"], ["-c:v", "copy", "-an"]):
+        if os.path.isfile(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+        ok, _ = _run_stream_tool(base + codec_args + [out_path], timeout)
+        if ok and os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+            return True
+    return False
+
+
 def probe_playable(path, timeout=6):
     """让 ffprobe 读正在增长的文件，读得到流才算能播。只读不转码。"""
     if not os.path.isfile(path):

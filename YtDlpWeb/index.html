@@ -78,6 +78,15 @@ label.chk input{width:16px;height:16px;accent-color:var(--primary)}
 .res-row .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
 .metas{display:grid;grid-template-columns:64px 96px 84px 140px;gap:8px;font-size:12px;color:var(--muted)}
 .metas span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sn-thumb{width:56px;height:32px;border-radius:4px;object-fit:cover;background:#eaeef2;
+  display:flex;align-items:center;justify-content:center;color:#8b949e;font-size:10px;flex:none}
+.sn-thumb.ph{font-size:11px}
+.sn-row{grid-template-columns:26px 56px minmax(0,1fr) auto auto!important}
+#sniffPlayer{display:none;margin:0 0 10px;padding:10px;border-radius:8px;background:#0d1117}
+#sniffPlayer video{width:100%;max-height:300px;display:block;border-radius:6px;background:#000}
+#sniffPlayer .sn-pv-head{display:flex;justify-content:space-between;align-items:center;gap:8px;
+  margin-bottom:8px;color:#c9d1d9;font-size:12px}
+#sniffPlayer .sn-pv-head button{border:0;background:transparent;color:#8b949e;cursor:pointer;font-size:12px}
 .empty{padding:22px 10px;text-align:center;color:var(--muted);font-size:13px}
 
 /* ---------- 进度 ---------- */
@@ -200,6 +209,26 @@ table.ft td.note{white-space:normal;color:var(--muted)}
     </div>
     <div class="hint">推荐先「探测资源」——解析出条目后勾选想要的再下载，避免整站播放列表被一次全下。
       「查看可用格式」列出该链接的全部清晰度与编码，点一行即可选用。</div>
+  </section>
+
+  <!-- 1.5 扩展嗅探结果（浏览器扩展抓到的直链，先试播再下载） -->
+  <section class="card" id="sniffCard">
+    <div class="card-h"><h2>浏览器扩展嗅探结果</h2>
+      <span class="spacer"></span>
+      <button class="btn sm" id="btnSniffRefresh">刷新</button>
+      <span class="muted" id="sniffCount">未加载</span></div>
+    <div id="sniffPlayer">
+      <div class="sn-pv-head"><span id="sniffPvTitle"></span>
+        <button id="sniffPvClose">✕ 关闭</button></div>
+      <video controls playsinline preload="metadata" id="sniffVideo"></video>
+    </div>
+    <div class="results" id="sniffList"><div class="empty">在浏览器里用扩展播放视频后，嗅探到的直链会出现在这里（可先试播确认，再勾选下载）。</div></div>
+    <div class="row-actions">
+      <button class="btn sm" id="btnSniffAll">全选</button>
+      <button class="btn sm" id="btnSniffNone">全不选</button>
+      <span class="spacer"></span>
+      <button class="btn primary" id="btnSniffDownload" disabled>下载选中项</button>
+    </div>
   </section>
 
   <!-- 2 结果 -->
@@ -437,7 +466,7 @@ const els = {
   fmtBody:$('fmtBody'), fmtLog:$('fmtLog'), fmtLogWrap:$('fmtLogWrap'),
   fmtClose:$('fmtClose'), fmtUseBest:$('fmtUseBest'),
   preview:$('preview'), pvImg:$('pvImg'), pvMeta:$('pvMeta'), pvOpen:$('pvOpen'), pvClose:$('pvClose'),
-  btnPlay:$('btnPlay')
+  btnPlay:$('btnPlay'), sniffCount:$('sniffCount')
 };
 const FIELDS = ['outdir','tpl','mode','merge','fmt','sub','sublang','embedsub','thumb','meta',
   'pl','items','ignore','open_after','net_hard','play_while','rate','proxy','cookie','conc','conc_n','aria','aria_args','flat','extra',
@@ -665,6 +694,196 @@ async function showPreview(i){
     });
     els.pvImg.alt = '封面';
   }catch(e){ els.pvImg.alt = '封面取不到：' + String(e.message||e); }
+}
+
+/* ---------- 扩展嗅探回流 ----------
+   扩展把嗅探结果 POST 到 /api/sniff/items，这里拉出来直接试播/下载。
+   试播走服务端的 /api/sniff/preview：m3u8 之类先抓 6 秒片段，mp4 直链直接给
+   原地址；缩略图也由服务端 ffmpeg 截帧后按 token 提供（不用把源站 URL 交给页面）。 */
+let sniffItems = [];
+let sniffChecked = new Set();
+const sniffPv = {};          // url -> {thumb, clip, duration, native}
+
+function snShort(u) {
+  try {
+    const p = new URL(u);
+    let n = decodeURIComponent(p.pathname.split('/').filter(Boolean).pop() || p.hostname);
+    if (n.length > 46) n = n.slice(0, 43) + '…';
+    return p.hostname + ' / ' + n;
+  } catch (e) { return String(u).slice(0, 50); }
+}
+function snSize(n) {
+  n = Number(n) || 0;
+  if (n <= 0) return '';
+  if (n < 1048576) return (n / 1024).toFixed(0) + ' KB';
+  if (n < 1073741824) return (n / 1048576).toFixed(1) + ' MB';
+  return (n / 1073741824).toFixed(2) + ' GB';
+}
+function snDur(sec) {
+  const s = Math.round(Number(sec) || 0);
+  if (!s) return '';
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
+  const p = (x) => (x < 10 ? '0' + x : '' + x);
+  return h ? h + ':' + p(m) + ':' + p(ss) : m + ':' + p(ss);
+}
+
+async function sniffLoad() {
+  els.sniffCount.textContent = '加载中…';
+  try {
+    const j = await (await fetch('/api/sniff/items')).json();
+    sniffItems = (j.items || []);
+  } catch (e) {
+    sniffItems = [];
+  }
+  // 已选中的按下标失效后要重算，否则会指向别的条目
+  sniffChecked = new Set();
+  sniffRender();
+}
+
+function sniffRender() {
+  const el = $('sniffList');
+  if (!sniffItems.length) {
+    el.innerHTML = '<div class="empty">还没有收到扩展的嗅探结果。在浏览器里用扩展嗅探视频后，点右上角「刷新」。</div>';
+  } else {
+    el.innerHTML = sniffItems.map((it, i) => {
+      const pv = sniffPv[it.url] || {};
+      const thumb = pv.thumb
+        ? `<img class="sn-thumb" src="${pv.thumb}" alt="封面">`
+        : '<div class="sn-thumb ph">…</div>';
+      return `<div class="res-row sn-row ${sniffChecked.has(i) ? 'on' : ''}" data-i="${i}">
+          <input type="checkbox" ${sniffChecked.has(i) ? 'checked' : ''} data-i="${i}">
+          ${thumb}
+          <div class="t" title="${esc(it.url)}">${esc(snShort(it.url))}</div>
+          <div class="metas"><span>${esc(snDur(pv.duration))}</span><span>${esc(snSize(it.size))}</span><span>${esc(it.kind || '')}</span></div>
+          <button class="btn sm sn-pv" data-i="${i}">试播</button>
+        </div>`;
+    }).join('');
+    el.querySelectorAll('.res-row').forEach((row) => {
+      row.addEventListener('click', (e) => {
+        if (e.target.tagName === 'INPUT' || e.target.classList.contains('sn-pv')) return;
+        sniffToggle(+row.dataset.i);
+      });
+    });
+    el.querySelectorAll('input[type=checkbox]').forEach((cb) => {
+      cb.addEventListener('change', () => sniffToggle(+cb.dataset.i));
+    });
+    el.querySelectorAll('.sn-pv').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        sniffPreview(+btn.dataset.i, btn);
+      });
+    });
+  }
+  els.sniffCount.textContent = sniffItems.length ? `共 ${sniffItems.length} 条` : '暂无';
+  $('btnSniffDownload').disabled = busy || sniffChecked.size === 0;
+}
+
+function sniffToggle(i) {
+  sniffChecked.has(i) ? sniffChecked.delete(i) : sniffChecked.add(i);
+  const row = $('sniffList').querySelector(`.res-row[data-i="${i}"]`);
+  if (row) {
+    row.classList.toggle('on', sniffChecked.has(i));
+    row.querySelector('input').checked = sniffChecked.has(i);
+  }
+  $('btnSniffDownload').disabled = busy || sniffChecked.size === 0;
+}
+
+async function sniffPreview(i, btn) {
+  const it = sniffItems[i];
+  if (!it) return;
+  if (btn) { btn.disabled = true; btn.textContent = '取画面…'; }
+  try {
+    const r = await fetch('/api/sniff/preview', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: it.url }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) {
+      toast(j.error || ('取不到画面（HTTP ' + r.status + '）'));
+      return;
+    }
+    const rec = { duration: j.duration || 0, native: !!j.native, thumb: '', clip: '' };
+    if (j.thumb) rec.thumb = '/api/sniff/media?id=' + encodeURIComponent(j.thumb);
+    if (j.clip) rec.clip = '/api/sniff/media?id=' + encodeURIComponent(j.clip);
+    sniffPv[it.url] = rec;
+    sniffRender();
+    sniffPlay(it.url, rec);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '试播'; }
+  }
+}
+
+function sniffPlay(url, rec) {
+  const box = $('sniffPlayer'), v = $('sniffVideo');
+  const src = rec.native ? url : rec.clip;
+  if (!src) { toast('这个流取不到片段，只能下载后用播放器看'); return; }
+  $('sniffPvTitle').textContent = snShort(url) + (rec.duration ? '  ·  ' + snDur(rec.duration) : '');
+  box.style.display = '';
+  v.onerror = () => toast('播放被站点拒绝（防盗链）或格式不支持，可勾选后下载交给 yt-dlp');
+  v.src = src;
+  v.play().catch(() => {});
+  box.scrollIntoView({ block: 'nearest' });
+}
+
+$('sniffPvClose').addEventListener('click', () => {
+  const v = $('sniffVideo');
+  try { v.pause(); } catch (e) {}
+  v.removeAttribute('src');
+  try { v.load(); } catch (e) {}
+  $('sniffPlayer').style.display = 'none';
+});
+$('btnSniffRefresh').addEventListener('click', sniffLoad);
+$('btnSniffAll').addEventListener('click', () => {
+  sniffItems.forEach((_, i) => sniffChecked.add(i));
+  sniffRender();
+});
+$('btnSniffNone').addEventListener('click', () => { sniffChecked = new Set(); sniffRender(); });
+$('btnSniffDownload').addEventListener('click', async () => {
+  const picks = [...sniffChecked].map((i) => sniffItems[i]).filter(Boolean);
+  if (!picks.length) { toast('请先勾选条目'); return; }
+  if (busy) { toast('有任务正在运行，请先停止或等待结束'); return; }
+  // 逐条提交：/api/sniff 一次只处理一个地址，且服务端的单任务闸门会挡住并发
+  const first = picks[0];
+  try {
+    setBusy(true, 'download');
+    setStatus('busy', '开始下载嗅探到的直链…');
+    const r = await fetch('/api/sniff', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        url: first.url, kind: 'media', title: first.title || '',
+        referer: first.referer || first.page_url || '', ua: first.ua || '',
+        cookie_jar: [],
+      }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) {
+      setBusy(false); setStatus('err', j.error || ('HTTP ' + r.status));
+      toast(j.error || '提交失败');
+      return;
+    }
+    if (picks.length > 1) toast('一次只能下一个：已提交第 1 条，其余请等它结束后再点（服务端同时只跑一个任务）');
+    sniffPoll();
+  } catch (e) {
+    setBusy(false); setStatus('err', String(e.message || e));
+  }
+});
+
+let sniffTimer = null;
+async function sniffPoll() {
+  clearTimeout(sniffTimer);
+  let j = null;
+  try { j = await (await fetch('/api/sniff/log')).json(); } catch (e) { j = null; }
+  if (!j) { sniffTimer = setTimeout(sniffPoll, 2000); return; }
+  const lines = j.lines || [];
+  if (lines.length) els.log.textContent = lines.join('\n');
+  const busyNow = !!j.busy;
+  setBusy(busyNow, busyNow ? 'download' : null);
+  if (j.done && !busyNow) {
+    setStatus('idle', j.ok ? '嗅探直链下载完成' : '嗅探直链下载失败');
+    sniffLoad();
+    return;
+  }
+  sniffTimer = setTimeout(sniffPoll, 1500);
 }
 
 /* ---------- SSE ---------- */
@@ -1034,6 +1253,7 @@ els.logWrap.addEventListener('toggle', ()=>{ if(els.logWrap.open) els.log.scroll
 (async function init(){
   try{ cfg = await (await fetch('/api/config')).json(); }catch(e){ cfg = {}; toast('无法连接服务'); }
   fillForm(); renderResults();
+  sniffRender(); sniffLoad();
   // 让「格式代码」框初始就显示当前模式实际使用的表达式，所见即所得
   const mf = modeFmt()[$('mode').value];
   if(!$('fmt').value && mf) $('fmt').value = mf;

@@ -5,7 +5,9 @@ server.py 不是包，用 importlib 按文件路径载入；载入本身没有�
 import importlib.util
 import os
 import threading
+import time
 import unittest
+import uuid
 from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -92,6 +94,180 @@ class TestThumbTokenTtl(unittest.TestCase):
         server.THUMB_TOKENS[token] = (url, ts - server.THUMB_TOKEN_TTL - 1)
         self.assertIsNone(server.thumb_url_for(token))
         self.assertNotIn(token, server.THUMB_TOKENS)
+
+
+def _write(path, data):
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+class TestSniffItems(unittest.TestCase):
+    def setUp(self):
+        server.SNIFF_ITEMS.clear()
+        server.PREVIEW_TOKENS.clear()
+
+    def tearDown(self):
+        server.SNIFF_ITEMS.clear()
+        server.PREVIEW_TOKENS.clear()
+
+    def test_non_http_and_garbage_are_dropped(self):
+        kept = server.register_sniff_items([
+            {"url": "ftp://cdn/a.mp4"}, {"url": ""}, "junk", {}, None,
+            {"url": "https://cdn/a.mp4"},
+        ])
+        self.assertEqual(kept, 1)
+        self.assertIn("https://cdn/a.mp4", server.SNIFF_ITEMS)
+
+    def test_same_url_updates_instead_of_duplicating(self):
+        server.register_sniff_items([{"url": "https://cdn/a.mp4", "size": 10}])
+        first_ts = server.SNIFF_ITEMS["https://cdn/a.mp4"]["first_ts"]
+        server.register_sniff_items([{"url": "https://cdn/a.mp4", "size": 99}])
+        self.assertEqual(len(server.SNIFF_ITEMS), 1)
+        rec = server.SNIFF_ITEMS["https://cdn/a.mp4"]
+        self.assertEqual(rec["size"], 99)
+        self.assertEqual(rec["first_ts"], first_ts)   # 首次出现时间不该被覆盖
+
+    def test_capacity_is_capped(self):
+        for i in range(server.SNIFF_MAX_ITEMS + 5):
+            server.register_sniff_items([{"url": "https://cdn/%d.mp4" % i}])
+        self.assertEqual(len(server.SNIFF_ITEMS), server.SNIFF_MAX_ITEMS)
+
+    def test_items_are_newest_first(self):
+        server.register_sniff_items([{"url": "https://cdn/a.mp4"}])
+        time.sleep(0.01)
+        server.register_sniff_items([{"url": "https://cdn/b.mp4"}])
+        items = server.sniff_items_json()["items"]
+        self.assertEqual(items[0]["url"], "https://cdn/b.mp4")
+
+
+class TestPreviewTokens(unittest.TestCase):
+    def setUp(self):
+        server.PREVIEW_TOKENS.clear()
+
+    def tearDown(self):
+        server.PREVIEW_TOKENS.clear()
+
+    def test_preview_path_is_stable_and_kind_specific(self):
+        p1 = server._preview_path("https://cdn/a.m3u8", "thumb")
+        p2 = server._preview_path("https://cdn/a.m3u8", "thumb")
+        c = server._preview_path("https://cdn/a.m3u8", "clip")
+        self.assertEqual(p1, p2)
+        self.assertTrue(p1.endswith(".png"))
+        self.assertTrue(c.endswith(".mp4"))
+        self.assertNotEqual(p1, c)
+        self.assertTrue(os.path.isdir(server.PREVIEW_DIR))
+
+    def test_wrong_kind_is_rejected(self):
+        token = server._preview_token("C:/tmp/x.png", "thumb")
+        self.assertIsNone(server.preview_token_lookup(token, "clip")[0])
+        self.assertEqual(server.preview_token_lookup(token, "thumb")[0], "C:/tmp/x.png")
+
+    def test_unknown_token_is_none(self):
+        self.assertIsNone(server.preview_token_lookup("nope")[0])
+
+    def test_expired_token_is_dropped(self):
+        token = server._preview_token("C:/tmp/x.png", "thumb")
+        path, kind, ts = server.PREVIEW_TOKENS[token]
+        server.PREVIEW_TOKENS[token] = (path, kind, ts - server.PREVIEW_TOKEN_TTL - 1)
+        self.assertIsNone(server.preview_token_lookup(token)[0])
+        self.assertNotIn(token, server.PREVIEW_TOKENS)
+
+
+class TestBuildSniffPreview(unittest.TestCase):
+    def setUp(self):
+        server.SNIFF_ITEMS.clear()
+        server.PREVIEW_TOKENS.clear()
+        self._urls = []
+
+    def tearDown(self):
+        for url in self._urls:
+            for kind in ("thumb", "clip"):
+                p = server._preview_path(url, kind)
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        server.SNIFF_ITEMS.clear()
+        server.PREVIEW_TOKENS.clear()
+
+    def _url(self, ext):
+        url = "https://cdn.example/%s.%s" % (uuid.uuid4().hex, ext)
+        self._urls.append(url)
+        return url
+
+    def test_unregistered_url_is_refused(self):
+        r = server.build_sniff_preview(self._url("m3u8"))
+        self.assertFalse(r["ok"])
+        self.assertIn("不在本机嗅探列表", r["error"])
+
+    def test_native_mp4_gets_thumb_and_duration_without_clip(self):
+        url = self._url("mp4")
+        server.register_sniff_items([{"url": url, "referer": "https://site/watch"}])
+        seen = {}
+
+        def fake_dur(u, cfg=None, timeout=20):
+            seen["dur_cfg"] = cfg
+            return 65.5
+
+        def fake_frame(u, cfg, out, at=1.0, timeout=None):
+            seen["frame"] = (u, cfg, at)
+            _write(out, b"\x89PNG\r\n\x1a\n")
+            return True
+
+        def fake_clip(*a, **k):
+            seen["clip"] = True
+            return False
+
+        with mock.patch.object(server.core, "stream_duration", fake_dur), \
+             mock.patch.object(server.core, "grab_stream_frame", fake_frame), \
+             mock.patch.object(server.core, "grab_stream_clip", fake_clip):
+            r = server.build_sniff_preview(url)
+        self.assertTrue(r["ok"], r)
+        self.assertTrue(r["native"])
+        self.assertAlmostEqual(r["duration"], 65.5)
+        self.assertTrue(r["thumb"])
+        self.assertEqual(r["clip"], "")
+        self.assertNotIn("clip", seen)
+        # 预览请求带上了条目里的 Referer（防盗链靠它）
+        self.assertEqual(seen["dur_cfg"].get("referer"), "https://site/watch")
+
+    def test_hls_clip_is_grabbed_and_framed_locally(self):
+        url = self._url("m3u8")
+        server.register_sniff_items([{"url": url}])
+        order = []
+
+        def fake_clip(u, cfg, out, seconds=6, timeout=None):
+            order.append(("clip", u))
+            _write(out, b"xxxx")
+            return True
+
+        def fake_frame(u, cfg, out, at=1.0, timeout=None):
+            order.append(("frame", u))
+            _write(out, b"\x89PNG")
+            return True
+
+        with mock.patch.object(server.core, "stream_duration", lambda *a, **k: 120.0), \
+             mock.patch.object(server.core, "grab_stream_clip", fake_clip), \
+             mock.patch.object(server.core, "grab_stream_frame", fake_frame):
+            r = server.build_sniff_preview(url)
+        self.assertTrue(r["ok"], r)
+        self.assertFalse(r["native"])
+        self.assertTrue(r["clip"])
+        self.assertTrue(r["thumb"])
+        # 截帧读的是本地片段，网络只走一遍
+        frame_src = [u for kind, u in order if kind == "frame"][0]
+        self.assertNotEqual(frame_src, url)
+        self.assertTrue(frame_src.endswith(".mp4"))
+
+    def test_nothing_grabbed_is_reported_as_failure(self):
+        url = self._url("m3u8")
+        server.register_sniff_items([{"url": url}])
+        with mock.patch.object(server.core, "stream_duration", lambda *a, **k: None), \
+             mock.patch.object(server.core, "grab_stream_clip", lambda *a, **k: False), \
+             mock.patch.object(server.core, "grab_stream_frame", lambda *a, **k: False):
+            r = server.build_sniff_preview(url)
+        self.assertFalse(r["ok"])
+        self.assertIn("抓不到画面", r["error"])
 
 
 if __name__ == "__main__":

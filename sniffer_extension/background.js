@@ -213,6 +213,83 @@ async function serverGet(path) {
     }
 }
 
+
+// ---------------- 预览：缩略图 / 短片段 / 直播判断 ----------------
+// 页面是 https 时，<img src="http://127.0.0.1/..."> 会被当成混合内容拦掉；
+// content script 自己 fetch 又受页面 CORS 限制。所以统一由这里取回字节再转
+// data URL 交给页面——扩展后台有 host_permissions，不受这两条限制。
+
+async function serverBase() {
+    const port = await findPort();
+    return port ? `http://127.0.0.1:${port}` : null;
+}
+
+function toBase64(bytes) {
+    // 分块拼接：一次 apply 几十万参数会爆调用栈
+    let bin = "";
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(bin);
+}
+
+async function serverFetchDataUrl(path) {
+    const base = await serverBase();
+    if (!base) return "";
+    try {
+        const r = await fetch(base + path);
+        if (!r.ok) return "";
+        const ctype = (r.headers.get("Content-Type") || "application/octet-stream").split(";")[0];
+        const buf = new Uint8Array(await r.arrayBuffer());
+        if (!buf.length) return "";
+        return "data:" + ctype + ";base64," + toBase64(buf);
+    } catch (e) {
+        return "";
+    }
+}
+
+// 把当前标签页的嗅探结果报给本机服务：网页版那边才看得见，服务端也才允许预览
+async function reportItems(tabId, pageUrl, title) {
+    const items = await ensureTab(tabId);
+    const list = Object.values(items).slice(0, 200).map((it) => ({
+        url: it.url,
+        kind: it.mime || "",
+        size: it.size || 0,
+        source: "webRequest",
+        page_url: pageUrl || "",
+        referer: pageUrl || "",
+        ua: navigator.userAgent,
+        title: title || "",
+    }));
+    if (!list.length) return { ok: true, count: 0 };
+    return serverPost("/api/sniff/items", { items: list, page_url: pageUrl || "" });
+}
+
+async function previewFor(url) {
+    const info = await serverPost("/api/sniff/preview", { url: url });
+    if (!info || !info.ok) {
+        return { ok: false, error: (info && info.error) || "服务没有响应" };
+    }
+    const out = {
+        ok: true, url: url,
+        native: !!info.native,
+        duration: info.duration || 0,
+        thumb: "",
+        clip: "",
+    };
+    if (info.thumb) {
+        out.thumb = await serverFetchDataUrl("/api/sniff/media?id=" + encodeURIComponent(info.thumb));
+    }
+    if (info.clip) {
+        out.clip = await serverFetchDataUrl("/api/sniff/media?id=" + encodeURIComponent(info.clip));
+    }
+    if (!out.thumb && !out.clip && !out.native) {
+        return { ok: false, error: "抓不到画面：可能需要登录，或是加密流（DRM）" };
+    }
+    return out;
+}
+
 // ---------------- 提交下载 ----------------
 
 async function cookieJarFor(url) {
@@ -261,6 +338,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.type === "stop_task") {
         serverPost("/api/stop", {}).then(sendResponse);
+        return true;
+    }
+    if (msg.type === "report_items") {
+        const tid = sender.tab && sender.tab.id;
+        if (tid == null) { sendResponse({ ok: false }); return false; }
+        reportItems(tid, msg.page_url || "", msg.title || "").then(sendResponse);
+        return true;
+    }
+    if (msg.type === "preview") {
+        previewFor(String(msg.url || "")).then(sendResponse);
+        return true;
+    }
+    if (msg.type === "play_task") {
+        serverPost("/api/play", {}).then(sendResponse);
         return true;
     }
     if (msg.type === "query_items") {

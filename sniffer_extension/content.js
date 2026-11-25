@@ -22,6 +22,10 @@
     const items = {};          // url -> {url, kind, size, source}
     const HOST_ID = "ytdlp-sniff-host";
     let host = null, root = null, panel = null, listEl = null, statusEl = null, badge = null, polling = null;
+    let playerEl = null, playerTitle = null, playWhileBtn = null;
+    const previewCache = {};     // url -> {done, ok, native, duration, thumb, clip, error}
+    const thumbQueue = [];
+    let thumbBusy = false, reportTimer = null;
 
     function isTop() { try { return window.top === window; } catch (e) { return false; } }
     function isHttpUrl(u) { return typeof u === "string" && /^https?:\/\//i.test(u); }
@@ -84,6 +88,7 @@
         dirty = true;
         updateBadge();
         if (isPanelOpen()) render();
+        scheduleReport();
     }
 
     function updateBadge() {
@@ -198,6 +203,24 @@
               border-radius: 6px; padding: 2px 10px; cursor: pointer; font-size: 12px; }
         #empty { color: #57606a; padding: 10px; text-align: center; }
         #status { margin: 6px 4px 2px; color: #57606a; font-size: 11px; min-height: 15px; }
+        .thumb { flex: none; width: 42px; height: 24px; border-radius: 4px; background: #eaeef2;
+                 color: #8b949e; font-size: 9px; display: flex; align-items: center;
+                 justify-content: center; background-size: cover; background-position: center; }
+        .meta { flex: none; color: #57606a; font-size: 11px; min-width: 32px; text-align: right; }
+        .pv { flex: none; border: 1px solid #d0d7de; background: #f6f8fa; color: #0969da;
+              border-radius: 6px; padding: 2px 7px; cursor: pointer; font-size: 11px; }
+        .pv[disabled] { opacity: .6; cursor: default; }
+        #playWhile { display: none; border: 1px solid #0969da; background: #ddf4ff; color: #0969da;
+                     border-radius: 6px; padding: 3px 10px; cursor: pointer; font-size: 12px; }
+        #player { display: none; margin: 4px; padding: 6px; background: #0d1117; border-radius: 8px; }
+        #playerHead { display: flex; justify-content: space-between; align-items: center;
+                      gap: 6px; margin-bottom: 4px; }
+        #playerTitle { color: #c9d1d9; font-size: 11px; overflow: hidden;
+                       text-overflow: ellipsis; white-space: nowrap; }
+        #playerClose { flex: none; border: 0; background: transparent; color: #8b949e;
+                       cursor: pointer; font-size: 12px; }
+        #player video { width: 100%; max-height: 220px; background: #000; border-radius: 6px;
+                        display: block; }
     `;
 
     function buildUI() {
@@ -261,7 +284,53 @@
             });
         });
         head.appendChild(stopBtn);
+        playWhileBtn = document.createElement("button");
+        playWhileBtn.id = "playWhile";
+        playWhileBtn.textContent = "边下边播";
+        playWhileBtn.title = "用系统播放器打开正在下载的文件";
+        playWhileBtn.addEventListener("click", () => {
+            playWhileBtn.disabled = true;
+            chrome.runtime.sendMessage({ type: "play_task" }, (r) => {
+                playWhileBtn.disabled = false;
+                if (chrome.runtime.lastError || !r) {
+                    setStatus("发送失败：扩展后台无响应", "#cf222e");
+                    return;
+                }
+                if (!r.ok) {
+                    setStatus(r.error || "打不开播放器", "#cf222e");
+                    return;
+                }
+                setStatus("已交给系统播放器（装 VLC / PotPlayer 更稳）", "#1a7f37");
+            });
+        });
+        head.appendChild(playWhileBtn);
         panel.appendChild(head);
+
+        playerEl = document.createElement("div");
+        playerEl.id = "player";
+        const playerHead = document.createElement("div");
+        playerHead.id = "playerHead";
+        playerTitle = document.createElement("span");
+        playerTitle.id = "playerTitle";
+        playerHead.appendChild(playerTitle);
+        const closeBtn = document.createElement("button");
+        closeBtn.id = "playerClose";
+        closeBtn.textContent = "✕ 关闭";
+        closeBtn.addEventListener("click", () => {
+            const v = playerEl.querySelector("video");
+            try { v.pause(); } catch (e) { /* ignore */ }
+            v.removeAttribute("src");
+            try { v.load(); } catch (e) { /* ignore */ }
+            playerEl.style.display = "none";
+        });
+        playerHead.appendChild(closeBtn);
+        playerEl.appendChild(playerHead);
+        const videoEl = document.createElement("video");
+        videoEl.setAttribute("controls", "");
+        videoEl.setAttribute("playsinline", "");
+        videoEl.setAttribute("preload", "metadata");
+        playerEl.appendChild(videoEl);
+        panel.appendChild(playerEl);
 
         listEl = document.createElement("div");
         listEl.id = "list";
@@ -308,6 +377,143 @@
         } catch (e) { /* ignore */ }
     }
 
+    // ---------------- 缩略图 / 试播 / 时长 ----------------
+    function fmtDuration(sec) {
+        const s = Math.max(0, Math.round(Number(sec) || 0));
+        if (!s) return "";
+        const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
+        const pad = (n) => (n < 10 ? "0" + n : "" + n);
+        return h ? h + ":" + pad(m) + ":" + pad(ss) : m + ":" + pad(ss);
+    }
+
+    function setThumb(el, dataUrl) {
+        el.style.backgroundImage = 'url("' + dataUrl + '")';
+        el.textContent = "";
+    }
+
+    function refreshMeta(url, dur) {
+        if (!listEl) return;
+        const rows = listEl.querySelectorAll(".row");
+        for (const r of rows) {
+            if (r.dataset.url !== url) continue;
+            const m = r.querySelector(".meta");
+            if (m && !m.textContent) m.textContent = fmtDuration(dur);
+        }
+    }
+
+    function requestPreview(url) {
+        const c = previewCache[url];
+        if (c && c.pending) return c.pending;
+        if (c && c.done) return Promise.resolve(c);
+        const p = new Promise((resolve) => {
+            chrome.runtime.sendMessage({ type: "preview", url: url }, (r) => {
+                if (chrome.runtime.lastError || !r) {
+                    Object.assign(previewCache[url] || (previewCache[url] = {}),
+                                  { done: true, ok: false, error: "扩展后台无响应" });
+                    resolve(previewCache[url]);
+                    return;
+                }
+                const rec = previewCache[url] || (previewCache[url] = {});
+                Object.assign(rec, r, { done: true });
+                if (rec.ok && rec.duration) {
+                    const it = items[url];
+                    if (it) it.dur = rec.duration;
+                    refreshMeta(url, rec.duration);
+                }
+                resolve(rec);
+            });
+        });
+        (previewCache[url] || (previewCache[url] = {})).pending = p;
+        return p;
+    }
+
+    function observeThumb(el, it) {
+        const c = previewCache[it.url];
+        if (c && c.thumb) { setThumb(el, c.thumb); return; }
+        if (c && c.done && !c.thumb) { el.textContent = "无图"; return; }
+        if (!("IntersectionObserver" in window)) { queueThumb(el, it); return; }
+        const io = new IntersectionObserver((ents) => {
+            for (const e of ents) {
+                if (!e.isIntersecting) continue;
+                io.disconnect();
+                queueThumb(el, it);
+            }
+        }, { threshold: 0.15 });
+        io.observe(el);
+    }
+
+    function queueThumb(el, it) {
+        const c = previewCache[it.url];
+        if (c && c.thumb) { setThumb(el, c.thumb); return; }
+        if (c && c.done && !c.thumb) { el.textContent = "无图"; return; }
+        thumbQueue.push({ el: el, it: it });
+        pumpThumbQueue();
+    }
+
+    // 服务端抓流是串行的（一次一个），这里也就一次只发一个，别自己把队列堆爆
+    function pumpThumbQueue() {
+        if (thumbBusy) return;
+        const job = thumbQueue.shift();
+        if (!job) return;
+        thumbBusy = true;
+        requestPreview(job.it.url).then((r) => {
+            thumbBusy = false;
+            if (r && r.thumb) setThumb(job.el, r.thumb);
+            else {
+                job.el.textContent = "无图";
+                job.el.title = (r && r.error) || "";
+            }
+            pumpThumbQueue();
+        });
+    }
+
+    function previewItem(it, btn) {
+        btn.disabled = true;
+        btn.textContent = "取画面…";
+        setStatus("正在问本机要画面（首次约 3-5 秒）…", "#0969da");
+        requestPreview(it.url).then((r) => {
+            btn.disabled = false;
+            btn.textContent = "试播";
+            if (!r || !r.ok) {
+                setStatus((r && r.error) || "取不到画面", "#cf222e");
+                return;
+            }
+            playUrl(it.url, r);
+        });
+    }
+
+    function playUrl(url, info) {
+        if (!playerEl) return;
+        // 浏览器能直接解的容器就走原地址（零等待）；m3u8 之类用刚抓好的一小段
+        const src = info.native ? url : (info.clip || "");
+        if (!src) {
+            setStatus("这个流取不到片段，只能「下载」后用播放器看", "#9a6700");
+            return;
+        }
+        playerTitle.textContent = shortUrl(url) + (info.duration ? "  ·  " + fmtDuration(info.duration) : "");
+        playerEl.style.display = "block";
+        const v = playerEl.querySelector("video");
+        v.onerror = () => {
+            setStatus("播放被站点拒绝（防盗链）或格式不支持，可点「下载」交给 yt-dlp", "#9a6700");
+        };
+        v.src = src;
+        try { v.play(); } catch (e) { /* 用户手势之外的自动播放可能被拦，控件仍在 */ }
+        if (panel) panel.scrollTop = 0;
+    }
+
+    // 嗅探结果同步给本机服务：网页版才能看见，服务端也才允许为这些地址取画面
+    function scheduleReport() {
+        if (reportTimer) return;
+        reportTimer = setTimeout(() => {
+            reportTimer = null;
+            chrome.runtime.sendMessage({
+                type: "report_items",
+                page_url: location.href,
+                title: document.title || "",
+            }, () => void chrome.runtime.lastError);
+        }, 2000);
+    }
+
     function render() {
         if (!panel) return;
         dirty = false;
@@ -320,10 +526,18 @@
             const it = items[k];
             const row = document.createElement("div");
             row.className = "row";
+            row.dataset.url = it.url;
+
+            // 缩略图：直链没有封面元数据，只能让本机 ffmpeg 截一帧（服务端缓存，
+            // 同一条第二次几乎瞬时）。滚动到可见才取，免得一开面板就排队几十个。
+            const thumb = document.createElement("div");
+            thumb.className = "thumb";
+            thumb.textContent = "…";
+            row.appendChild(thumb);
 
             const kindTag = document.createElement("span");
             kindTag.className = "tag";
-            kindTag.textContent = it.kind.toUpperCase();
+            kindTag.textContent = String(it.kind || "media").toUpperCase().slice(0, 5);
             row.appendChild(kindTag);
 
             const label = document.createElement("span");
@@ -332,6 +546,17 @@
             label.title = it.url + (it.source ? "\n来源：" + it.source : "");
             row.appendChild(label);
 
+            const meta = document.createElement("span");
+            meta.className = "meta";
+            meta.textContent = it.dur ? fmtDuration(it.dur) : "";
+            row.appendChild(meta);
+
+            const pv = document.createElement("button");
+            pv.className = "pv";
+            pv.textContent = "试播";
+            pv.addEventListener("click", () => previewItem(it, pv));
+            row.appendChild(pv);
+
             const btn = document.createElement("button");
             btn.className = "dl";
             btn.textContent = "下载";
@@ -339,6 +564,7 @@
             row.appendChild(btn);
 
             listEl.appendChild(row);
+            observeThumb(thumb, it);
         }
         if (!keys.length) {
             const empty = document.createElement("div");
@@ -404,6 +630,9 @@
         polling = setInterval(() => {
             chrome.runtime.sendMessage({ type: "sniff_log" }, (data) => {
                 if (chrome.runtime.lastError || !data) return;
+                if (data.playable && playWhileBtn) {
+                    playWhileBtn.style.display = data.playable.ok ? "inline-block" : "none";
+                }
                 const prog = data.prog;
                 if (prog && prog.pct != null && !data.done) {
                     showStop(true);

@@ -22,6 +22,8 @@ yt-dlp 下载器 · Web 界面服务端
   4. 默认「最佳画质 + 自动合并为 mp4」，并嵌入封面与元数据。
 """
 
+import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -47,7 +49,7 @@ INDEX_FILE = os.path.join(APP_DIR, "index.html")
 
 PORT_RANGE = core.PORT_RANGE
 APP_ID = "yt-dlp-web"          # 扩展靠它确认「端口上跑的是本项目」，而不是别的服务
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.0"
 
 # 唯一被放行的扩展 ID——由 sniffer_extension\manifest.json 里的 "key" 决定（打包后固定不变）。
 # 以前这里是「任何 chrome-extension:// 都放行」，等于让本机的其它扩展也能改配置、
@@ -551,7 +553,172 @@ def sniff_log_json():
                 err = ln.strip()
                 break
         d["last_error"] = err
-        return d
+    # 扩展面板据此显示「边下边播」按钮：探测是本机在后台做的，不占下载带宽
+    with PLAY_LOCK:
+        d["playable"] = {"ok": bool(PLAY_STATE["ok"]), "reason": PLAY_STATE["reason"],
+                         "active": bool(PLAY_STATE["raw_path"])}
+    return d
+
+
+# ---------------- 嗅探条目登记与直链预览 ----------------
+# 扩展把嗅探到的地址报上来，本机才有资格「替它去看一眼」：预览接口只认登记过的
+# 地址，客户端不能凭空给一个 URL 让服务端去连（否则就是 SSRF 入口）。
+SNIFF_ITEMS = {}
+SNIFF_ITEMS_LOCK = threading.Lock()
+SNIFF_MAX_ITEMS = 300
+
+PREVIEW_DIR = os.path.join(tempfile.gettempdir(), "ytdlp_preview")
+PREVIEW_TOKENS = {}
+PREVIEW_LOCK = threading.Lock()
+PREVIEW_GEN_LOCK = threading.Lock()     # 抓流是带宽活，一次只做一个
+PREVIEW_TOKEN_TTL = 6 * 3600
+PREVIEW_TOKEN_MAX = 256
+
+
+def register_sniff_items(items, page_url=""):
+    """登记扩展上报的嗅探条目（同地址只更新，不重复占位）。"""
+    now = time.time()
+    kept = 0
+    with SNIFF_ITEMS_LOCK:
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            url = clean_media_url(it.get("url"))
+            if not core.is_http_url(url):
+                continue
+            rec = SNIFF_ITEMS.get(url) or {"url": url, "first_ts": now}
+            rec.update({
+                "kind": str(it.get("kind") or rec.get("kind") or "")[:16],
+                "size": int(it.get("size") or 0),
+                "source": str(it.get("source") or "")[:80],
+                "page_url": str(it.get("page_url") or page_url or rec.get("page_url") or "")[:500],
+                "referer": str(it.get("referer") or rec.get("referer") or "")[:500],
+                "ua": str(it.get("ua") or rec.get("ua") or "")[:400],
+                "title": str(it.get("title") or rec.get("title") or "")[:200],
+                "ts": now,
+            })
+            SNIFF_ITEMS[url] = rec
+            kept += 1
+        while len(SNIFF_ITEMS) > SNIFF_MAX_ITEMS:
+            SNIFF_ITEMS.pop(next(iter(SNIFF_ITEMS)))
+    return kept
+
+
+def sniff_items_json():
+    with SNIFF_ITEMS_LOCK:
+        items = list(SNIFF_ITEMS.values())
+    items.sort(key=lambda r: r.get("ts") or 0, reverse=True)
+    return {"ok": True, "items": items[:SNIFF_MAX_ITEMS], "busy": RUNNER.busy()}
+
+
+def _preview_path(url, kind):
+    os.makedirs(PREVIEW_DIR, exist_ok=True)
+    digest = hashlib.sha1((kind + "|" + url).encode("utf-8")).hexdigest()[:20]
+    return os.path.join(PREVIEW_DIR, digest + (".png" if kind == "thumb" else ".mp4"))
+
+
+def _preview_token(path, kind):
+    token = secrets.token_urlsafe(12)
+    now = time.time()
+    with PREVIEW_LOCK:
+        for k, (_, _, ts) in list(PREVIEW_TOKENS.items()):
+            if now - ts > PREVIEW_TOKEN_TTL:
+                PREVIEW_TOKENS.pop(k, None)
+        PREVIEW_TOKENS[token] = (path, kind, now)
+        while len(PREVIEW_TOKENS) > PREVIEW_TOKEN_MAX:
+            PREVIEW_TOKENS.pop(next(iter(PREVIEW_TOKENS)))
+    return token
+
+
+def preview_token_lookup(token, want_kind=None):
+    item = None
+    with PREVIEW_LOCK:
+        item = PREVIEW_TOKENS.get(str(token or ""))
+    if not item:
+        return None, None
+    path, kind, ts = item
+    if want_kind and kind != want_kind:
+        return None, None
+    if time.time() - ts > PREVIEW_TOKEN_TTL:
+        with PREVIEW_LOCK:
+            PREVIEW_TOKENS.pop(str(token), None)
+        return None, None
+    return path, kind
+
+
+def build_sniff_preview(url):
+    """给一条直链生成缩略图 / 短片段 / 时长。
+
+    顺序有讲究：抓片段和问时长并发起来，片段落盘后再从**本地**截帧——网络只走
+    一遍。纯 mp4 直链没有片段可抓，就直接对原地址截帧（这种情况也快）。
+    """
+    with SNIFF_ITEMS_LOCK:
+        item = dict(SNIFF_ITEMS.get(url) or {})
+    if not item:
+        return {"ok": False, "error": "这条地址不在本机嗅探列表里，不能预览"}
+    cfg = {"referer": item.get("referer") or item.get("page_url") or "",
+           "ua": item.get("ua") or ""}
+    native = core.browser_can_play_url(url)
+    out = {"ok": True, "url": url, "native": native, "duration": None,
+           "thumb": "", "clip": "", "kind": item.get("kind") or ""}
+    # 抓流是带宽活：一次只做一个，别让用户连点把上行撑满
+    with PREVIEW_GEN_LOCK:
+        thumb = _preview_path(url, "thumb")
+        clip = _preview_path(url, "clip")
+        frame_job = clip_job = dur_job = None
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+        try:
+            dur_job = pool.submit(core.stream_duration, url, cfg)
+            if not (os.path.isfile(thumb) and os.path.getsize(thumb) > 0):
+                at = 1.0
+                st = dur_job.result(timeout=25)
+                out["duration"] = st
+                if st:
+                    at = max(0.5, min(5.0, st * 0.25))
+                if not native:
+                    if not (os.path.isfile(clip) and os.path.getsize(clip) > 0):
+                        clip_job = pool.submit(core.grab_stream_clip, url, cfg, clip)
+                        clip_job.result()
+                    if os.path.isfile(clip) and os.path.getsize(clip) > 0:
+                        # 片段已在本地：截帧不走网络，几乎瞬时
+                        frame_job = pool.submit(core.grab_stream_frame, clip, {}, thumb, at)
+                    else:
+                        frame_job = pool.submit(core.grab_stream_frame, url, cfg, thumb, at)
+                else:
+                    frame_job = pool.submit(core.grab_stream_frame, url, cfg, thumb, at)
+                frame_job.result()
+            else:
+                out["duration"] = dur_job.result(timeout=25)
+                if not native and not (os.path.isfile(clip) and os.path.getsize(clip) > 0):
+                    pool.submit(core.grab_stream_clip, url, cfg, clip).result()
+        except concurrent.futures.TimeoutError:
+            pass
+        finally:
+            pool.shutdown(wait=False)
+        if os.path.isfile(thumb) and os.path.getsize(thumb) > 0:
+            out["thumb"] = _preview_token(thumb, "thumb")
+        if os.path.isfile(clip) and os.path.getsize(clip) > 0:
+            out["clip"] = _preview_token(clip, "clip")
+    if not out["thumb"] and not out["clip"]:
+        out["ok"] = False
+        out["error"] = "抓不到画面：这个源可能需要登录，或是加密流（DRM）"
+    return out
+
+
+def purge_stale_previews(hours=6):
+    """清掉过期的预览素材：临时目录不该无限长大。"""
+    cutoff = time.time() - hours * 3600
+    try:
+        names = os.listdir(PREVIEW_DIR)
+    except OSError:
+        return
+    for name in names:
+        p = os.path.join(PREVIEW_DIR, name)
+        try:
+            if os.path.getmtime(p) < cutoff:
+                os.remove(p)
+        except OSError:
+            pass
 
 
 def write_cookie_jar(jar, url):
@@ -602,6 +769,9 @@ def run_sniff_task(cfg, url, kind, token=None):
         # 直链媒体（m3u8/mp4）本身没有封面和元数据，强行 embed 只会让 ffmpeg 报错、
         # 把一次成功的下载判成失败。这里只做「下回来」这一件事。
         cfg.update({"thumb": False, "meta": False, "sub": False, "embedsub": False})
+    # 直链只有一路格式，这里写死 b：否则全局的 bv*+ba/b 会被判成「音视频分离」，
+    # 可播性判断直接返回「不适用」。play_while 只用于让服务端探测，不会自动弹播放器。
+    cfg.update({"fmt": "b", "play_while": True})
     try:
         run_download(cfg, [url], emit, no_playlist=True)
     except Exception as e:
@@ -920,6 +1090,51 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _send_file(self, path, ctype):
+        """发送本地文件，支持 Range：<video> 拖动进度条会发 Range 请求。"""
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return self._json({"error": "预览文件不见了"}, 404)
+        start, end = 0, size - 1
+        code = 200
+        rng = self.headers.get("Range") or ""
+        m = re.match(r"bytes=(\d*)-(\d*)$", rng.strip())
+        if m and size > 0:
+            if m.group(1):
+                start = int(m.group(1))
+            if m.group(2):
+                end = min(int(m.group(2)), size - 1)
+            if start > end or start >= size:
+                self.send_response(416)
+                self.send_header("Content-Range", "bytes */%d" % size)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            code = 206
+        length = end - start + 1
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if code == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.end_headers()
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                left = length
+                while left > 0:
+                    chunk = f.read(min(65536, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def _busy_json(self):
         """忙碌时统一回 409：前端 stream() 会读 error 字段并 toast，不会卡在「探测中」。"""
         return self._json({"ok": False, "busy": True, "running_kind": RUNNER.kind,
@@ -988,6 +1203,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if p == "/api/sniff/log":
             return self._json(sniff_log_json())
+        if p == "/api/sniff/items":
+            return self._json(sniff_items_json())
+        if p == "/api/sniff/media":
+            qs = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            path, kind = preview_token_lookup((qs.get("id") or [""])[0])
+            if not path:
+                return self._json({"error": "预览不存在或已过期"}, 404)
+            return self._send_file(path, "video/mp4" if kind == "clip" else "image/png")
         self._json({"error": "not found"}, 404)
 
     def do_POST(self):
@@ -1114,6 +1337,19 @@ class Handler(BaseHTTPRequestHandler):
                 RUNNER.finish()
                 sse.close()
             return
+
+        if p == "/api/sniff/items":
+            items = body.get("items")
+            if not isinstance(items, list):
+                return self._json({"error": "items 必须是数组"}, 400)
+            n = register_sniff_items(items[:200], str(body.get("page_url") or ""))
+            return self._json({"ok": True, "count": n})
+
+        if p == "/api/sniff/preview":
+            url = clean_media_url(body.get("url"))
+            if not core.is_http_url(url):
+                return self._json({"error": "请填写以 http:// 或 https:// 开头的链接"}, 400)
+            return self._json(build_sniff_preview(url))
 
         if p == "/api/sniff":
             # 浏览器扩展提交嗅探到的地址，立即排队交给 yt-dlp
@@ -1255,6 +1491,7 @@ def purge_stale_thumbs():
 def main():
     purge_stale_cookie_files()
     purge_stale_thumbs()
+    purge_stale_previews()
     # 允许 --port 指定端口，否则在 8765-8775 内自动避让占用
     arg_port = None
     for i, a in enumerate(sys.argv):
