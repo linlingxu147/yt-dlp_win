@@ -281,10 +281,17 @@ def info_from_json(d):
     if not size:
         size = max([(f.get("filesize") or f.get("filesize_approx") or 0)
                     for f in (d.get("formats") or [])], default=0)
+    thumb = str(d.get("thumbnail") or "")
+    if not thumb:
+        for t in reversed(d.get("thumbnails") or []):
+            if isinstance(t, dict) and t.get("url"):
+                thumb = str(t["url"])
+                break
     return {
         "title": title, "dur": fmt_dur(d.get("duration")), "res": res,
         "size": fmt_size(size), "up": d.get("uploader") or d.get("channel") or "",
         "url": d.get("webpage_url") or d.get("original_url") or d.get("url") or "",
+        "thumb": thumb,
     }
 
 
@@ -953,7 +960,7 @@ def build_formats_cmd(cfg, url):
 
 def new_progress_state():
     return {"pct": 0.0, "size": "", "speed": "", "eta": "",
-            "file": "", "item_i": 0, "item_total": 0, "done": set()}
+            "file": "", "raw_path": "", "item_i": 0, "item_total": 0, "done": set()}
 
 
 def _clean_num(v):
@@ -996,12 +1003,12 @@ def parse_progress_line(line):
         if fname:
             name = FRAG_RE.sub(".", os.path.basename(fname.strip()))
         return {"status": status, "pct": max(0.0, min(100.0, pct)), "size": size,
-                "speed": spd, "eta": _clean_num(eta), "file": name}
+                "speed": spd, "eta": _clean_num(eta), "file": name, "raw": fname.strip()}
     m = PROG_RE.search(s)
     if m:
         return {"status": "downloading", "pct": float(m.group("pct")),
                 "size": m.group("size") or "", "speed": m.group("speed") or "",
-                "eta": m.group("eta") or "", "file": ""}
+                "eta": m.group("eta") or "", "file": "", "raw": ""}
     return None
 
 
@@ -1027,6 +1034,8 @@ def progress_event(state, line):
         state["pct"] = p["pct"]
         if p.get("file"):
             state["file"] = p["file"]
+        if p.get("raw"):
+            state["raw_path"] = p["raw"]
         if p.get("status") in ("finished", "finished_download"):
             state["done"].add(os.path.splitext(state.get("file") or "")[0])
         if state.get("file") != prev_file:
@@ -1036,6 +1045,9 @@ def progress_event(state, line):
     if base:
         state["done"].add(os.path.splitext(base)[0])
         state["file"] = base
+        m = FILE_RE.match(str(line or ""))
+        if m:
+            state["raw_path"] = m.group("path").strip()
         return {"kind": "file", "file": base}
     m = ITEM_RE.search(str(line or ""))
     if m:

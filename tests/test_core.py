@@ -918,5 +918,58 @@ class TestThumbSafety(unittest.TestCase):
         self.assertIn("no exe", err)
 
 
+class TestPreviewFields(unittest.TestCase):
+    def test_thumb_from_thumbnail(self):
+        info = core.info_from_json({"title": "T", "thumbnail": "https://a/x.jpg"})
+        self.assertEqual(info["thumb"], "https://a/x.jpg")
+
+    def test_thumb_falls_back_to_thumbnails_last(self):
+        d = {"title": "T", "thumbnails": [{"url": "https://a/small.jpg"},
+                                          {"url": "https://a/big.jpg"}]}
+        self.assertEqual(core.info_from_json(d)["thumb"], "https://a/big.jpg")
+
+    def test_thumb_empty_when_absent(self):
+        self.assertEqual(core.info_from_json({"title": "T"})["thumb"], "")
+
+    def test_existing_six_keys_unchanged(self):
+        d = {"title": "T", "duration": 61, "height": 1080, "width": 1920,
+             "filesize": 2048, "uploader": "U", "webpage_url": "https://a/v",
+             "thumbnail": "https://a/x.jpg"}
+        info = core.info_from_json(d)
+        self.assertEqual(info["title"], "T")
+        self.assertEqual(info["dur"], "01:01")
+        self.assertEqual(info["res"], "1920x1080")
+        self.assertEqual(info["size"], "2.0 KB")
+        self.assertEqual(info["up"], "U")
+        self.assertEqual(info["url"], "https://a/v")
+        raw = core.info_from_json_raw(d)
+        self.assertEqual(raw["dur"], 61)
+        self.assertEqual(raw["size"], 2048)
+        self.assertEqual(raw["thumb"], "https://a/x.jpg")
+
+    def test_raw_path_keeps_full_path_and_format_marker(self):
+        st = core.new_progress_state()
+        line = "PROG|downloading|500|NA|1000|NA|NA|C:/d/Title.f137.mp4"
+        core.progress_event(st, line)
+        self.assertEqual(st["raw_path"], "C:/d/Title.f137.mp4")
+        # 显示名照旧：去目录、去格式标记
+        self.assertEqual(st["file"], "Title.mp4")
+
+    def test_raw_path_from_destination_line(self):
+        st = core.new_progress_state()
+        core.progress_event(st, "[download] Destination: C:/d/Title.f140.m4a")
+        self.assertEqual(st["raw_path"], "C:/d/Title.f140.m4a")
+        self.assertEqual(st["file"], "Title.m4a")
+
+    def test_parse_progress_line_exposes_raw(self):
+        p = core.parse_progress_line("PROG|downloading|500|NA|1000|NA|NA|C:/d/a.f137.mp4")
+        self.assertEqual(p["raw"], "C:/d/a.f137.mp4")
+        self.assertEqual(p["file"], "a.mp4")
+
+    def test_legacy_progress_line_has_empty_raw(self):
+        p = core.parse_progress_line("[download]  12.5% of  10.00MiB at 1.00MiB/s ETA 00:10")
+        self.assertEqual(p["raw"], "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
