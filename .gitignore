@@ -1,0 +1,21 @@
+# 便携包里的可执行文件与内置运行时：单个 ffmpeg.exe 就 136 MB，
+# 超过 GitHub 单文件 100 MB 硬限制，推上去会被直接拒绝，因此不进仓库
+*.exe
+_internal/
+
+# 下载产物
+downloads/
+
+# 本机配置：含绝对路径、浏览器档案等个人设置，各端首启会自动生成默认值
+YtDlpGUI/config.json
+YtDlpWeb/config.json
+*.bak
+
+# Python / Node
+__pycache__/
+*.pyc
+node_modules/
+
+# 日志与临时文件
+*.log
+*.tmp

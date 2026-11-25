@@ -1,0 +1,42 @@
+{
+    "manifest_version": 3,
+    "name": "yt-dlp 网页视频嗅探",
+    "version": "1.5.0",
+    "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoZt2EP+eLc9ZF0s8p5zZ3kC6V35ZS8dmJIA5gtcTw9XIq1qdjo9LY1zc0a6TZwd+N8lQPmu1B4b67acdNFh3/MkkKaxsd7EwlPfwax+iextwOpPEfWwESpMMb6mr4E9Q/+LH+ioUOjcTehUkGz7Hlt2m6CGhwQK7PDHskU84nz+lqlY9UEPQNU3BfrU2A15Ru1Sa5iqSv4T90qEBciAItsf6DEP4VQar7tPy52xQp94/bE0o1+hxgAHhWrY6EUVupiTllOFgNRVeY27xzxA4XhyIXAROx2vduhXXZ3LJkq7TARqLkpNt0J4gjVTDEh347G2HjatvFYOO+NyWI0L4mwIDAQAB",
+    "description": "嗅探网页中正在播放的视频/音频（网络响应 + 页面请求钩子 + 页面元素），一键交给本机 yt-dlp Web 服务下载。原理借鉴 FileCentipede 扩展。",
+    "permissions": [
+        "webRequest",
+        "storage",
+        "contextMenus",
+        "cookies",
+        "tabs"
+    ],
+    "host_permissions": [
+        "<all_urls>"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "action": {
+        "default_title": "yt-dlp 嗅探：点我打开/收起本页嗅探面板"
+    },
+    "icons": {
+        "128": "icon128.png"
+    },
+    "content_scripts": [
+        {
+            "matches": ["http://*/*", "https://*/*"],
+            "js": ["injected.js"],
+            "run_at": "document_start",
+            "all_frames": true,
+            "world": "MAIN"
+        },
+        {
+            "matches": ["http://*/*", "https://*/*"],
+            "js": ["content.js"],
+            "run_at": "document_start",
+            "all_frames": true,
+            "world": "ISOLATED"
+        }
+    ]
+}
