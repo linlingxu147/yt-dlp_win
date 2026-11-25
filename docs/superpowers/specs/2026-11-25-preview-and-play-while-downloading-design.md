@@ -1,7 +1,7 @@
 # 设计：下载前预浏览 + 边下边播放
 
 日期：2026-11-25
-状态：已与用户逐节确认，待实现
+状态：已实现并合并验证（`feat/preview-and-play-while`，见 plan 文档勾选与回归用例）
 范围：`ytdlp_core.py`、`YtDlpGUI/main.py`、`YtDlpWeb/server.py`、`YtDlpWeb/index.html`、`tests/test_core.py`、`README.md`
 
 ---

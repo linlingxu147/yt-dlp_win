@@ -43,7 +43,7 @@
   - `fetch_thumb(url, cfg, cache_dir=None, timeout=8, max_bytes=2097152) -> (path: str, err: str|None)`
   - `fetch_thumb_via_ytdlp(url, cfg, cache_dir=None) -> (path: str, err: str|None)`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `tests/test_core.py` 末尾追加：
 
@@ -142,12 +142,12 @@ class TestThumbSafety(unittest.TestCase):
         self.assertIn("no exe", err)
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `E:/python/python.exe -m unittest discover -s tests -k TestThumbSafety -v`
 Expected: FAIL / ERROR，`AttributeError: module 'ytdlp_core' has no attribute 'is_public_http_url'`
 
-- [ ] **Step 3: 加 imports**
+- [x] **Step 3: 加 imports**
 
 把 `ytdlp_core.py` 第 15-25 行的 import 块改成（新增 `hashlib`、`ipaddress`、`socket`、`urllib.error`、`urllib.request`、`urlsplit`，其余保持原样）：
 
@@ -171,7 +171,7 @@ import urllib.request
 from urllib.parse import urlsplit
 ```
 
-- [ ] **Step 4: 实现安全校验与缓存路径**
+- [x] **Step 4: 实现安全校验与缓存路径**
 
 在 `ytdlp_core.py` 的 `is_http_url`（355-356 行）之后、`sanitize_urls` 之前插入：
 
@@ -244,7 +244,7 @@ def thumb_headers(cfg):
     return h
 ```
 
-- [ ] **Step 5: 实现取图（含 yt-dlp 兜底）**
+- [x] **Step 5: 实现取图（含 yt-dlp 兜底）**
 
 紧接上一步插入的代码之后追加：
 
@@ -322,17 +322,17 @@ def fetch_thumb(url, cfg, cache_dir=None, timeout=THUMB_TIMEOUT, max_bytes=THUMB
     return path, None
 ```
 
-- [ ] **Step 6: 跑测试确认通过**
+- [x] **Step 6: 跑测试确认通过**
 
 Run: `E:/python/python.exe -m unittest discover -s tests -k TestThumbSafety -v`
 Expected: PASS（12 例）
 
-- [ ] **Step 7: 全量回归**
+- [x] **Step 7: 全量回归**
 
 Run: `E:/python/python.exe -m unittest discover -s tests`
 Expected: OK，114 例（102 + 12）
 
-- [ ] **Step 8: 提交**
+- [x] **Step 8: 提交**
 
 ```bash
 git add ytdlp_core.py tests/test_core.py
@@ -358,7 +358,7 @@ git commit -m "核心：封面取图与公网地址校验
   - `parse_progress_line(line)` 返回 dict 新增 `"raw": str`（完整路径，未做 basename / FRAG_RE 处理）
   - `progress_event(state, line)` 维护 `state["raw_path"]`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 追加到 `tests/test_core.py`：
 
@@ -416,12 +416,12 @@ class TestPreviewFields(unittest.TestCase):
         self.assertEqual(p["raw"], "")
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `E:/python/python.exe -m unittest discover -s tests -k TestPreviewFields -v`
 Expected: FAIL，`KeyError: 'thumb'` / `KeyError: 'raw_path'`
 
-- [ ] **Step 3: info_from_json 加 thumb**
+- [x] **Step 3: info_from_json 加 thumb**
 
 把 `ytdlp_core.py:278-282` 的 return 块替换为：
 
@@ -442,7 +442,7 @@ Expected: FAIL，`KeyError: 'thumb'` / `KeyError: 'raw_path'`
 
 `info_from_json_raw` 不用改——它调 `info_from_json` 后只覆盖 `dur` / `size`，`thumb` 自动带上。
 
-- [ ] **Step 4: new_progress_state 加 raw_path**
+- [x] **Step 4: new_progress_state 加 raw_path**
 
 把 `ytdlp_core.py:807-809` 替换为：
 
@@ -452,7 +452,7 @@ def new_progress_state():
             "file": "", "raw_path": "", "item_i": 0, "item_total": 0, "done": set()}
 ```
 
-- [ ] **Step 5: parse_progress_line 暴露原始路径**
+- [x] **Step 5: parse_progress_line 暴露原始路径**
 
 在 `ytdlp_core.py:851-852` 的 return 里加 `raw`（`fname` 是机器行第 7 段，原样保留）：
 
@@ -471,7 +471,7 @@ def new_progress_state():
                 "eta": m.group("eta") or "", "file": "", "raw": ""}
 ```
 
-- [ ] **Step 6: progress_event 维护 raw_path**
+- [x] **Step 6: progress_event 维护 raw_path**
 
 在 `ytdlp_core.py:881-882`（`if p.get("file"): state["file"] = p["file"]`）之后插入：
 
@@ -493,7 +493,7 @@ def new_progress_state():
         return {"kind": "file", "file": base}
 ```
 
-- [ ] **Step 7: 跑测试确认通过 + 全量回归**
+- [x] **Step 7: 跑测试确认通过 + 全量回归**
 
 Run: `E:/python/python.exe -m unittest discover -s tests -k TestPreviewFields -v`
 Expected: PASS（8 例）
@@ -501,7 +501,7 @@ Expected: PASS（8 例）
 Run: `E:/python/python.exe -m unittest discover -s tests`
 Expected: OK，122 例
 
-- [ ] **Step 8: 提交**
+- [x] **Step 8: 提交**
 
 ```bash
 git add ytdlp_core.py tests/test_core.py
@@ -529,7 +529,7 @@ git commit -m "核心：探测结果带封面地址，进度带磁盘真实路�
   - `make_preview_link(real_path, outdir) -> (link_path: str, err: str|None)`
   - `clear_preview_links(outdir) -> None`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 追加到 `tests/test_core.py`：
 
@@ -659,12 +659,12 @@ class TestProbePlayableReal(unittest.TestCase):
 
 在 `tests/test_core.py` 的 import 区补 `import subprocess`（现有 import 里没有）。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `E:/python/python.exe -m unittest discover -s tests -k TestPlayHelpers -v`
 Expected: FAIL，`AttributeError: module 'ytdlp_core' has no attribute 'fmt_is_separated'`
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 在 `ytdlp_core.py` 的 `fetch_thumb` 之后追加：
 
@@ -760,7 +760,7 @@ def clear_preview_links(outdir):
         pass
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `E:/python/python.exe -m unittest discover -s tests -k TestPlayHelpers -v`
 Expected: PASS（8 例）
@@ -768,12 +768,12 @@ Expected: PASS（8 例）
 Run: `E:/python/python.exe -m unittest discover -s tests -k TestProbePlayableReal -v`
 Expected: PASS（4 例；无 ffmpeg 的机器上是 skipped）
 
-- [ ] **Step 5: 全量回归**
+- [x] **Step 5: 全量回归**
 
 Run: `E:/python/python.exe -m unittest discover -s tests`
 Expected: OK，134 例
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add ytdlp_core.py tests/test_core.py
@@ -803,7 +803,7 @@ git commit -m "核心：可播性探测与硬链接预览
 - Consumes: Task 3 的 `fmt_is_separated(cfg)`。
 - Produces: 配置键 `play_while`（bool，默认 False）；`build_download_cmd(cfg, urls, no_playlist=False)` 在 `play_while` 为真时追加 `--hls-use-mpegts`，并在 merge 有效且非音频模式时追加 `--remux-video <merge>`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 追加到 `tests/test_core.py`：
 
@@ -860,12 +860,12 @@ class TestPlayWhileCmd(unittest.TestCase):
         self.assertIs(cfg["play_while"], True)
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `E:/python/python.exe -m unittest discover -s tests -k TestPlayWhileCmd -v`
 Expected: FAIL，`KeyError: 'play_while'`
 
-- [ ] **Step 3: 加配置键**
+- [x] **Step 3: 加配置键**
 
 把 `ytdlp_core.py:460` 那一行改成：
 
@@ -881,7 +881,7 @@ _BOOL_FIELDS = ("sub", "embedsub", "thumb", "meta", "pl", "open_after", "ignore"
                 "play_while")
 ```
 
-- [ ] **Step 4: 加命令分支**
+- [x] **Step 4: 加命令分支**
 
 在 `ytdlp_core.py` 的 `build_download_cmd` 里，`elif mode == "audio_mp3":` 那两行（736-737）之后、`if cfg.get("sub"):`（738）之前插入：
 
@@ -897,7 +897,7 @@ _BOOL_FIELDS = ("sub", "embedsub", "thumb", "meta", "pl", "open_after", "ignore"
             cmd += ["--remux-video", merge]
 ```
 
-- [ ] **Step 5: 跑测试确认通过 + 全量回归**
+- [x] **Step 5: 跑测试确认通过 + 全量回归**
 
 Run: `E:/python/python.exe -m unittest discover -s tests -k TestPlayWhileCmd -v`
 Expected: PASS（9 例）
@@ -905,12 +905,12 @@ Expected: PASS（9 例）
 Run: `E:/python/python.exe -m unittest discover -s tests`
 Expected: OK，143 例
 
-- [ ] **Step 6: 桌面版命令自检**
+- [x] **Step 6: 桌面版命令自检**
 
 Run: `E:/python/python.exe YtDlpGUI/main.py --selftest`
 Expected: 退出码 0，打印的命令里**不含** `--hls-use-mpegts`（默认关闭）
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add ytdlp_core.py tests/test_core.py
@@ -938,7 +938,7 @@ git commit -m "核心：边下边播开关与命令分支
   - `POST /api/play`：200 `{"ok":true}` / 400 传了 path 或不可播 / 409 无下载任务 / 500 播放器打开失败
   - SSE 事件 `{"type":"playable","ok":bool,"reason":str}`；`row` 事件的 `data` 里多一个 `thumb_id`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 追加到 `tests/test_core.py`：
 
@@ -989,12 +989,12 @@ class TestPlayState(unittest.TestCase):
             self.assertFalse(self.srv.PLAY_STATE["ok"])
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `E:/python/python.exe -m unittest discover -s tests -k TestThumbTokens -v`
 Expected: FAIL，`AttributeError: module ... has no attribute 'THUMB_LOCK'`
 
-- [ ] **Step 3: 补 imports**
+- [x] **Step 3: 补 imports**
 
 `YtDlpWeb/server.py` 第 25-35 行的 import 块改为：
 
@@ -1026,7 +1026,7 @@ from ytdlp_core import (  # noqa: E402
 )
 ```
 
-- [ ] **Step 4: token 表与播放状态**
+- [x] **Step 4: token 表与播放状态**
 
 在 `YtDlpWeb/server.py` 的 `class Runner:`（119 行）之前插入：
 
@@ -1114,7 +1114,7 @@ def _start_play_probe(raw, cfg, outdir, emit):
                      daemon=True).start()
 ```
 
-- [ ] **Step 5: 探测结果登记封面 token**
+- [x] **Step 5: 探测结果登记封面 token**
 
 把 `YtDlpWeb/server.py:193` 那一行替换为：
 
@@ -1124,7 +1124,7 @@ def _start_play_probe(raw, cfg, outdir, emit):
                     emit({"type": "row", "data": info})
 ```
 
-- [ ] **Step 6: 下载时触发探测、结束时清理**
+- [x] **Step 6: 下载时触发探测、结束时清理**
 
 在 `_download_attempt` 的 `if ev:` 块里，`emit({"type": "progress", ...})` 之后、`continue`（274 行）之前插入：
 
@@ -1174,7 +1174,7 @@ def _start_play_probe(raw, cfg, outdir, emit):
             PLAY_STATE.update({"raw_path": "", "ok": False, "reason": "还没有开始下载"})
 ```
 
-- [ ] **Step 7: GET /api/thumb**
+- [x] **Step 7: GET /api/thumb**
 
 在 `do_GET` 的 `if p == "/api/sniff/log":`（753 行）之前插入：
 
@@ -1204,7 +1204,7 @@ def _start_play_probe(raw, cfg, outdir, emit):
             return
 ```
 
-- [ ] **Step 8: POST /api/play**
+- [x] **Step 8: POST /api/play**
 
 在 `do_POST` 的 `if p == "/api/open":`（909 行）之前插入：
 
@@ -1232,7 +1232,7 @@ def _start_play_probe(raw, cfg, outdir, emit):
             return self._json({"ok": True})
 ```
 
-- [ ] **Step 9: 启动时清理过期封面缓存**
+- [x] **Step 9: 启动时清理过期封面缓存**
 
 在 `purge_stale_cookie_files`（939-954 行）之后追加：
 
@@ -1259,7 +1259,7 @@ def purge_stale_thumbs():
     purge_stale_thumbs()
 ```
 
-- [ ] **Step 10: 跑测试 + 全量回归 + 语法检查**
+- [x] **Step 10: 跑测试 + 全量回归 + 语法检查**
 
 Run: `E:/python/python.exe -m unittest discover -s tests -k TestThumbTokens -v`
 Expected: PASS（4 例）
@@ -1273,7 +1273,7 @@ Expected: OK，150 例
 Run: `E:/python/python.exe -m py_compile YtDlpWeb/server.py ytdlp_core.py`
 Expected: 无输出，退出码 0
 
-- [ ] **Step 11: 提交**
+- [x] **Step 11: 提交**
 
 ```bash
 git add YtDlpWeb/server.py tests/test_core.py
@@ -1294,7 +1294,7 @@ git commit -m "网页版：封面 token 端点与边下边播端点
 - Consumes: Task 5 的 `GET /api/thumb?id=`、`POST /api/play`、SSE `playable` 事件、`row.data.thumb_id`。
 - Produces:  DOM id `preview`（预览卡）、`pvImg`、`pvMeta`、`pvOpen`、`pvClose`、`btnPlay`、`play_while`；JS 函数 `showPreview(i)`、`hidePreview()`、`setPlayable(ok, reason)`。
 
-- [ ] **Step 1: 加 HTML**
+- [x] **Step 1: 加 HTML**
 
 在 `index.html:210` 的 `<div class="results" id="results">…</div>` 之后插入：
 
@@ -1332,7 +1332,7 @@ git commit -m "网页版：封面 token 端点与边下边播端点
             边下边播只对能流式播放的源有效（HLS / mkv / webm）；音视频分离的源与 aria2c 会置灰并说明原因。</div>
 ```
 
-- [ ] **Step 2: 加 els 与 FIELDS**
+- [x] **Step 2: 加 els 与 FIELDS**
 
 把 `index.html:422` 的 `fmtClose:$('fmtClose'), fmtUseBest:$('fmtUseBest')` 改成：
 
@@ -1344,7 +1344,7 @@ git commit -m "网页版：封面 token 端点与边下边播端点
 
 把 `FIELDS`（424-426）里的 `'open_after','net_hard'` 改成 `'open_after','net_hard','play_while'`。
 
-- [ ] **Step 3: 行内加「预览」按钮并绑定**
+- [x] **Step 3: 行内加「预览」按钮并绑定**
 
 把 `rowHtml`（556-567）的 `.metas` 块之后、`</div>` 之前加一个按钮，整段替换为：
 
@@ -1375,7 +1375,7 @@ function rowHtml(i){
     });
 ```
 
-- [ ] **Step 4: 实现预览卡**
+- [x] **Step 4: 实现预览卡**
 
 在 `esc` 函数（605 行）之后插入：
 
@@ -1419,7 +1419,7 @@ els.btnPlay.addEventListener('click', async ()=>{
 });
 ```
 
-- [ ] **Step 5: 可播性状态与 SSE 分支**
+- [x] **Step 5: 可播性状态与 SSE 分支**
 
 在 `setPlayable` 处新增函数（放在 `setBusy` 之后）：
 
@@ -1444,7 +1444,7 @@ function setPlayable(ok, reason){
 
 在 `doDetect` 开头 `results = []; checked = new Set(); renderResults();`（633 行）之后插入 `hidePreview();`。
 
-- [ ] **Step 6: 语法检查**
+- [x] **Step 6: 语法检查**
 
 把 `index.html` 里 `<script>` 与 `</script>` 之间的内容抽到临时文件再检查：
 
@@ -1455,7 +1455,7 @@ node --check /tmp/inline.js
 
 Expected: 无输出，退出码 0
 
-- [ ] **Step 7: 起服务手工验证**
+- [x] **Step 7: 起服务手工验证**
 
 ```bash
 E:/python/python.exe YtDlpWeb/server.py --port 8799 --no-browser
@@ -1470,7 +1470,7 @@ E:/python/python.exe YtDlpWeb/server.py --port 8799 --no-browser
 
 验证完关掉服务窗口。
 
-- [ ] **Step 8: 提交**
+- [x] **Step 8: 提交**
 
 ```bash
 git add YtDlpWeb/index.html
@@ -1492,7 +1492,7 @@ git commit -m "网页版：预览卡与边下边播按钮
 - Consumes: Task 1-4 的核心函数（`fetch_thumb`、`probe_playable`、`make_preview_link`、`clear_preview_links`、`real_download_path`、`fmt_is_separated`）。
 - Produces: `self.var_playwhile`、`self.btn_play`、`self.lbl_play`、预览面板控件 `self.pv_img` / `self.pv_meta` / `self.btn_pv_open`；队列消息 `("preview", idx, path, err)` 与 `("playable", ok, reason)`；方法 `_show_preview(i)`、`_on_preview(payload)`、`_set_playable(ok, reason)`、`_play_now()`、`_start_play_probe()`。
 
-- [ ] **Step 1: 加开关**
+- [x] **Step 1: 加开关**
 
 在 `YtDlpGUI/main.py:299`（那条 `.muted` 提示的 grid 结束）之后插入：
 
@@ -1505,7 +1505,7 @@ git commit -m "网页版：预览卡与边下边播按钮
             row=7, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
 ```
 
-- [ ] **Step 2: 配置读写**
+- [x] **Step 2: 配置读写**
 
 在 `_collect_cfg` 的 `"net_hard": self.var_nethard.get(),`（488 行）之后插入：
 
@@ -1519,7 +1519,7 @@ git commit -m "网页版：预览卡与边下边播按钮
         self.var_playwhile.set(self.cfg.get("play_while", False))
 ```
 
-- [ ] **Step 3: 加预览面板**
+- [x] **Step 3: 加预览面板**
 
 在 `_build_results` 的 `self.lbl_count.pack(side="right")`（435 行）之后插入：
 
@@ -1540,7 +1540,7 @@ git commit -m "网页版：预览卡与边下边播按钮
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 ```
 
-- [ ] **Step 4: 预览取图与显示（后台线程 + 队列）**
+- [x] **Step 4: 预览取图与显示（后台线程 + 队列）**
 
 在 `_add_result`（1151 行）之前插入：
 
@@ -1631,7 +1631,7 @@ import webbrowser
 from tkinter import ttk, filedialog, messagebox
 ```
 
-- [ ] **Step 5: 加播放按钮与探测**
+- [x] **Step 5: 加播放按钮与探测**
 
 在 `_build_progress` 的 `self.lbl_detail.grid(...)`（403 行）之后插入：
 
@@ -1718,7 +1718,7 @@ from tkinter import ttk, filedialog, messagebox
             messagebox.showerror("打开播放器失败", "%s\n建议安装 VLC 或 PotPlayer。" % e)
 ```
 
-- [ ] **Step 6: 任务结束清理**
+- [x] **Step 6: 任务结束清理**
 
 在 `_on_done` 与 `_on_detect_done` 里各加一行清理。`_on_done` 开头插入：
 
@@ -1728,7 +1728,7 @@ from tkinter import ttk, filedialog, messagebox
         self._set_playable(False, "还没有开始下载")
 ```
 
-- [ ] **Step 7: 自检与手工验证**
+- [x] **Step 7: 自检与手工验证**
 
 Run: `E:/python/python.exe -m py_compile YtDlpGUI/main.py`
 Expected: 无输出，退出码 0
@@ -1747,7 +1747,7 @@ Run: `E:/python/python.exe YtDlpGUI/main.py`
 
 验证完关掉窗口。
 
-- [ ] **Step 8: 提交**
+- [x] **Step 8: 提交**
 
 ```bash
 git add YtDlpGUI/main.py
@@ -1769,7 +1769,7 @@ Tkinter 的 PhotoImage 只认 PNG/GIF，所以封面经随包 ffmpeg 转一次 P
 - Consumes: Task 1-7 的全部产出。
 - Produces: 更新后的 README；实测结论（速度对照、播放器锁文件行为）。
 
-- [ ] **Step 1: 更新 README**
+- [x] **Step 1: 更新 README**
 
 在「快速开始」之后新增一节：
 
@@ -1805,7 +1805,7 @@ Tkinter 的 PhotoImage 只认 PNG/GIF，所以封面经随包 ffmpeg 转一次 P
 - 个别播放器以独占方式打开文件时可能挡住续写，遇到就换 VLC / PotPlayer。
 ```
 
-- [ ] **Step 2: 全量回归**
+- [x] **Step 2: 全量回归**
 
 Run: `E:/python/python.exe -m unittest discover -s tests`
 Expected: OK，150 例（若实际数字不同，以实际为准并同步 README）
@@ -1819,7 +1819,7 @@ Expected: 退出码 0
 Run: `node tests/extension_smoke.js`
 Expected: 5/5 通过
 
-- [ ] **Step 3: 手工实测矩阵**
+- [x] **Step 3: 手工实测矩阵**
 
 起服务 `E:/python/python.exe YtDlpWeb/server.py --port 8799 --no-browser`，按下表逐项验证并记录结果：
 
@@ -1832,12 +1832,12 @@ Expected: 5/5 通过
 
 播放器各试一次：VLC、PotPlayer、Windows「电影和电视」。**重点确认播放器打开期间 yt-dlp 仍在写**（进度百分比继续涨）。若某播放器导致写入失败，在 README 的已知限制里点名。
 
-- [ ] **Step 4: 速度对照**
+- [x] **Step 4: 速度对照**
 
 同一个 HLS 源，开关关/开各跑一次，记录两次的平均下载速度（进度行里的 `速度`）。
 Expected: 两者在同一量级，无明显下降。把数字写进提交信息。
 
-- [ ] **Step 5: 端点守卫复查**
+- [x] **Step 5: 端点守卫复查**
 
 ```bash
 curl -s -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:8799/api/thumb?url=https://example.com/a.jpg"
@@ -1848,7 +1848,7 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST -H "Content-Type: application/j
 
 Expected: 依次 400、404、400、409
 
-- [ ] **Step 6: 清理与提交**
+- [x] **Step 6: 清理与提交**
 
 关掉服务窗口，确认 `downloads\.preview\` 已清空、`__pycache__` 已删。
 
