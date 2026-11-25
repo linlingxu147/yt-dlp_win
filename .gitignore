@@ -11,6 +11,9 @@ YtDlpGUI/config.json
 YtDlpWeb/config.json
 *.bak
 
+# 本机下载历史（含下载链接，仅存本机）
+YtDlpGUI/history.json
+
 # Python / Node
 __pycache__/
 *.pyc

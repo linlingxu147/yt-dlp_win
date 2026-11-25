@@ -9,23 +9,28 @@
 
 ## 快速开始（选一种即可）
 
-### 1. 桌面版（Tkinter，单窗口 · 主入口）
+### 1. 桌面版（pywebview + Web 界面，单窗口 · 主入口）
 
 双击 `YtDlpGUI\启动.bat`。
 
-需要本机装有 Python 3.9+（脚本会自动探测 `pyw -3` / `pythonw` / `python` / `py -3`，
-并检查 tkinter；缺 tkinter 时会给出中文提示而不是直接闪退）。
+需要本机装有 Python 3.9+（脚本会自动探测 `pyw -3` / `pythonw` / `python` / `py -3`）。
+界面用 **pywebview** 承载原生 HTML/CSS/JS（WebView2 / Evergreen Edge 内核）：
+首次启动脚本会自动 `pip install pywebview`；若窗口打不开并提示缺少 WebView2，
+按提示安装 [WebView2 运行时](https://developer.microsoft.com/microsoft-edge/webview2/)（Win10/11 一般自带）。
+高 DPI 清晰渲染、整页自然滚动，不再有旧 Tkinter 版的模糊与裁切问题。
 
-**桌面版会顺带在自己窗口里跑起浏览器扩展所需的本地服务**（默认开，右上角显示
+**桌面版会顺带在自己窗口里跑起浏览器扩展所需的本地服务**（默认开，顶栏显示
 「扩展服务：127.0.0.1:8765」）。也就是说：开着桌面版，扩展就能直接用，不必再开一个
 黑框窗口。高级设置里取消勾选「启用浏览器扩展支持」即可关掉；关掉窗口时服务随之停止。
 **扩展提交的下载由桌面版自己执行**（1.8.0 起）：进度、日志、停止按钮都在桌面窗口里，
 内嵌服务只负责接请求、把状态镜像回扩展面板；桌面版自己发起的任务与扩展提交的任务共用一个任务槽。
 
-**1.9.0 起窗口分两个页签：「下载」与「扩展嗅探」。** 扩展抓到的条目会回流到「扩展嗅探」页：
+**窗口分三个页签：「下载」「扩展嗅探」「下载历史」。** 扩展抓到的条目会回流到「扩展嗅探」页：
 每 3 秒自动刷新（只在该页可见时）、默认折叠分片、可预览试播、勾选后「下载选中」直接进桌面版流水线。
-网页界面在同版本退役，批量挑选不再需要浏览器。
-「下载」页整页可滚（滚轮或右侧滚动条）：窗口不够高时日志与结果表滚下去就能看到，不再被裁掉。
+「下载历史」页记录每次下载（成功/失败/停止，含扩展与嗅探页发起的任务，最多 500 条，
+存本机 `YtDlpGUI\history.json`，不进仓库），可一键重新下载或打开目录。
+「高级」里有界面主题三态开关（跟随系统/浅色/深色），选择存本机 localStorage。
+旧 Tkinter 界面已退役，保留在 `YtDlpGUI\legacy\main_tk.py` 一个版本周期供回退。
 
 ### 2. 独立扩展服务（无网页界面，可选）
 
@@ -103,9 +108,14 @@ yt-dlp_win\
 ├─ ffmpeg.exe                  # 合并音视频 / 转码用
 ├─ ffprobe.exe                 # 元数据探测（yt-dlp 部分功能会调用）
 ├─ ytdlp_core.py               # ★ 共享核心：命令构建、配置读写、诊断规则、进度解析
-├─ YtDlpGUI\                   # 桌面版
-│   ├─ main.py
+├─ YtDlpGUI\                   # 桌面版（pywebview + Web 前端）
+│   ├─ main.py                 # 薄入口：建窗、装配 host/api、内嵌扩展服务
+│   ├─ host.py                 # 宿主：任务流水线、配置、历史、事件泵（可单测）
+│   ├─ api.py                  # js_api 方法面（JS↔Python 桥）
+│   ├─ ui\                     # 前端：原生 ES 模块，零构建（index.html / css / js）
+│   ├─ legacy\main_tk.py       # 已退役的 Tkinter 版（保留一个版本周期）
 │   ├─ config.json             # 桌面版配置（schema_version=3；内嵌服务也读写这份）
+│   ├─ history.json            # 本机下载历史（最多 500 条，不进仓库）
 │   └─ 启动.bat
 ├─ YtDlpWeb\                   # 扩展服务（无网页界面）
 │   ├─ server.py               # 纯标准库 HTTP 服务（也能被桌面版当模块内嵌）
@@ -121,6 +131,8 @@ yt-dlp_win\
 │   ├─ test_core.py            # 核心逻辑单元测试（unittest）
 │   ├─ test_hardening.py       # 安全/健壮性回归
 │   ├─ test_server.py          # 服务端接口与并发闸门
+│   ├─ test_host.py            # 桌面宿主：事件泵/历史/流水线/预览播放/嗅探
+│   ├─ test_api.py             # js_api 方法面与输入校验
 │   └─ extension_smoke.js      # 扩展后台冒烟（Node + 假 chrome API）
 └─ downloads\                  # 默认下载目录
 ```
@@ -267,6 +279,7 @@ node tests\extension_smoke.js
 | --- | --- |
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Unlicense；本目录为官方 Windows onedir 发行包 |
 | [FFmpeg](https://ffmpeg.org/) | LGPL/GPL 视具体构建；随包分发请遵守其许可 |
+| [pywebview](https://pywebview.flowrl.com/) | BSD-3；桌面窗口承载 Web 界面（首次启动自动安装，依赖系统 WebView2） |
 | `curl_cffi` / `websockets` / `pycryptodome` / `certifi` | 见 `_internal\THIRD_PARTY_LICENSES.txt` |
 
 本仓库自身的界面与嗅探代码仅为个人自用工具，请遵守目标站点的服务条款与版权规定。
