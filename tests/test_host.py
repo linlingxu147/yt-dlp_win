@@ -222,6 +222,16 @@ class DownloadTest(unittest.TestCase):
         self.host.task_kind = "download"
         self.assertFalse(self.host.submit_server_task({"urls": ["https://x"]}))
 
+    def test_sniff_source_recorded(self):
+        task = {"urls": ["https://x/v"], "cfg": dict(self.cfg),
+                "emit": None, "no_playlist": True, "source": "sniff"}
+        with mock.patch.object(self.mod, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod, "iter_lines_watch", fake_iter([])):
+            self.host.start_external(task)
+            self.host._worker.join(5)
+        self.host.pump_once()
+        self.assertEqual(self.host.history[-1]["source"], "sniff")
+
     def test_external_task_mirrors_and_records_ext_source(self):
         emitted = []
         task = {"urls": ["https://x/v"], "cfg": dict(self.cfg),

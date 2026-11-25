@@ -285,7 +285,7 @@ class Host:
         self.dl_urls = urls
         self.dl_no_playlist = bool(task.get("no_playlist", True))
         self.dl_outdir = outdir
-        self.dl_source = "ext"
+        self.dl_source = task.get("source") or "ext"
         self.net_tried, self.net_name = set(), "normal"
         self.user_stopped = False
         self.running = True
@@ -398,7 +398,7 @@ class Host:
             self.record_history({"urls": self.dl_urls, "outdir": self.dl_outdir,
                                  "status": "ok", "code": 0, "elapsed": round(elapsed, 1),
                                  "done_count": done_count, "mode": base.get("mode", ""),
-                                 "source": "ext" if was_ext else getattr(self, "dl_source", "gui")})
+                                 "source": getattr(self, "dl_source", "gui")})
             self._finish_task(code)
             self._task_ev()
             if base.get("open_after"):
@@ -413,7 +413,7 @@ class Host:
             self.record_history({"urls": self.dl_urls, "outdir": self.dl_outdir,
                                  "status": status, "code": code, "elapsed": round(elapsed, 1),
                                  "done_count": done_count, "mode": base.get("mode", ""),
-                                 "source": "ext" if was_ext else getattr(self, "dl_source", "gui")})
+                                 "source": getattr(self, "dl_source", "gui")})
             self._finish_task(code)
             self._task_ev()
         self._put({"type": "done", "code": code, "elapsed": round(elapsed, 1),
@@ -887,7 +887,7 @@ class Host:
             if it.get("ua"):
                 cfg["ua"] = it["ua"]
         task = {"urls": [it["url"] for it in items], "kind": "media", "cfg": cfg,
-                "emit": None, "no_playlist": True}
+                "emit": None, "no_playlist": True, "source": "sniff"}
         if not self.submit_server_task(task):
             return self._busy()
         self._put({"type": "sniff_started"})
