@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -969,6 +970,129 @@ class TestPreviewFields(unittest.TestCase):
     def test_legacy_progress_line_has_empty_raw(self):
         p = core.parse_progress_line("[download]  12.5% of  10.00MiB at 1.00MiB/s ETA 00:10")
         self.assertEqual(p["raw"], "")
+
+
+FFMPEG = os.path.join(ROOT, "ffmpeg.exe")
+FFPROBE = os.path.join(ROOT, "ffprobe.exe")
+HAS_FFMPEG = os.path.isfile(FFMPEG) and os.path.isfile(FFPROBE)
+
+
+class TestPlayHelpers(unittest.TestCase):
+    def test_separated_fmt(self):
+        self.assertTrue(core.fmt_is_separated({"mode": "best"}))
+        self.assertTrue(core.fmt_is_separated({"mode": "single", "fmt": "137+140"}))
+        self.assertFalse(core.fmt_is_separated({"mode": "single"}))
+        self.assertFalse(core.fmt_is_separated({"mode": "best", "fmt": "b"}))
+        self.assertFalse(core.fmt_is_separated({"mode": "audio_mp3"}))
+
+    def test_real_path_prefers_part_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            final = os.path.join(d, "a.mp4")
+            self.assertEqual(core.real_download_path(final), "")
+            with open(final + ".part", "wb") as f:
+                f.write(b"x")
+            self.assertEqual(core.real_download_path(final), final + ".part")
+            os.remove(final + ".part")
+            with open(final, "wb") as f:
+                f.write(b"x")
+            self.assertEqual(core.real_download_path(final), final)
+
+    def test_real_path_empty_input(self):
+        self.assertEqual(core.real_download_path(""), "")
+        self.assertEqual(core.real_download_path(None), "")
+
+    def test_probe_missing_file(self):
+        v = core.probe_playable("Z:/definitely/not/here.mkv")
+        self.assertFalse(v["ok"])
+        self.assertTrue(v["reason"])
+
+    def test_link_keeps_format_marker_and_clears_safely(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "Title.f137.mp4.part")
+            with open(src, "wb") as f:
+                f.write(b"abcdef")
+            link, err = core.make_preview_link(src, d)
+            self.assertIsNone(err)
+            self.assertEqual(os.path.basename(link), "Title.f137.mp4")
+            self.assertEqual(os.path.dirname(link), os.path.join(d, ".preview"))
+            with open(link, "rb") as f:
+                self.assertEqual(f.read(), b"abcdef")
+            # 硬链接：写源文件，链接看得到增长
+            with open(src, "ab") as f:
+                f.write(b"growing")
+            with open(link, "rb") as f:
+                self.assertEqual(f.read(), b"abcdefgrowing")
+            core.clear_preview_links(d)
+            self.assertFalse(os.path.exists(link))
+            self.assertTrue(os.path.isfile(src))
+            with open(src, "rb") as f:
+                self.assertEqual(f.read(), b"abcdefgrowing")
+
+    def test_link_replaces_stale_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "a.mp4.part")
+            with open(src, "wb") as f:
+                f.write(b"new")
+            os.makedirs(os.path.join(d, ".preview"))
+            with open(os.path.join(d, ".preview", "a.mp4"), "wb") as f:
+                f.write(b"stale")
+            link, err = core.make_preview_link(src, d)
+            self.assertIsNone(err)
+            with open(link, "rb") as f:
+                self.assertEqual(f.read(), b"new")
+
+    def test_link_missing_source_reports_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            link, err = core.make_preview_link(os.path.join(d, "nope.part"), d)
+            self.assertEqual(link, "")
+            self.assertTrue(err)
+
+    def test_clear_on_missing_dir_is_quiet(self):
+        core.clear_preview_links("Z:/definitely/not/here")
+
+
+@unittest.skipUnless(HAS_FFMPEG, "需要随包 ffmpeg/ffprobe")
+class TestProbePlayableReal(unittest.TestCase):
+    """把设计阶段的探针固化成测试：截断的 mkv/webm/ts 可读，mp4 不可读。"""
+
+    def _make(self, d, name, extra):
+        out = os.path.join(d, name)
+        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error",
+               "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10",
+               "-f", "lavfi", "-i", "sine=frequency=440", "-t", "6"] + extra + ["-y", out]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       creationflags=core.CREATE_NO_WINDOW, timeout=120)
+        return out
+
+    def _truncate(self, src, pct):
+        dst = src + ".partial"
+        with open(src, "rb") as f:
+            data = f.read()
+        with open(dst, "wb") as f:
+            f.write(data[:len(data) * pct // 100])
+        return dst
+
+    def test_mkv_partial_is_playable(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self._make(d, "a.mkv", ["-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac"])
+            self.assertTrue(core.probe_playable(self._truncate(src, 40))["ok"])
+
+    def test_webm_partial_is_playable(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self._make(d, "a.webm", ["-c:v", "libvpx", "-b:v", "200k", "-c:a", "libopus"])
+            self.assertTrue(core.probe_playable(self._truncate(src, 40))["ok"])
+
+    def test_mpegts_partial_is_playable(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self._make(d, "a.ts", ["-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", "-f", "mpegts"])
+            self.assertTrue(core.probe_playable(self._truncate(src, 40))["ok"])
+
+    def test_mp4_partial_is_not_playable(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = self._make(d, "a.mp4", ["-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac"])
+            v = core.probe_playable(self._truncate(src, 40))
+            self.assertFalse(v["ok"])
+            self.assertTrue(v["reason"])
 
 
 if __name__ == "__main__":

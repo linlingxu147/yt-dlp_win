@@ -510,6 +510,97 @@ def fetch_thumb(url, cfg, cache_dir=None, timeout=THUMB_TIMEOUT, max_bytes=THUMB
     return path, None
 
 
+# ---------------- 边下边播 ----------------
+
+PREVIEW_SUBDIR = ".preview"
+
+
+def fmt_is_separated(cfg):
+    """最终格式表达式含 "+" 即音视频分离（下出来是两个文件，任何一个都不是完整片子）。"""
+    fmt = str(cfg.get("fmt") or "").strip()
+    if not fmt:
+        fmt = MODE_FMT.get(mode_key(cfg.get("mode")), "")
+    return "+" in fmt
+
+
+def real_download_path(raw_path):
+    """progress.filename 给的是目标名；磁盘上先找 .part，没有才用目标名本身。"""
+    p = str(raw_path or "").strip()
+    if not p:
+        return ""
+    part = p + ".part"
+    if os.path.isfile(part):
+        return part
+    return p if os.path.isfile(p) else ""
+
+
+def probe_playable(path, timeout=6):
+    """让 ffprobe 读正在增长的文件，读得到流才算能播。只读不转码。"""
+    if not os.path.isfile(path):
+        return {"ok": False, "reason": "文件还没写出来"}
+    cmd = [find_tool("ffprobe.exe"), "-v", "error", "-show_entries", "format=duration",
+           "-of", "default=nw=1:nk=1", path]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                creationflags=CREATE_NO_WINDOW)
+    except OSError as e:
+        return {"ok": False, "reason": f"ffprobe 不可用：{e}"}
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        return {"ok": False, "reason": "ffprobe 超时"}
+    text = decode_bytes(out or b"").strip()
+    if proc.returncode != 0 or not text:
+        lines = decode_bytes(err or b"").strip().splitlines()
+        return {"ok": False, "reason": lines[0] if lines else "读不到媒体信息"}
+    return {"ok": True, "reason": ""}
+
+
+def make_preview_link(real_path, outdir):
+    """硬链接出一个扩展名正确的名字给系统播放器。
+
+    播放器按内容识别、不看扩展名，但 .part 没有文件关联，os.startfile 会弹
+    「选择打开方式」。硬链接零字节拷贝，且放在下载目录内的子目录保证同卷。
+    """
+    if not os.path.isfile(real_path):
+        return "", "文件还没写出来"
+    base = os.path.basename(real_path)
+    if base.lower().endswith(".part"):
+        base = base[:-5]
+    d = os.path.join(outdir or "", PREVIEW_SUBDIR)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as e:
+        return "", f"无法创建预览目录：{e}"
+    link = os.path.join(d, base)
+    try:
+        if os.path.exists(link):
+            os.remove(link)
+        os.link(real_path, link)
+    except OSError as e:
+        return "", f"此磁盘不支持硬链接（常见于 exFAT/FAT32 U 盘）：{e}"
+    return link, None
+
+
+def clear_preview_links(outdir):
+    """只删链接，不动被链接的数据——删硬链接不影响源文件。"""
+    d = os.path.join(outdir or "", PREVIEW_SUBDIR)
+    try:
+        for name in os.listdir(d):
+            try:
+                os.remove(os.path.join(d, name))
+            except OSError:
+                pass
+        os.rmdir(d)
+    except OSError:
+        pass
+
+
 def sanitize_urls(urls, allow_other=False):
     """过滤出可交给 yt-dlp 的地址，返回 (可用列表, 被丢弃列表)。
 
