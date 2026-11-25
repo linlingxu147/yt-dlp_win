@@ -283,5 +283,50 @@ class TestBuildSniffPreview(unittest.TestCase):
         self.assertIn("抓不到画面", r["error"])
 
 
+class TestServiceLifecycle(unittest.TestCase):
+    """桌面版内嵌服务靠的就是这两个入口：start_service() 启动、Service.shutdown() 收摊。"""
+
+    def test_start_serves_status_and_shutdown_releases_port(self):
+        import json
+        import socket
+        import urllib.request
+
+        try:
+            svc = server.start_service()
+        except OSError as e:
+            self.skipTest("端口都被占用：%s" % e)
+        try:
+            body = json.loads(urllib.request.urlopen(svc.url + "/api/status", timeout=5).read())
+            self.assertEqual(body["app"], "yt-dlp-web")
+            self.assertIn("busy", body)
+            port = svc.port
+        finally:
+            svc.shutdown()
+        # 关掉之后端口必须放出来，否则下次启动会被自己的残影挡住
+        with socket.socket() as sock:
+            sock.settimeout(1.0)
+            self.assertNotEqual(sock.connect_ex(("127.0.0.1", port)), 0)
+
+    def test_shutdown_is_idempotent(self):
+        try:
+            svc = server.start_service()
+        except OSError as e:
+            self.skipTest("端口都被占用：%s" % e)
+        svc.shutdown()
+        svc.shutdown()
+
+    def test_set_config_file_points_both_readers_at_one_file(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "sub", "config.json")
+            old = server.CONFIG_FILE
+            try:
+                server.set_config_file(target)
+                self.assertEqual(server.CONFIG_FILE, target)
+                self.assertTrue(os.path.isdir(os.path.dirname(target)))
+            finally:
+                server.set_config_file(old)
+
+
 if __name__ == "__main__":
     unittest.main()

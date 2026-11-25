@@ -27,6 +27,23 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 sys.path.insert(0, BASE_DIR)
 import ytdlp_core as core  # noqa: E402
 
+
+def load_web_server():
+    """把 YtDlpWeb/server.py 当模块载入（不执行它的 main）。
+
+    返回 None 表示文件缺失——桌面版照常可用，只是扩展连不上。
+    """
+    import importlib.util
+    path = os.path.join(BASE_DIR, "YtDlpWeb", "server.py")
+    if not os.path.isfile(path):
+        return None
+    spec = importlib.util.spec_from_file_location("ytdlp_web_server", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["ytdlp_web_server"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 # 与网页版共用的实现统一放在 ytdlp_core：这里只导入名字，避免两套逻辑各自漂移。
 from ytdlp_core import (  # noqa: E402
     MODE_CHOICES, MODE_FMT, MODE_NAME, mode_key, TEMPLATES, BROWSERS,
@@ -63,7 +80,7 @@ TROUBLE_LABELS = {
 
 
 class App:
-    def __init__(self, root):
+    def __init__(self, root, ext_service=True):
         self.root = root
         self.root.title("yt-dlp 下载器   ·   可视化界面")
         self.root.geometry("1010x1000")
@@ -71,6 +88,8 @@ class App:
 
         self.q = queue.Queue()
         self.proc = None
+        self.web_svc = None            # 内嵌的浏览器扩展服务（后台线程）
+        self._want_service = ext_service
         self.running = False
         self.task_kind = None     # 当前占用子进程的任务名，见 TASK_LABELS
         self.cfg = self._load_config()
@@ -109,6 +128,10 @@ class App:
         for _w in getattr(self, "_cfg_warnings", []):
             self.log_line("[配置] " + _w + "\n", "warn")
         self._refresh_progress()
+        if self._want_service:
+            self._start_ext_service()
+        else:
+            self._set_svc_label("扩展服务：未启用", ok=False)
         self._pump()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -128,6 +151,8 @@ class App:
         self.lbl_env.config(
             text=("ffmpeg 已就绪 · aria2c 已就绪" if self.has_aria2c else "ffmpeg 已就绪 · 未检测到 aria2c"),
             foreground=("#1a7f37" if self.has_aria2c else "#9a6700"))
+        self.lbl_svc = ttk.Label(top, text="扩展服务：启动中…", font=FONT_S, foreground="#8c959f")
+        self.lbl_svc.pack(side="right", padx=(0, 14))
 
         # 主体：左右两列分区
         body = ttk.Frame(self.root)
@@ -395,6 +420,14 @@ class App:
         ttk.Entry(lf, textvariable=self.var_extra, font=FONT).grid(row=2, column=1, sticky="ew", pady=3, padx=(0, 6))
         ttk.Label(lf, text="任意 yt-dlp 参数，如 --download-archive archive.txt",
                   foreground="#8c959f", font=FONT_S).grid(row=3, column=1, sticky="w", pady=(0, 6))
+        self.var_extsvc = tk.BooleanVar()
+        ttk.Checkbutton(lf, text="启用浏览器扩展支持（本机 127.0.0.1:8765，网页版/扩展共用）",
+                        variable=self.var_extsvc,
+                        command=self._toggle_ext_service).grid(
+            row=4, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 2))
+        ttk.Label(lf, text="关掉后扩展就找不到服务；桌面版自身下载不受影响",
+                  foreground="#8c959f", font=FONT_S).grid(row=5, column=0, columnspan=2, sticky="w",
+                                                          padx=6, pady=(0, 6))
 
     def _build_progress(self, row):
         lf = ttk.LabelFrame(self.root, text=" 下载进度 ")
@@ -519,6 +552,7 @@ class App:
             "flat": self.var_flat.get(),
             "net_hard": self.var_nethard.get(),
             "play_while": self.var_playwhile.get(),
+            "ext_service": self.var_extsvc.get(),
             "browser": self.var_browser.get(), "browser_profile": self.var_browser_profile.get().strip(),
             "ua": self.var_ua.get().strip(), "referer": self.var_referer.get().strip(),
             "headers": normalize_headers(self.txt_headers.get("1.0", "end")),
@@ -558,6 +592,7 @@ class App:
         self.var_generic.set(self.cfg["generic"])
         self.var_nethard.set(self.cfg.get("net_hard", True))
         self.var_playwhile.set(self.cfg.get("play_while", False))
+        self.var_extsvc.set(bool(self.cfg.get("ext_service", True)))
         self._sync_mode(keep_fmt=True)
 
     def _sync_mode(self, keep_fmt=False):
@@ -1520,6 +1555,50 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
+    # ---------------- 内嵌扩展服务 ----------------
+    def _set_svc_label(self, text, ok=True):
+        if not hasattr(self, "lbl_svc"):
+            return
+        self.lbl_svc.config(text=text, foreground=("#1a7f37" if ok else "#b35900"))
+
+    def _start_ext_service(self):
+        """在后台线程里拉起 HTTP 服务；失败只提示，不影响桌面版下载。"""
+        if self.web_svc is not None:
+            return
+        try:
+            mod = load_web_server()
+            if mod is None:
+                self._set_svc_label("扩展服务：缺少 YtDlpWeb/server.py", ok=False)
+                return
+            # 两边共用桌面版这份配置：扩展触发的下载和界面上的设置才是一回事
+            mod.set_config_file(CONFIG_FILE)
+            self.web_svc = mod.start_service()
+        except Exception as e:
+            self.web_svc = None
+            self._set_svc_label("扩展服务启动失败", ok=False)
+            self.log_line("[扩展服务] 启动失败：%s\n" % e, "warn")
+            return
+        self._set_svc_label("扩展服务：%s" % self.web_svc.url.replace("http://", ""), ok=True)
+        self.log_line("[扩展服务] 已监听 %s（浏览器扩展可直连）\n" % self.web_svc.url, "info")
+
+    def _stop_ext_service(self):
+        if self.web_svc is None:
+            return
+        try:
+            self.web_svc.shutdown()
+        except Exception:
+            pass
+        self.web_svc = None
+        self._set_svc_label("扩展服务：已停止", ok=False)
+
+    def _toggle_ext_service(self):
+        want = bool(self.var_extsvc.get())
+        if want:
+            self._start_ext_service()
+        else:
+            self._stop_ext_service()
+        self._save_config()
+
     def on_close(self):
         if self.task_kind and not messagebox.askokcancel(
                 "退出", "「%s」仍在进行，确定退出吗？" % TASK_LABELS.get(self.task_kind, "任务")):
@@ -1529,6 +1608,7 @@ class App:
             self.stop()
         except Exception:
             pass
+        self._stop_ext_service()
         # 强退时 _on_done 不会跑，这里补一次清理：否则下载目录里会一直留着
         # .preview 下的硬链接（文件已删、链接还指向不存在的 .part）。
         try:
@@ -1544,7 +1624,7 @@ def main():
         root.call("tk", "scaling", 1.2)
     except Exception:
         pass
-    app = App(root)
+    app = App(root, ext_service=("--selftest" not in sys.argv))
     if "--selftest" in sys.argv:
         print(json.dumps(app.build_cmd(["https://www.youtube.com/watch?v=TEST"]), ensure_ascii=False, indent=2))
         sys.stdout.flush()          # 退出前必须 flush，否则看不到输出（项目备忘）

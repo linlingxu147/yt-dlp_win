@@ -972,6 +972,8 @@ DEFAULT_CONFIG = {
     # 网络自愈用的键（桌面版界面不暴露，但加载/保存时不能丢）
     "impersonate": "", "ipv4": False, "chunk": "", "proxy_off": False,
     "socket_timeout": "", "net_hard": True, "play_while": False,
+    # 桌面版内嵌的浏览器扩展服务（扩展靠它下载/预览）。关掉就只有桌面版能用。
+    "ext_service": True,
     "yt_dlp_path": find_tool("yt-dlp.exe"),
     "schema_version": CONFIG_SCHEMA_VERSION,
 }

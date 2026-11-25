@@ -48,7 +48,7 @@ INDEX_FILE = os.path.join(APP_DIR, "index.html")
 
 PORT_RANGE = core.PORT_RANGE
 APP_ID = "yt-dlp-web"          # 扩展靠它确认「端口上跑的是本项目」，而不是别的服务
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.7.0"
 
 # 唯一被放行的扩展 ID——由 sniffer_extension\manifest.json 里的 "key" 决定（打包后固定不变）。
 # 以前这里是「任何 chrome-extension:// 都放行」，等于让本机的其它扩展也能改配置、
@@ -119,6 +119,19 @@ from ytdlp_core import (  # noqa: E402
 
 # 诊断规则、模式表、格式表达式都在 ytdlp_core；网页版只保留自己的默认配置。
 DEFAULT_CONFIG = core.default_config()
+
+
+def set_config_file(path):
+    """让宿主（比如桌面版）指定用哪一份 config.json。
+
+    默认是本目录的；桌面版内嵌服务时指向桌面版那份 config.json，
+    这样扩展触发的下载和界面上看到的设置才是同一份。
+    """
+    global CONFIG_FILE
+    p = os.path.abspath(str(path))
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    CONFIG_FILE = p
+    return CONFIG_FILE
 
 
 def load_config(warn=None):
@@ -1497,11 +1510,75 @@ def purge_stale_thumbs():
         pass
 
 
-def main():
+class Service:
+    """一个跑在后台线程里的 HTTP 服务。
+
+    ``start_service()`` 只负责占端口、拉起 serve_forever；打印横幅、开浏览器
+    这些「独立进程」才需要的事留在 ``main()`` 里，宿主（桌面版）调用时不会有
+    任何标准输出副作用。
+    """
+
+    def __init__(self, httpd, port, thread):
+        self.httpd = httpd
+        self.port = port
+        self.thread = thread
+        self._closed = False
+        self.url = "http://%s:%d" % (LISTEN_HOST, port)
+
+    def shutdown(self, timeout=5.0):
+        """停掉服务并释放端口。可重复调用（宿主退出与 finally 都会调）。"""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.httpd.shutdown()
+        except Exception:
+            pass
+        try:
+            self.httpd.server_close()
+        except Exception:
+            pass
+        try:
+            self.thread.join(timeout)
+        except Exception:
+            pass
+
+
+def pick_port(port=None):
+    """占一个端口：优先用指定的，否则在 PORT_RANGE 里避让。返回 (port, 被占用的列表)。"""
+    ports = [port] if port else list(PORT_RANGE)
+    skipped = []
+    for p in ports:
+        try:
+            httpd = ThreadingHTTPServer((LISTEN_HOST, p), Handler)
+            return p, httpd, skipped
+        except OSError:
+            skipped.append(p)
+    return None, None, skipped
+
+
+def start_service(port=None):
+    """启动服务并立刻返回 Service；失败抛 OSError（端口全被占）。
+
+    宿主可以完全不管标准输出：这里不 print、不开浏览器。
+    """
     purge_stale_cookie_files()
     purge_stale_thumbs()
     purge_stale_previews()
-    # 允许 --port 指定端口，否则在 8765-8775 内自动避让占用
+    p, httpd, skipped = pick_port(port)
+    if p is None:
+        raise OSError("端口 %s 都被占用，无法启动" %
+                      (port if port else "8765-8775"))
+    httpd.daemon_threads = True
+    t = threading.Thread(target=httpd.serve_forever, name="ytdlp-web", daemon=True)
+    t.start()
+    svc = Service(httpd, p, t)
+    svc.skipped = skipped
+    return svc
+
+
+def main():
+    # 允许 --port 指定端口，否则在 8765-8775 内自动避让
     arg_port = None
     for i, a in enumerate(sys.argv):
         if a == "--port" and i + 1 < len(sys.argv):
@@ -1509,38 +1586,33 @@ def main():
                 arg_port = int(sys.argv[i + 1])
             except ValueError:
                 pass
-    ports = [arg_port] if arg_port else list(PORT_RANGE)
-
-    port, skipped = None, []
-    for p in ports:
-        try:
-            httpd = ThreadingHTTPServer((LISTEN_HOST, p), Handler)
-            port = p
-            break
-        except OSError:
-            skipped.append(p)
-    if port is None:
-        print("端口 %s 都被占用，无法启动。" % (ports[0] if arg_port else "8765-8775"))
+    try:
+        svc = start_service(arg_port)
+    except OSError as e:
+        print(e)
         return 1
 
     print("=" * 56)
     print("  yt-dlp 下载器 · Web 界面已启动")
-    print(f"  访问地址：  http://127.0.0.1:{port}")
+    print(f"  访问地址：  {svc.url}")
     print("  访问范围：  仅本机（不监听局域网，手机无法访问）")
     print("  停止服务：  关闭本窗口，或按 Ctrl+C")
     print("=" * 56)
-    if skipped:
+    if svc.skipped:
         print("  注意：端口 %s 已被占用（可能是另一个实例还在运行），已改用 %s。"
-              % (", ".join(str(x) for x in skipped), port))
+              % (", ".join(str(x) for x in svc.skipped), svc.port))
     if "--no-browser" not in sys.argv:
         try:
-            webbrowser.open(f"http://127.0.0.1:{port}")
+            webbrowser.open(svc.url)
         except Exception:
             pass
     try:
-        httpd.serve_forever()
+        while svc.thread.is_alive():
+            svc.thread.join(0.5)
     except KeyboardInterrupt:
         print("\n已停止。")
+    finally:
+        svc.shutdown()
     return 0
 
 

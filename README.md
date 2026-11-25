@@ -1,7 +1,7 @@
 # yt-dlp 便携版工具箱（Windows）
 
 一个开箱即用的视频下载工具包：内置 `yt-dlp.exe` 与 `ffmpeg.exe`，并提供三种用法——
-**桌面窗口版**、**本地网页版**、**浏览器嗅探扩展**（配合网页版使用）。
+**桌面窗口版**（主入口，自带扩展服务）、**浏览器嗅探扩展**、**本地网页版**（可选）。
 
 同一套核心逻辑放在 `ytdlp_core.py` 里，两个前端都只是薄薄的界面层。
 
@@ -9,14 +9,22 @@
 
 ## 快速开始（选一种即可）
 
-### 1. 桌面版（Tkinter，单窗口）
+### 1. 桌面版（Tkinter，单窗口 · 主入口）
 
 双击 `YtDlpGUI\启动.bat`。
 
 需要本机装有 Python 3.9+（脚本会自动探测 `pyw -3` / `pythonw` / `python` / `py -3`，
 并检查 tkinter；缺 tkinter 时会给出中文提示而不是直接闪退）。
 
-### 2. 网页版（浏览器界面，推荐配合扩展）
+**桌面版会顺带在自己窗口里跑起浏览器扩展所需的本地服务**（默认开，右上角显示
+「扩展服务：127.0.0.1:8765」）。也就是说：开着桌面版，扩展就能直接用，不必再开一个
+黑框窗口。高级设置里取消勾选「启用浏览器扩展支持」即可关掉；关掉窗口时服务随之停止。
+
+### 2. 网页版（浏览器界面，可选）
+
+> 阶段说明：桌面版已经内嵌服务，网页版在功能上被桌面版 + 扩展覆盖，后续版本会退役。
+> 仍保留它是因为「40+ 配置项、批量粘链接、格式表、排障阶梯、完整日志」这些低频操作
+> 目前只有网页界面顺手。
 
 双击 `YtDlpWeb\启动.bat`。控制台会打印：
 
@@ -31,7 +39,7 @@
 
 ### 3. 浏览器嗅探扩展（Chrome / Edge，MV3）
 
-1. 先启动网页版（`YtDlpWeb\启动.bat`），保持窗口不要关。
+1. 先让本机服务跑起来：**开着桌面版即可**（推荐），或者启动网页版（`YtDlpWeb\启动.bat`）。
 2. 打开 `chrome://extensions`（Edge 为 `edge://extensions`），开启「开发者模式」。
 3. 「加载已解压的扩展程序」→ 选择本目录下的 `sniffer_extension`。
 4. 打开要下载的网页并刷新一次，右下角会出现「▶ 嗅探 (N)」浮条。
@@ -96,10 +104,10 @@ yt-dlp_win\
 ├─ ytdlp_core.py               # ★ 共享核心：命令构建、配置读写、诊断规则、进度解析
 ├─ YtDlpGUI\                   # 桌面版
 │   ├─ main.py
-│   ├─ config.json             # 桌面版配置（schema_version=2）
+│   ├─ config.json             # 桌面版配置（schema_version=3；内嵌服务也读写这份）
 │   └─ 启动.bat
 ├─ YtDlpWeb\                   # 网页版
-│   ├─ server.py               # 纯标准库 HTTP 服务（ThreadingHTTPServer）
+│   ├─ server.py               # 纯标准库 HTTP 服务（也能被桌面版当模块内嵌）
 │   ├─ index.html              # 单文件前端（无构建依赖）
 │   ├─ config.json             # 网页版配置（与桌面版键名一致）
 │   └─ 启动.bat
@@ -110,7 +118,9 @@ yt-dlp_win\
 │   ├─ content.js              # 浮条 UI、轮询进度、上报元素里的媒体地址
 │   └─ README.md               # 扩展单独的说明与版本历史
 ├─ tests\                       # 回归测试
-│   ├─ test_core.py            # 核心逻辑单元测试（unittest，148 个用例）
+│   ├─ test_core.py            # 核心逻辑单元测试（unittest）
+│   ├─ test_hardening.py       # 安全/健壮性回归
+│   ├─ test_server.py          # 服务端接口与并发闸门
 │   └─ extension_smoke.js      # 扩展后台冒烟（Node + 假 chrome API）
 └─ downloads\                  # 默认下载目录
 ```
@@ -119,8 +129,9 @@ yt-dlp_win\
 
 ## 配置
 
-两个前端各有一份 `config.json`，**键名完全一致**（老版本的 `open` 会自动迁移成 `open_after`），
-读写都由 `ytdlp_core.py` 负责：
+桌面版与网页版各自默认有一份 `config.json`，**键名完全一致**（老版本的 `open` 会自动迁移成
+`open_after`）。桌面版内嵌服务时会让服务直接读写桌面版这份，所以扩展触发的下载与界面设置
+是同一套配置。读写都由 `ytdlp_core.py` 负责：
 
 - 写入是**原子**的（临时文件 + `os.replace`，并留一份 `.bak`），断电不会写坏；
 - 加载时会做类型/取值校验并给出警告，坏值回退默认值而不是崩掉整个界面；
@@ -130,6 +141,8 @@ yt-dlp_win\
 `browser` `browser_profile` `ua` `referer` `headers` `cookie`
 `extractor_args` `retries` `proxy` `rate` `conc` `conc_n` `aria` `aria_args` `extra`
 以及进阶网络键 `impersonate` `ipv4` `chunk` `proxy_off` `socket_timeout`（仅手改配置）。
+`ext_service` 是桌面版的「启用浏览器扩展支持」开关（默认 `true`）。
+
 `conc` / `conc_n` 是分片并发（yt-dlp `-N`）：**默认开、并发 4**。本机对同一段流实测
 `-N 1` 4.88 MiB/s、`-N 4` 6.36、`-N 8` 6.09、`-N 32` 5.54——甜点在 4，再往上多半只是
 给自己添 403。它只对 HLS/DASH 这类分片流有效，**单个文件的直链（.mp4 一条）加多少并发
