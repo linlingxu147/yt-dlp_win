@@ -305,8 +305,9 @@ class PreviewPlayTest(unittest.TestCase):
         png = os.path.join(self.tmp.name, "t.png")
         with open(png, "wb") as f:
             f.write(b"\x89PNG\r\n\x1a\nfake")
+        # 字面公网 IP：is_public_http_url 无需 DNS 即可判定公网
         with mock.patch.object(self.mod, "fetch_thumb", return_value=(png, None)):
-            r = self.host.get_thumb("https://cdn.example/x.png", {})
+            r = self.host.get_thumb("https://93.184.216.34/x.png", {})
         self.assertTrue(r["ok"])
         self.assertTrue(r["data_url"].startswith("data:image/png;base64,"))
 
@@ -316,7 +317,7 @@ class PreviewPlayTest(unittest.TestCase):
 
     def test_thumb_failure_degrades(self):
         with mock.patch.object(self.mod, "fetch_thumb", return_value=("", "403")):
-            r = self.host.get_thumb("https://cdn.example/x.png", {})
+            r = self.host.get_thumb("https://93.184.216.34/x.png", {})
         self.assertFalse(r["ok"])
         self.assertEqual(r["err"], "403")
 
