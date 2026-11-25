@@ -12,6 +12,7 @@
 约定：本模块只依赖标准库，绝不 import tkinter / http.server。
 """
 
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -323,7 +324,13 @@ def path_inside(path, root):
     try:
         p = os.path.normcase(os.path.realpath(path))
         r = os.path.normcase(os.path.realpath(root))
-        return p == r or p.startswith(r + os.sep)
+        # 目录根（"C:\\"）本身就以分隔符结尾，再拼一次会变成 "c:\\\\"，
+        # 于是整个盘里的路径都被判成「不在里面」——/api/open 与边下边播都受影响。
+        if not r.endswith(os.sep):
+            r += os.sep
+        if not p.endswith(os.sep):
+            p += os.sep
+        return p.startswith(r)
     except Exception:
         return False
 
@@ -343,11 +350,6 @@ def clean_media_url(url):
     return s.strip().strip('"').strip("'")
 
 
-def sniff_head(text, limit=120):
-    s = str(text or "")
-    return s[:limit] + ("…" if len(s) > limit else "")
-
-
 def scrub_header_value(text, limit=0):
     """去掉能伪造请求头的控制字符（CR/LF/NUL/制表符），用于整串 Cookie 这类原样透传的值。
 
@@ -361,7 +363,6 @@ def scrub_header_value(text, limit=0):
 
 # ---------------- 链接校验 ----------------
 # 以 "-" 开头的「链接」会被 yt-dlp 当成参数；非 http(s) 的字符串同样没意义。
-_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
 _BARE_DOMAIN_RE = re.compile(r"^(?:[\w\-]+\.)+[A-Za-z]{2,}(?:[:/?#]\S*)?$")
 
 
@@ -374,11 +375,31 @@ def is_http_url(url):
 THUMB_CACHE_DIR = os.path.join(tempfile.gettempdir(), "ytdlp_thumbs")
 THUMB_MAX_BYTES = 2 * 1024 * 1024
 THUMB_TIMEOUT = 8
+THUMB_CACHE_TTL = 6 * 3600          # 缓存超过 6 小时就重取（CDN 链接会失效）
 _THUMB_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+_THUMB_MAGIC = (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a", b"BM")
 
+# 非公网网段黑名单。除了 RFC1918，还要覆盖这些「看着像公网、其实是本机/内网」的段：
+#   ::ffff:0:0/96  IPv4-mapped IPv6（::ffff:127.0.0.1 是最常见的绕过写法）
+#   100.64/10      运营商级 NAT；198.18/15 基准测试；240/4 保留；64:ff9b::/96 NAT64
 _PRIVATE_NETS = tuple(ipaddress.ip_network(n) for n in (
-    "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16",
-    "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10"))
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16",
+    "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4",
+    "255.255.255.255/32",
+    "::/128", "::1/128", "64:ff9b::/96", "::ffff:0:0/96", "100::/64",
+    "2001:db8::/32", "fc00::/7", "fe80::/10", "ff00::/8"))
+
+
+def _ip_is_blocked(ip):
+    """一个已解析的地址是否指向本机 / 内网 / 保留段。"""
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:          # ::ffff:127.0.0.1 拆回 IPv4 再判，别被写法绕开
+        return _ip_is_blocked(mapped)
+    if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+            or ip.is_multicast or ip.is_unspecified):
+        return True
+    return any(ip in net for net in _PRIVATE_NETS if net.version == ip.version)
 
 
 def is_public_http_url(url):
@@ -402,9 +423,27 @@ def is_public_http_url(url):
             ip = ipaddress.ip_address(str(info[4][0]).split("%")[0])
         except ValueError:
             return False
-        if any(ip in net for net in _PRIVATE_NETS):
+        if _ip_is_blocked(ip):
             return False
     return True
+
+
+class _ThumbRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """跟随跳转，但每一跳都重新校验——只看首个地址等于给 302 开了后门。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not is_public_http_url(newurl):
+            raise urllib.error.HTTPError(
+                newurl, code, "重定向到非公网地址，已拒绝", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_THUMB_OPENER = urllib.request.build_opener(_ThumbRedirectHandler())
+
+
+def _open_thumb(req, timeout):
+    """单点出口：测试可以替身掉这一层，不必真联网。"""
+    return _THUMB_OPENER.open(req, timeout=timeout)
 
 
 def thumb_cache_path(url, cache_dir=None):
@@ -417,7 +456,12 @@ def thumb_cache_path(url, cache_dir=None):
 
 
 def thumb_headers(cfg):
-    """取图用与下载同一套凭据，否则防盗链站点会 403。"""
+    """取图用与下载同一套凭据，否则防盗链站点会 403。
+
+    注意：这里会带上 Cookie / 自定义头，**只给 yt-dlp 兜底通路用**。
+    直接用 urllib 取图请用 thumb_direct_headers()——封面主机来自站点元数据，
+    不该拿到我们的登录态。
+    """
     h = {}
     ua = str(cfg.get("ua") or "").strip()
     if ua:
@@ -437,6 +481,23 @@ def thumb_headers(cfg):
     return h
 
 
+def thumb_direct_headers(cfg):
+    """urllib 直连取图时只带 UA + Referer：不带 Cookie，也不带自定义头。
+
+    UA/Referer 是防盗链站点的最低要求（没有就 403），泄露风险可接受；
+    Cookie 和自定义头（常放 token）一旦发给站点元数据里指定的任意主机，
+    就等于把登录态交出去。真需要凭据时由 yt-dlp 兜底通路去取。
+    """
+    h = {}
+    ua = str(cfg.get("ua") or "").strip()
+    if ua:
+        h["User-Agent"] = ua
+    ref = str(cfg.get("referer") or "").strip()
+    if ref:
+        h["Referer"] = scrub_header_value(ref)
+    return h
+
+
 def fetch_thumb_via_ytdlp(url, cfg, cache_dir=None):
     """兜底：让 yt-dlp 自己取封面。
 
@@ -448,60 +509,102 @@ def fetch_thumb_via_ytdlp(url, cfg, cache_dir=None):
         os.makedirs(d, exist_ok=True)
     except OSError as e:
         return "", f"无法创建封面缓存目录：{e}"
+
+    def snapshot():
+        """记下调用前目录里已有的封面，事后只认「这次新出现的」。"""
+        seen = {}
+        try:
+            for name in os.listdir(d):
+                if name.startswith("thumb_") and \
+                        os.path.splitext(name)[1].lower() in _THUMB_EXTS:
+                    try:
+                        seen[name] = os.path.getmtime(os.path.join(d, name))
+                    except OSError:
+                        seen[name] = 0.0
+        except OSError:
+            pass
+        return seen
+
+    before = snapshot()
     cmd = [_exe(cfg), "--skip-download", "--write-thumbnail", "--no-write-info-json",
            "-P", d, "-o", "thumb_%(id)s.%(ext)s"]
     add_access_args(cmd, cfg)
     cmd += ["--", str(url)]
+    proc = None
     try:
         proc = spawn(cmd, d)
         out, _ = proc.communicate(timeout=60)
+    except subprocess.TimeoutExpired:
+        # 超时也要把子进程收掉，否则句柄和进程都留在后台
+        if proc is not None:
+            kill_tree(proc)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+        return "", "封面兜底取图超时"
     except Exception as e:
+        if proc is not None:
+            kill_tree(proc)
         return "", f"封面兜底取图失败：{e}"
     if proc.returncode != 0:
         tail = decode_bytes(out or b"").strip().splitlines()
         return "", "封面兜底取图失败：%s" % (tail[-1] if tail else "yt-dlp 返回非零")
     best, best_mtime = "", -1.0
-    try:
-        for name in os.listdir(d):
-            if not name.startswith("thumb_"):
-                continue
-            p = os.path.join(d, name)
-            if os.path.splitext(name)[1].lower() not in _THUMB_EXTS:
-                continue
-            m = os.path.getmtime(p)
-            if m > best_mtime:
-                best, best_mtime = p, m
-    except OSError:
-        pass
+    for name, mtime in snapshot().items():
+        # 只认本次新出现、或被本次改写的文件：缓存目录是所有站点共用的，
+        # 取「mtime 最新的一个」会把别的站点 6 小时内的封面认成自己的。
+        if name in before and before[name] >= mtime:
+            continue
+        if mtime > best_mtime:
+            best, best_mtime = os.path.join(d, name), mtime
     if not best:
         return "", "站点没有提供封面"
     return best, None
 
 
-def fetch_thumb(url, cfg, cache_dir=None, timeout=THUMB_TIMEOUT, max_bytes=THUMB_MAX_BYTES):
+def _looks_like_image(data):
+    """200 的 HTML / JSON 错误页不该被当成封面长期缓存。"""
+    head = bytes(data[:16])
+    if head.startswith(_THUMB_MAGIC):
+        return True
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return True
+    if head[:4] == b"\x00\x00\x01\x00":            # .ico
+        return True
+    # 认不出格式时不硬拦：ffmpeg 才是最终裁判，只挡明显是文本的响应
+    return head.lstrip()[:1] not in (b"<", b"{", b"[")
+
+
+def fetch_thumb(url, cfg, cache_dir=None, timeout=THUMB_TIMEOUT, max_bytes=THUMB_MAX_BYTES,
+                ttl=THUMB_CACHE_TTL):
     """取封面到本地缓存，返回 (本地路径, 失败原因)。永不向调用方抛异常。"""
     if not is_public_http_url(url):
         return "", "封面地址不是公网 http(s)，已拒绝"
     path = thumb_cache_path(url, cache_dir)
     try:
         if os.path.isfile(path) and os.path.getsize(path) > 0:
-            return path, None
+            if ttl <= 0 or time.time() - os.path.getmtime(path) < ttl:
+                return path, None
     except OSError:
         pass
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
     except OSError as e:
         return "", f"无法创建封面缓存目录：{e}"
-    req = urllib.request.Request(str(url), headers=thumb_headers(cfg))
+    req = urllib.request.Request(str(url), headers=thumb_direct_headers(cfg))
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open_thumb(req, timeout) as resp:
             data = resp.read(max_bytes + 1)
     except Exception:
+        # 直连失败（含「重定向去了内网」）才动用带凭据的兜底通路
         return fetch_thumb_via_ytdlp(url, cfg, cache_dir)
     if len(data) > max_bytes:
         return "", "封面超过 2 MB，已跳过"
     if not data:
         return "", "封面是空响应"
+    if not _looks_like_image(data):
+        return "", "封面地址返回的不是图片"
     try:
         with open(path, "wb") as f:
             f.write(data)
@@ -540,9 +643,11 @@ def probe_playable(path, timeout=6):
         return {"ok": False, "reason": "文件还没写出来"}
     cmd = [find_tool("ffprobe.exe"), "-v", "error", "-show_entries", "format=duration",
            "-of", "default=nw=1:nk=1", path]
+    kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+    if hasattr(subprocess, "STARTUPINFO"):      # 与 spawn/kill_tree 同口径，非 Windows 也不炸
+        kwargs["creationflags"] = CREATE_NO_WINDOW
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                creationflags=CREATE_NO_WINDOW)
+        proc = subprocess.Popen(cmd, **kwargs)
     except OSError as e:
         return {"ok": False, "reason": f"ffprobe 不可用：{e}"}
     try:
@@ -583,7 +688,14 @@ def make_preview_link(real_path, outdir):
             os.remove(link)
         os.link(real_path, link)
     except OSError as e:
-        return "", f"此磁盘不支持硬链接（常见于 exFAT/FAT32 U 盘）：{e}"
+        # 分因归因：只有「文件系统不支持硬链接」（exFAT/FAT32/部分网络盘）才该
+        # 甩给磁盘格式；权限不足、目标被占用、跨卷都另有说法，混为一谈会把人带偏。
+        winerr = getattr(e, "winerror", None)
+        if winerr in (1, 50, 1314):        # ERROR_INVALID_FUNCTION / 不支持 / 权限
+            return "", f"此磁盘不支持硬链接（常见于 exFAT/FAT32 U 盘）：{e}"
+        if winerr == 32:                   # ERROR_SHARING_VIOLATION
+            return "", "上一个预览文件还在播放器里打开着，关掉播放器再试"
+        return "", f"无法创建预览文件（{e}），可稍后重试或改用「下载完成再播放」"
     return link, None
 
 
@@ -601,7 +713,7 @@ def clear_preview_links(outdir):
         pass
 
 
-def sanitize_urls(urls, allow_other=False):
+def sanitize_urls(urls):
     """过滤出可交给 yt-dlp 的地址，返回 (可用列表, 被丢弃列表)。
 
     - 丢掉空行与以 # 开头的注释行
@@ -615,7 +727,7 @@ def sanitize_urls(urls, allow_other=False):
             continue
         if _BARE_DOMAIN_RE.match(u):
             u = "https://" + u
-        if is_http_url(u) or (allow_other and _URL_SCHEME_RE.match(u)):
+        if is_http_url(u):
             good.append(u)
         else:
             bad.append(str(raw or "").strip())
@@ -633,12 +745,13 @@ _UNSAFE_LONG = (
     r"--plugin-dirs|--netrc-cmd|--on-download($|=)|--use-postprocessor($|=)|"
     r"--batch-file($|=)|--print-to-file($|=)|--ffmpeg-location($|=)|"
     r"--remote-components($|=)|--js-runtimes($|=)|--out($|=)|--output($|=)|"
-    r"--pa($|=)|--paths($|=)"
+    r"--pa($|=)|--paths($|=)|--update($|=)|--postprocessor-args($|=)|"
+    r"--parse-metadata($|=)|--replace-in-metadata($|=)"
 )
 UNSAFE_ARG_RE = re.compile("^(" + _UNSAFE_LONG + ")", re.I)
 # 短选项大小写敏感：-o/--output 与 -P/--paths 的落盘路径完全由用户指定，
 # 但 -p、-o 之外的短选项（-4 / -N / -i）不该被误伤。
-UNSAFE_SHORT_RE = re.compile(r"^(-o|-P)")
+UNSAFE_SHORT_RE = re.compile(r"^(-o|-P|-U)")
 
 
 def is_unsafe_arg(token):
@@ -798,7 +911,9 @@ def coerce_types(merged, warnings=None):
 
     for key, (label, lo, hi) in _INT_FIELDS.items():
         s = str(merged.get(key) if merged.get(key) is not None else "").strip()
-        if s.isdigit() and lo <= int(s) <= hi:
+        # 必须 isascii + isdigit：'²'.isdigit() 是 True，但 int('²') 会抛 ValueError，
+        # 手改配置写成上标/带圈数字就能让整个配置读写崩掉。
+        if s.isascii() and s.isdigit() and lo <= int(s) <= hi:
             merged[key] = s
             continue
         fallback = str(DEFAULT_CONFIG.get(key) or "")
@@ -836,8 +951,10 @@ def load_config(path, defaults=None, warn=None):
     base = dict(defaults or DEFAULT_CONFIG)
     data = {}
     if os.path.isfile(path):
+        # utf-8-sig：记事本/PowerShell 存出来的 BOM 会让 json.load 直接失败，
+        # 用户看到的现象是「所有设置突然回默认」，所以宁可吞掉 BOM。
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 raise ValueError("配置根节点不是对象")
@@ -848,11 +965,55 @@ def load_config(path, defaults=None, warn=None):
             else:
                 print("[warn] " + msg, file=sys.stderr)
             data = {}
-    cfg, warnings = coerce_config(data, base)
+    try:
+        cfg, warnings = coerce_config(data, base)
+    except Exception as e:      # 校正逻辑自身的意外不能连累启动
+        cfg, warnings = dict(base), [f"配置校正失败（{e}），已改用默认设置"]
     for w in warnings:
         if warn:
             warn(w)
     return cfg
+
+
+@contextlib.contextmanager
+def _write_lock(path, timeout=2.0):
+    """按目标文件加一把跨进程的建议锁，让「读-改-写」不至于交错。
+
+    O_EXCL 建锁文件在 Windows 上是原子的；拿不到就等一会儿，超时后照样往下走
+    （宁可慢一次，也不能因为别人留了个死锁文件就永久保存不了配置）。
+    这只防交错写入，防不了「后写覆盖先写的字段」——那需要锁住整个读改写周期。
+    """
+    lock = path + ".lock"
+    deadline = time.time() + timeout
+    fd = None
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:                     # 上一个进程被强杀留下的死锁文件
+                if time.time() - os.path.getmtime(lock) > 30:
+                    os.remove(lock)
+                    continue
+            except OSError:
+                pass
+            if time.time() >= deadline:
+                break
+            time.sleep(0.02)
+        except OSError:
+            break
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
 
 
 def atomic_write_text(path, text, backup=True):
@@ -863,7 +1024,23 @@ def atomic_write_text(path, text, backup=True):
     """
     d = os.path.dirname(os.path.abspath(path))
     os.makedirs(d, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=os.path.basename(path) + ".", suffix=".tmp")
+    with _write_lock(os.path.abspath(path)):
+        _write_text_locked(path, d, text, backup)
+
+
+def _write_text_locked(path, d, text, backup):
+    base = os.path.basename(path)
+    # 强杀留下的临时文件不会自己消失：超过 5 分钟的顺手清掉
+    try:
+        now = time.time()
+        for name in os.listdir(d):
+            if name.startswith(base + ".") and name.endswith(".tmp"):
+                full = os.path.join(d, name)
+                if now - os.path.getmtime(full) > 300:
+                    os.remove(full)
+    except OSError:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=base + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
@@ -889,7 +1066,15 @@ def save_config(path, cfg, warn=None):
     校正出来的提醒要回给调用方，否则界面「保存成功」但值被悄悄改掉了，
     用户只会觉得「填了没生效」。
     """
-    data, warnings = coerce_config(cfg, cfg)
+    try:
+        data, warnings = coerce_config(cfg, cfg)
+    except Exception as e:
+        msg = f"配置校正失败：{e}（{path}）"
+        if warn:
+            warn(msg)
+        else:
+            print("[err] " + msg, file=sys.stderr)
+        return False
     for w in warnings:
         if warn:
             warn(w)
@@ -1071,7 +1256,8 @@ def parse_progress_line(line):
     """
     s = str(line or "")
     if PROG_MARK in s:
-        f = s.split(PROG_MARK, 1)[1].split("|")
+        # 文件名是最后一列，里面本身可能带 "|"，所以只切前 6 个分隔符
+        f = s.split(PROG_MARK, 1)[1].split("|", 6)
         f += [""] * (7 - len(f))
         status, dl, total, est, speed, eta, fname = [x.strip() for x in f[:7]]
         total_bytes = None
@@ -1239,50 +1425,90 @@ def iter_lines_watch(proc, abort=None, keepalive=None, idle_seconds=IDLE_PING_SE
     不输出，任务就永远占着那唯一的执行槽。这里把读输出放进线程，主循环每
     idle_seconds 醒一次：
       * 调 keepalive()，返回 False 说明对端断开 → 终止子进程，reason="client"
-      * 连续 stall_seconds 没有新行 → 终止子进程，reason="stall"
+      * 连续 stall_seconds 没有任何字节输出 → 终止子进程，reason="stall"
     结束原因写进 why 字典（why={"reason": ...}），由调用方决定日志文案。
+
+    「活动」按**收到的字节**算，不按行算：ffmpeg 合并/转码时只往 stderr 刷
+    `\\r` 进度、几十秒不产出一个 `\\n`，按行判活会把这种合法阶段当成卡死杀掉。
     """
     box = queue.Queue()
+    activity = [time.time()]          # pump 线程更新，主循环只读
 
     def pump():
-        try:
-            for line in iter_lines(proc, keep_blank=keep_blank):
+        buf = b""
+
+        def emit(raw):
+            line = decode_bytes(raw).rstrip("\r")
+            if line or keep_blank:
                 box.put(line)
+
+        def feed(chunk):
+            nonlocal buf
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8", "replace")
+            buf += chunk
+            # 只有 \n 才产出「行」，\r 仅用于判活：否则 ffmpeg 的进度条会刷出成百上千行
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                emit(raw)
+
+        try:
+            stdout = proc.stdout
+            # 真实管道是 BufferedReader；测试替身与文本流只有迭代器，两条路都支持
+            reader = getattr(stdout, "read1", None) or getattr(stdout, "read", None)
+            if reader is not None:
+                while True:
+                    chunk = reader(4096)
+                    if not chunk:
+                        break
+                    activity[0] = time.time()
+                    feed(chunk)
+            else:
+                for chunk in stdout:
+                    activity[0] = time.time()
+                    feed(chunk)
+            if buf:
+                emit(buf)
         except Exception:
             pass
         box.put(_EOF)
 
     th = threading.Thread(target=pump, daemon=True)
     th.start()
-    last_line = time.time()
     reason = "normal"
 
-    while True:
-        try:
-            item = box.get(timeout=idle_seconds)
-        except queue.Empty:
-            # 只有真的闲下来才探活：keepalive 通常带心跳写入，每条输出都发一次就太吵了
+    try:
+        while True:
+            try:
+                item = box.get(timeout=idle_seconds)
+            except queue.Empty:
+                # 只有真的闲下来才探活：keepalive 通常带心跳写入，每条输出都发一次就太吵了
+                if abort and abort():
+                    reason = "client"
+                    break
+                if keepalive and not keepalive():
+                    reason = "client"
+                    break
+                if time.time() - activity[0] >= stall_seconds:
+                    reason = "stall"
+                    break
+                continue
+            if item is _EOF:
+                break
+            activity[0] = time.time()
             if abort and abort():
                 reason = "client"
                 break
-            if keepalive and not keepalive():
-                reason = "client"
-                break
-            if time.time() - last_line >= stall_seconds:
-                reason = "stall"
-                break
-            continue
-        if item is _EOF:
-            break
-        last_line = time.time()
-        if abort and abort():
-            reason = "client"
-            break
-        yield item
-    if reason != "normal":
-        kill_tree(proc)
-    if why is not None:
-        why["reason"] = reason
+            yield item
+    except GeneratorExit:
+        # 消费侧提前退出（break / 异常）同样要收掉进程树，别把 ffmpeg 后代留在后台
+        reason = "closed"
+        raise
+    finally:
+        if reason != "normal":
+            kill_tree(proc)
+        if why is not None:
+            why["reason"] = reason
 
 
 def yt_dlp_version(exe=None):
@@ -1424,6 +1650,8 @@ def parse_format_line(line):
         res, note = "audio only", " ".join(tail)
     else:
         res, note = (rest[0] if rest else ""), " ".join(rest[1:])
+    if re.match(r"^sb\d", left[0], re.I):
+        return None          # 故事板（storyboard）不是可下载的媒体格式
     codec = re.sub(r"\s{2,}", " ", parts[2]).strip() if len(parts) > 2 else ""
     return {
         "id": left[0], "ext": ext, "res": res,
@@ -1453,8 +1681,7 @@ PROBE_VARIANTS = [
 
 def build_probe_cmd(cfg, url, variant):
     """自动排障用的极简探测命令：只求拿到一条元数据 JSON，越快越好。"""
-    cmd = [_exe(cfg), "--skip-download", "-j", "--no-warnings",
-           "--no-playlist", "--playlist-items", "1"]
+    cmd = [_exe(cfg), "--skip-download", "-j", "--no-warnings", "--no-playlist"]
     if str(cfg.get("proxy") or "").strip():
         cmd += ["--proxy", str(cfg["proxy"]).strip()]
     if variant == "ua":
@@ -1471,6 +1698,16 @@ def build_probe_cmd(cfg, url, variant):
     elif variant == "generic":
         cmd += ["--force-generic-extractor"]
     elif variant == "plain":
+        # 「直连（当前设置）」= 不加指纹/分块/代理这些花活，但 UA/Referer/自定义头
+        # 本来就是用户当前配置的一部分，漏掉它们探测出来的结果没有参考价值。
+        ua = str(cfg.get("ua") or "").strip()
+        if ua:
+            cmd += ["--user-agent", ua]
+        ref = str(cfg.get("referer") or "").strip() or referer_of(url)
+        if ref:
+            cmd += ["--referer", ref]
+        for name, value in normalize_headers(cfg.get("headers")):
+            cmd += ["--add-header", "%s: %s" % (name, value)]
         if str(cfg.get("cookie") or "").strip():
             cmd += ["--cookies", str(cfg["cookie"]).strip()]
     cmd += ["--", url]
@@ -1478,8 +1715,15 @@ def build_probe_cmd(cfg, url, variant):
 
 
 def apply_probe_fix(cfg, url, fix):
-    """把某一套排障方案落进配置，返回被改动的项目名列表。"""
-    touched = []
+    """把某一套排障方案落进配置。
+
+    返回 (touched, manual)：
+      touched —— 真的写进 cfg 的项目名
+      manual  —— 无法自动填、必须用户自己动手的项目名
+    代理地址、限速值、具体格式 ID 都不存在「正确默认值」，硬塞一个只会让
+    用户以为已经修好了，所以这里只如实报告，不假装应用。
+    """
+    touched, manual = [], []
     if fix.get("ua"):
         cfg["ua"] = UA_WINDOWS
         touched.append("User-Agent")
@@ -1496,12 +1740,12 @@ def apply_probe_fix(cfg, url, fix):
         cfg["generic"] = True
         touched.append("通用提取器")
     if fix.get("proxy"):
-        touched.append("代理")
+        manual.append("代理地址")
     if fix.get("rate"):
-        touched.append("限速")
+        manual.append("限速")
     if fix.get("fmt"):
-        touched.append("格式")
-    return touched
+        manual.append("格式")
+    return touched, manual
 
 
 def now():

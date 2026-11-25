@@ -320,9 +320,22 @@ class TestConfigIO(unittest.TestCase):
 class TestMisc(unittest.TestCase):
     def test_apply_probe_fix(self):
         cfg = core.default_config()
-        touched = core.apply_probe_fix(cfg, "https://a.com/v/1", {"ua": True, "referer": True})
+        touched, manual = core.apply_probe_fix(
+            cfg, "https://a.com/v/1", {"ua": True, "referer": True})
         self.assertEqual(cfg["referer"], "https://a.com/")
         self.assertIn("User-Agent", touched)
+        self.assertEqual(manual, [])
+
+    def test_apply_probe_fix_does_not_pretend(self):
+        # 代理/限速/格式没有「正确默认值」：只能如实报告，不能假装已应用，
+        # 更不能把 cfg 改成一个看起来修好了实则没变的配置。
+        cfg = core.default_config()
+        before = dict(cfg)
+        touched, manual = core.apply_probe_fix(
+            cfg, "https://a.com/v/1", {"proxy": True, "rate": True, "fmt": True})
+        self.assertEqual(touched, [])
+        self.assertEqual(manual, ["代理地址", "限速", "格式"])
+        self.assertEqual(cfg, before)
 
     def test_command_text_quotes(self):
         self.assertEqual(core.command_text(["a", "b c"]), 'a "b c"')
@@ -866,7 +879,7 @@ class TestThumbSafety(unittest.TestCase):
         self.assertEqual(h["Cookie"], "sid=1")
 
     def test_fetch_rejects_private_before_any_request(self):
-        with mock.patch("urllib.request.urlopen") as op:
+        with mock.patch("ytdlp_core._open_thumb") as op:
             path, err = core.fetch_thumb("http://127.0.0.1/a.jpg", {})
         op.assert_not_called()
         self.assertEqual(path, "")
@@ -880,7 +893,7 @@ class TestThumbSafety(unittest.TestCase):
             with open(p, "wb") as f:
                 f.write(b"\xff\xd8\xff")
             with mock.patch("ytdlp_core.is_public_http_url", return_value=True), \
-                 mock.patch("urllib.request.urlopen") as op:
+                 mock.patch("ytdlp_core._open_thumb") as op:
                 path, err = core.fetch_thumb(u, {}, cache_dir=d)
         op.assert_not_called()
         self.assertEqual(path, p)
@@ -894,7 +907,7 @@ class TestThumbSafety(unittest.TestCase):
         resp.__exit__ = mock.Mock(return_value=False)
         with tempfile.TemporaryDirectory() as d:
             with mock.patch("ytdlp_core.is_public_http_url", return_value=True), \
-                 mock.patch("urllib.request.urlopen", return_value=resp):
+                 mock.patch("ytdlp_core._open_thumb", return_value=resp):
                 path, err = core.fetch_thumb("https://cdn.example/a.jpg", {}, cache_dir=d)
         self.assertEqual(path, "")
         self.assertIn("2 MB", err)
@@ -903,7 +916,7 @@ class TestThumbSafety(unittest.TestCase):
         # 兜底会真起 yt-dlp 进程，测试里必须替身掉，否则单测会联网
         with tempfile.TemporaryDirectory() as d:
             with mock.patch("ytdlp_core.is_public_http_url", return_value=True), \
-                 mock.patch("urllib.request.urlopen", side_effect=OSError("reset")), \
+                 mock.patch("ytdlp_core._open_thumb", side_effect=OSError("reset")), \
                  mock.patch("ytdlp_core.fetch_thumb_via_ytdlp",
                             return_value=("", "兜底也失败")) as fb:
                 path, err = core.fetch_thumb("https://cdn.example/a.jpg", {}, cache_dir=d)

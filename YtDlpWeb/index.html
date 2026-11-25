@@ -535,16 +535,19 @@ function readForm(){
 function scheduleSave(){
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async ()=>{
-    cfg = {...cfg, ...readForm()};
+    const form = readForm();   // 只读一次：读两次时中间若有输入，发出去的和记下的就不是同一份
     try{
       const r = await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify(readForm())});
+        body:JSON.stringify(form)});
       const j = await r.json().catch(()=>({}));
       if(!r.ok || j.ok === false){
         toast(j.error || ('设置保存失败（HTTP ' + r.status + '）'));
         return;
       }
-      if(j.config) cfg = {...cfg, ...j.config};   // 回填服务端整理后的值，所见即所得
+      // 以服务端校正后的配置为准；不再先乐观合并，否则保存失败时界面显示的是
+      // 一份磁盘上并不存在的设置。
+      cfg = j.config ? {...cfg, ...j.config} : {...cfg, ...form};
+      if(j.config) fillForm();
       const w = j.warnings || [];
       if(w.length) toast(w.length > 1 ? w[0] + `（另有 ${w.length - 1} 条提醒，见日志）` : w[0]);
     }
@@ -891,13 +894,21 @@ async function doCopy(){
       try{ ok = document.execCommand('copy'); }catch(_){}
       ta.remove();
     }
-    toast(ok ? '命令已复制到剪贴板' : '复制失败，命令已输出到日志');
+    const dropped = (r.ignored || []).length;
+    let msg = ok ? '命令已复制到剪贴板' : '复制失败，命令已输出到日志';
+    if(dropped) msg += `（已忽略 ${dropped} 个无法识别的链接）`;
+    toast(msg);
     addLog('> ' + text, 'cmd');
   }catch(e){ toast('获取命令失败'); }
 }
 async function doOpen(){
   try{
-    await fetch('/api/open',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const r = await fetch('/api/open',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    if(!r.ok){
+      const j = await r.json().catch(()=>({}));
+      toast(j.error || ('打开目录失败（HTTP ' + r.status + '）'));
+      return;
+    }
   }catch(e){ toast('打开文件夹失败'); }
 }
 async function doReset(){
@@ -1004,6 +1015,7 @@ els.filter.addEventListener('input', renderResults);
 $('mode').addEventListener('change', ()=>{
   const auto = modeFmt()[$('mode').value];
   if(auto) $('fmt').value = auto;
+  scheduleSave();   // 带出来的 fmt 也是一次设置变更，不落盘刷新后就丢了
 });
 $('aria').addEventListener('change', ()=>{
   if($('aria').checked && !(cfg.env || {}).aria2c)
@@ -1029,7 +1041,9 @@ els.logWrap.addEventListener('toggle', ()=>{ if(els.logWrap.open) els.log.scroll
   if(s.busy){
     setBusy(true, s.kind);
     t0 = Date.now() - (s.elapsed || 0) * 1000;   // 刷新后接着计时
-    updateElapsed(); setStatus('busy','任务进行中…');
+    updateElapsed();
+    // 进度只走任务自己那条 SSE 流，中途刷新接不上；说清楚比留个空进度条诚实。
+    setStatus('busy', `任务进行中…（本页是在任务开始后才打开的，进度与日志看不到；结束后会自动解除占用）`);
   }
   else setStatus('idle','就绪');
 })();

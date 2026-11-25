@@ -93,9 +93,38 @@
     }
 
     // ---------------- 来源 1：页面世界钩子（injected.js） ----------------
+    // MAIN world 与页面共用同一个 JS 环境，页面脚本也能 dispatch 同名事件往这里
+    // 塞任意 URL。所以只收同时满足两条的条目：nonce 对得上（injected.js 每次加载
+    // 随机生成），且这个 URL 后台真的在网络层看到过（chrome.webRequest 是页面
+    // 碰不到的通道）。伪造者两条都过不了。
+    let sniffToken = "";
+    const netSeen = new Set();      // 后台网络嗅探实锤见过的 URL
+    let pendingMain = [];           // nonce 验证通过、但网络侧还没到的条目
+
+    window.addEventListener("ytdlp-sniff-token", (e) => {
+        const t = e && e.detail && e.detail.token;
+        if (typeof t === "string" && t) sniffToken = t;
+    });
+
+    function flushPendingMain() {
+        const keep = [];
+        for (const it of pendingMain) {
+            if (netSeen.has(it.url)) addItem(it.url, it.kind, it.size, "页面请求");
+            else if (Date.now() - it.ts < 4000) keep.push(it);
+        }
+        pendingMain = keep;
+        if (pendingMain.length) setTimeout(flushPendingMain, 600);
+    }
+
     window.addEventListener("ytdlp-sniff", (e) => {
         const d = e.detail || {};
-        if (d && d.url) addItem(d.url, d.kind, d.size, "页面请求");
+        if (!d || !d.url) return;
+        if (!sniffToken || d.token !== sniffToken) return;   // 页面伪造的：没有 nonce
+        if (!isHttpUrl(d.url)) return;
+        if (netSeen.has(d.url)) { addItem(d.url, d.kind, d.size, "页面请求"); return; }
+        // 钩子可能比后台的 webRequest 回传更早，给网络侧 4 秒追上来的机会
+        if (pendingMain.length < 200) pendingMain.push({ url: d.url, kind: d.kind, size: d.size, ts: Date.now() });
+        if (pendingMain.length === 1) setTimeout(flushPendingMain, 600);
     });
 
     // ---------------- 来源 2：后台网络嗅探 ----------------
@@ -103,6 +132,7 @@
         if (!msg || typeof msg !== "object") return;
         if (msg.type === "net_items" || msg.type === "frame_items") {
             for (const it of (msg.items || [])) {
+                if (isHttpUrl(it.url)) netSeen.add(it.url);
                 addItem(it.url, guessKind(it.url), it.size || 0,
                         msg.type === "net_items" ? "网络响应" : "iframe");
             }

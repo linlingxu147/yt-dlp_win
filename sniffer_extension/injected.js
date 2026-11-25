@@ -13,9 +13,26 @@
 (function () {
     "use strict";
 
+    // 每次加载一个随机 nonce：MAIN world 和页面共享同一个 JS 环境，页面脚本
+    // 自己也能 dispatch 同名事件，带上 nonce 后至少不能「照抄一次就能一直伪造」。
+    // 真正的兜底在 content.js 那边（必须同时被后台网络嗅探看到）。
+    var TOKEN = "";
+    try {
+        var buf = new Uint8Array(16);
+        crypto.getRandomValues(buf);
+        TOKEN = Array.prototype.map.call(buf, function (b) { return ("0" + b.toString(16)).slice(-2); }).join("");
+    } catch (e) { TOKEN = String(Math.random()).slice(2) + String(Date.now()); }
+
     var send = function (detail) {
-        try { window.dispatchEvent(new CustomEvent("ytdlp-sniff", { detail: detail })); } catch (e) { /* ignore */ }
+        try {
+            detail.token = TOKEN;
+            window.dispatchEvent(new CustomEvent("ytdlp-sniff", { detail: detail }));
+        } catch (e) { /* ignore */ }
     };
+
+    try {
+        window.dispatchEvent(new CustomEvent("ytdlp-sniff-token", { detail: { token: TOKEN } }));
+    } catch (e) { /* ignore */ }
 
     var MAX_BODY = 8 * 1024 * 1024;      // 超过 8MB 的响应不再读正文
     var MAX_HTML_BODY = 256 * 1024;      // HTML 只在小体积时扫描（内联脚本里的播放地址）

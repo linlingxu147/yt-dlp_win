@@ -464,6 +464,7 @@ class App:
         self.btn_pv_open.pack(anchor="w", pady=(4, 0))
         self._preview_url = ""
         self._photo = None
+        self._preview_gen = 0
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
     def _build_log(self, row):
@@ -827,7 +828,8 @@ class App:
                 elif kind == "trodone":
                     self._on_trouble_done(rest[0], rest[1] if len(rest) > 1 else "trouble")
                 elif kind == "preview":
-                    self._on_preview(rest[0], rest[1] if len(rest) > 1 else None)
+                    self._on_preview(rest[0], rest[1] if len(rest) > 1 else "",
+                                     rest[2] if len(rest) > 2 else None)
                 elif kind == "playable":
                     self._set_playable(rest[0], rest[1] if len(rest) > 1 else "")
         except queue.Empty:
@@ -1056,14 +1058,19 @@ class App:
     def _apply_probe_fix(self, hit):
         label, fix, url = hit
         cfg = self._collect_cfg()
-        touched = core.apply_probe_fix(cfg, url, fix)
+        touched, manual = core.apply_probe_fix(cfg, url, fix)
         self.var_ua.set(cfg.get("ua") or "")
         self.var_referer.set(cfg.get("referer") or "")
         self.var_browser.set(cfg.get("browser") or "（不使用）")
         self.var_generic.set(bool(cfg.get("generic")))
         self._save_config()
-        self.log_line(f"=== 已自动应用「{label}」：{'、'.join(touched) or '无需改动'}，"
-                      f"现在可以直接点「探测资源」===\n", "ok")
+        parts = []
+        if touched:
+            parts.append("已自动应用：" + "、".join(touched))
+        if manual:
+            parts.append("需要你手动设置：" + "、".join(manual))
+        msg = "；".join(parts) or "这个错误没有可自动应用的设置"
+        self.log_line(f"=== 排障「{label}」：{msg} ===\n", "ok")
 
     def _on_trouble_done(self, ok, task="trouble"):
         self.task_kind = None
@@ -1214,10 +1221,25 @@ class App:
             return
         self._set_preview_image(None, "封面加载中…")
         cfg = self._collect_cfg()
+        self._preview_gen += 1
+        gen = self._preview_gen
 
         def work():
+            # 取图与转码（ffmpeg 最坏 30s）都在这里做：旧实现把 subprocess.run 放在
+            # Tk 主线程，一张慢封面就能把整个界面冻住半分钟。
             path, err = core.fetch_thumb(url, cfg)
-            self.q.put(("preview", path, err))
+            if not err and path:
+                png = os.path.join(tempfile.gettempdir(),
+                                   "ytdlp_preview_%d_%d.png" % (os.getpid(), gen))
+                cmd = [find_tool("ffmpeg.exe"), "-hide_banner", "-loglevel", "error", "-y",
+                       "-i", path, "-vf", "scale=320:-1", "-frames:v", "1", png]
+                try:
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   creationflags=core.CREATE_NO_WINDOW, timeout=30)
+                    path, err = png, None
+                except Exception as e:
+                    path, err = "", "封面格式无法显示：%s" % e
+            self.q.put(("preview", gen, path, err))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1228,17 +1250,16 @@ class App:
         else:
             self.pv_img.config(image="", text=text or "")
 
-    def _on_preview(self, path, err):
+    def _on_preview(self, gen, path, err):
+        # 快速连点不同条目时，先发的请求可能后到：代次对不上就整条丢弃，
+        # 否则用户看到的是上一条的封面。
+        if gen != self._preview_gen:
+            return
         if err or not path:
             self._set_preview_image(None, "封面取不到：%s" % (err or "未知原因"))
             return
-        png = os.path.join(tempfile.gettempdir(), "ytdlp_preview_%d.png" % os.getpid())
-        cmd = [find_tool("ffmpeg.exe"), "-hide_banner", "-loglevel", "error", "-y",
-               "-i", path, "-vf", "scale=320:-1", "-frames:v", "1", png]
         try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           creationflags=core.CREATE_NO_WINDOW, timeout=30)
-            photo = tk.PhotoImage(file=png)
+            photo = tk.PhotoImage(file=path)
         except Exception as e:
             self._set_preview_image(None, "封面格式无法显示：%s" % e)
             return
@@ -1498,6 +1519,12 @@ class App:
         self._save_config()
         try:
             self.stop()
+        except Exception:
+            pass
+        # 强退时 _on_done 不会跑，这里补一次清理：否则下载目录里会一直留着
+        # .preview 下的硬链接（文件已删、链接还指向不存在的 .part）。
+        try:
+            core.clear_preview_links(self.cfg.get("outdir") or os.path.join(BASE_DIR, "downloads"))
         except Exception:
             pass
         self.root.destroy()
