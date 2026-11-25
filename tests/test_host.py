@@ -340,5 +340,78 @@ class PreviewPlayTest(unittest.TestCase):
         self.assertIn("aria2c", ev["reason"])
 
 
+class SniffServiceTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load_host()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.events = []
+        self.host = self.mod.Host(os.path.join(self.tmp.name, "config.json"),
+                                  emit=self.events.append)
+        self.host.mark_ready()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_sniff_download_overrides_cfg(self):
+        captured = {}
+        def sink(task):
+            captured.update(task)
+            return True
+        self.host.submit_server_task = sink
+        items = [{"url": "https://cdn/x.m3u8", "referer": "https://p/", "ua": "UA"}]
+        r = self.host.sniff_download(items)
+        self.assertTrue(r["ok"])
+        self.assertEqual(captured["cfg"]["fmt"], "b")
+        self.assertTrue(captured["cfg"]["play_while"])
+        self.assertFalse(captured["cfg"]["thumb"])
+        self.assertEqual(captured["cfg"]["referer"], "https://p/")
+        self.assertTrue(captured["no_playlist"])
+
+    def test_sniff_download_busy(self):
+        self.host.task_kind = "download"
+        r = self.host.sniff_download([{"url": "https://cdn/x"}])
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["busy"])
+
+    def test_sniff_items_without_service(self):
+        d = self.host.sniff_items()
+        self.assertEqual(d["items"], [])
+        self.assertFalse(d["svc"])
+
+    def test_sniff_preview_requires_service(self):
+        r = self.host.sniff_preview("https://cdn/x")
+        self.assertFalse(r["ok"])
+
+    def test_sniff_play_clip_without_clip(self):
+        r = self.host.sniff_play_clip()
+        self.assertFalse(r["ok"])
+
+    def test_set_ext_service_lifecycle_with_stub(self):
+        import threading as _th
+        class StubRunner:
+            def reserve(self, kind): return True
+            def finish(self): pass
+        class StubMod:
+            RUNNER = StubRunner()
+            PLAY_LOCK = _th.Lock()
+            PLAY_STATE = {}
+            def set_config_file(self, p): pass
+            def start_service(self):
+                class Svc:
+                    url = "http://127.0.0.1:8799"
+                    def shutdown(self): pass
+                return Svc()
+            def set_task_sink(self, sink, stop=None): pass
+        self.host.load_web_server = lambda: StubMod()
+        r = self.host.set_ext_service(True)
+        self.assertTrue(r["ok"])
+        self.assertIsNotNone(self.host.web_svc)
+        self.host.pump_once()
+        self.assertTrue(any(e["type"] == "svc" and e["ok"] for e in self.events))
+        self.host.set_ext_service(False)
+        self.assertIsNone(self.host.web_svc)
+        self.assertFalse(self.host.cfg["ext_service"])
+
+
 if __name__ == "__main__":
     unittest.main()

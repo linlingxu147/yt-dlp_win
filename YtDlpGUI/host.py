@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import queue
+import sys
 import threading
 import time
 
@@ -801,3 +802,142 @@ class Host:
         good, _ = sanitize_urls(urls or [])
         cmd = core.build_download_cmd(cfg, good)
         return {"ok": True, "text": command_text(cmd)}
+
+    # ---------------- 内嵌扩展服务 ----------------
+    def load_web_server(self):
+        import importlib.util
+        path = os.path.join(core.BASE_DIR, "YtDlpWeb", "server.py")
+        if not os.path.isfile(path):
+            return None
+        spec = importlib.util.spec_from_file_location("ytdlp_web_server", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def start_ext_service(self):
+        if self.web_svc is not None:
+            return {"ok": True}
+        try:
+            mod = self.load_web_server()
+            if mod is None:
+                self._put({"type": "svc", "text": "扩展服务：缺少 YtDlpWeb/server.py", "ok": False})
+                return {"ok": False, "error": "缺少 YtDlpWeb/server.py"}
+            mod.set_config_file(self.config_file)
+            self._web_mod = mod
+            self.web_svc = mod.start_service()
+            mod.set_task_sink(self.submit_server_task, stop=self.stop)
+        except Exception as e:
+            self.web_svc = None
+            self._web_mod = None
+            self._put({"type": "svc", "text": "扩展服务启动失败", "ok": False})
+            return {"ok": False, "error": str(e)}
+        self._put({"type": "svc", "text": "扩展服务：%s" % self.web_svc.url.replace("http://", ""),
+                   "ok": True})
+        self._log("[扩展服务] 已监听 %s\n" % self.web_svc.url, "info")
+        return {"ok": True}
+
+    def stop_ext_service(self):
+        if self.web_svc is None:
+            return
+        if self._web_mod:
+            self._web_mod.set_task_sink(None, stop=None)
+        try:
+            self.web_svc.shutdown()
+        except Exception:
+            pass
+        self.web_svc = None
+        self._web_mod = None
+        self._put({"type": "svc", "text": "扩展服务：已停止", "ok": False})
+
+    def set_ext_service(self, on):
+        if on:
+            r = self.start_ext_service()
+        else:
+            self.stop_ext_service()
+            r = {"ok": True}
+        self.save_config({"ext_service": bool(on)})
+        return r
+
+    # ---------------- 扩展嗅探 ----------------
+    def sniff_items(self):
+        if self._web_mod is None:
+            return {"ok": True, "items": [], "busy": bool(self.task_kind), "svc": False}
+        d = self._web_mod.sniff_items_json()
+        d["svc"] = True
+        return d
+
+    def sniff_clear(self):
+        if self._web_mod is not None:
+            self._web_mod.clear_sniff_items()
+        return {"ok": True}
+
+    def sniff_download(self, items):
+        if not items:
+            return {"ok": False, "error": "先选中要下载的条目"}
+        if self.task_kind:
+            return self._busy()
+        cfg = dict(self.cfg)
+        cfg.update({"fmt": "b", "play_while": True, "thumb": False, "meta": False,
+                    "sub": False, "embedsub": False})
+        if len(items) == 1:
+            it = items[0]
+            if it.get("referer") or it.get("page_url"):
+                cfg["referer"] = it.get("referer") or it.get("page_url")
+            if it.get("ua"):
+                cfg["ua"] = it["ua"]
+        task = {"urls": [it["url"] for it in items], "kind": "media", "cfg": cfg,
+                "emit": None, "no_playlist": True}
+        if not self.submit_server_task(task):
+            return self._busy()
+        self._put({"type": "sniff_started"})
+        return {"ok": True}
+
+    def sniff_preview(self, url):
+        if self._web_mod is None:
+            return {"ok": False, "error": "扩展服务未启用"}
+        try:
+            res = self._web_mod.build_sniff_preview(url)
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        if not res.get("ok"):
+            return {"ok": False, "error": res.get("error") or "未知原因"}
+        out = {"ok": True, "duration": res.get("duration"),
+               "thumb_data_url": "", "has_clip": False}
+        if res.get("thumb"):
+            path, _ = self._web_mod.preview_token_lookup(res["thumb"], "thumb")
+            if path:
+                try:
+                    with open(path, "rb") as f:
+                        out["thumb_data_url"] = ("data:image/png;base64,"
+                                                 + base64.b64encode(f.read()).decode())
+                except OSError:
+                    pass
+        if res.get("clip"):
+            path, _ = self._web_mod.preview_token_lookup(res["clip"], "clip")
+            self._sniff_clip = path or ""
+            out["has_clip"] = bool(self._sniff_clip)
+        return out
+
+    def sniff_play_clip(self):
+        if not self._sniff_clip:
+            return {"ok": False, "error": "没有可播放的片段"}
+        try:
+            os.startfile(self._sniff_clip)
+        except Exception as e:
+            return {"ok": False, "error": "打开播放器失败：%s" % e}
+        return {"ok": True}
+
+    # ---------------- 收尾 ----------------
+    def shutdown(self):
+        self.save_config({})
+        try:
+            self.stop()
+        except Exception:
+            pass
+        self.stop_ext_service()
+        try:
+            clear_preview_links(self.cfg.get("outdir") or os.path.join(core.BASE_DIR, "downloads"))
+        except Exception:
+            pass
+        self._stop_flag = True
