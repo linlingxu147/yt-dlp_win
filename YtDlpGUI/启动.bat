@@ -4,8 +4,6 @@ setlocal
 title yt-dlp GUI
 cd /d "%~dp0"
 
-rem 依次探测可用的 Python：不再写死 E:\python 这类个人机器上的路径。
-rem 桌面版需要 tkinter，所以优先用带窗口的启动器（pyw/pythonw），避免多一个黑框。
 set "PYW="
 set "PYC="
 where pyw.exe >nul 2>nul && set "PYW=pyw -3"
@@ -16,13 +14,23 @@ where python.exe >nul 2>nul && set "PYC=python.exe"
 if not defined PYC (
     where py.exe >nul 2>nul && set "PYC=py -3"
 )
-
 if not defined PYW if not defined PYC goto nopy
 
-rem 先用控制台版探一次 tkinter（系统 Python 常常不带，探不到就别让用户对着闪退猜）
+rem 首次自动安装 pywebview
 if defined PYC (
-    %PYC% -c "import tkinter" >nul 2>nul
-    if errorlevel 1 goto notk
+    %PYC% -c "import webview" >nul 2>nul
+    if errorlevel 1 (
+        echo 首次运行：正在安装 pywebview…
+        %PYC% -m pip install pywebview
+        if errorlevel 1 goto nopkg
+    )
+)
+
+rem WebView2 运行时预判（Evergreen 安装登记在此键）
+reg query "HKLM\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}" /v pv >nul 2>nul
+if errorlevel 1 (
+    echo [提示] 未检测到 WebView2 运行时。若窗口无法打开，请安装：
+    echo        https://developer.microsoft.com/microsoft-edge/webview2/
 )
 
 if defined PYW (
@@ -41,11 +49,9 @@ echo.
 pause
 exit /b 1
 
-:notk
+:nopkg
 echo.
-echo [错误] 找到的 Python 缺少 tkinter（桌面界面库），无法启动本窗口程序。
-echo        常见原因：使用了精简版/嵌入式 Python，或安装时没有勾选 tcl/tk。
-echo        替代方案：改用 YtDlpWeb\启动.bat（网页版，不需要 tkinter）。
+echo [错误] pywebview 安装失败。请手动执行：py -3 -m pip install pywebview
 echo.
 pause
 exit /b 1
