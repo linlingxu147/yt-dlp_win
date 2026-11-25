@@ -1095,5 +1095,57 @@ class TestProbePlayableReal(unittest.TestCase):
             self.assertTrue(v["reason"])
 
 
+class TestPlayWhileCmd(unittest.TestCase):
+    URLS = ["https://example.com/v"]
+
+    def test_off_by_default(self):
+        self.assertFalse(core.DEFAULT_CONFIG["play_while"])
+
+    def test_command_byte_identical_when_off(self):
+        cfg = core.default_config()
+        base = core.build_download_cmd(cfg, self.URLS)
+        cfg["play_while"] = False
+        self.assertEqual(core.build_download_cmd(cfg, self.URLS), base)
+        self.assertNotIn("--hls-use-mpegts", base)
+        self.assertNotIn("--remux-video", base)
+
+    def test_never_adds_no_part(self):
+        for pw in (False, True):
+            cfg = dict(core.default_config(), play_while=pw)
+            self.assertNotIn("--no-part", core.build_download_cmd(cfg, self.URLS))
+
+    def test_on_adds_mpegts(self):
+        cfg = dict(core.default_config(), play_while=True, mode="single")
+        cmd = core.build_download_cmd(cfg, self.URLS)
+        self.assertIn("--hls-use-mpegts", cmd)
+
+    def test_on_remuxes_to_merge_target(self):
+        cfg = dict(core.default_config(), play_while=True, mode="single", merge="mkv")
+        cmd = core.build_download_cmd(cfg, self.URLS)
+        i = cmd.index("--remux-video")
+        self.assertEqual(cmd[i + 1], "mkv")
+
+    def test_no_remux_when_merge_disabled(self):
+        for merge in ("", "不转换"):
+            cfg = dict(core.default_config(), play_while=True, mode="single", merge=merge)
+            self.assertNotIn("--remux-video", core.build_download_cmd(cfg, self.URLS))
+
+    def test_no_remux_for_audio_modes(self):
+        for mode in ("audio_mp3", "audio_raw"):
+            cfg = dict(core.default_config(), play_while=True, mode=mode)
+            self.assertNotIn("--remux-video", core.build_download_cmd(cfg, self.URLS))
+
+    def test_flags_come_before_url_separator(self):
+        cfg = dict(core.default_config(), play_while=True, mode="single")
+        cmd = core.build_download_cmd(cfg, self.URLS)
+        self.assertLess(cmd.index("--hls-use-mpegts"), cmd.index("--"))
+
+    def test_type_coercion(self):
+        cfg, warns = core.coerce_config({"play_while": "false"})
+        self.assertIs(cfg["play_while"], False)
+        cfg, _ = core.coerce_config({"play_while": "开"})
+        self.assertIs(cfg["play_while"], True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
