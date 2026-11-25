@@ -25,6 +25,7 @@ yt-dlp 下载器 · Web 界面服务端
 import json
 import os
 import re
+import secrets
 import shutil
 import sys
 import tempfile
@@ -32,7 +33,7 @@ import threading
 import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 # 与桌面版共用的核心（模式表、命令构建、进度解析、自愈阶梯、配置读写）都在这里。
 # 放在项目根目录，网页版只是它的一个前端。
@@ -74,10 +75,11 @@ def extension_origin_ok(origin):
 # 与桌面版共用的实现统一放在 ytdlp_core：这里只导入本文件真正用到的名字。
 from ytdlp_core import (  # noqa: E402
     NET_PLAN_LABEL, PROBE_VARIANTS, build_probe_cmd, classify_line, clean_media_url,
-    command_text, diagnose, find_tool, info_from_json, is_net_failure, iter_lines_watch,
-    json_ok as _json_ok, kill_tree, new_progress_state, next_net_plan, parse_format_line,
-    path_inside, progress_event, progress_text, sanitize_urls, scrub_header_value, spawn,
-    unsafe_arg_in,
+    clear_preview_links, command_text, diagnose, find_tool, fmt_is_separated,
+    info_from_json, is_net_failure, iter_lines_watch, json_ok as _json_ok, kill_tree,
+    make_preview_link, new_progress_state, next_net_plan, parse_format_line, path_inside,
+    probe_playable, progress_event, progress_text, real_download_path, sanitize_urls,
+    scrub_header_value, spawn, unsafe_arg_in,
 )
 
 
@@ -114,6 +116,89 @@ def warn_bad_urls(emit, bad):
         return
     emit({"type": "log", "level": "warn",
           "text": "已忽略 %d 个无法识别的链接：%s" % (len(bad), "、".join(bad[:3]))})
+
+
+# ---------------- 预浏览：封面 token 表 ----------------
+# 客户端只拿 token，不能传 URL 让服务端去 fetch——否则这就是个能探内网的 SSRF 洞。
+THUMB_LOCK = threading.Lock()
+THUMB_TOKENS = {}
+THUMB_TOKEN_MAX = 512
+
+_THUMB_CTYPE = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+                ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
+                ".img": "application/octet-stream"}
+
+
+def register_thumb(url):
+    if not url:
+        return ""
+    token = secrets.token_urlsafe(12)
+    with THUMB_LOCK:
+        THUMB_TOKENS[token] = str(url)
+        while len(THUMB_TOKENS) > THUMB_TOKEN_MAX:
+            THUMB_TOKENS.pop(next(iter(THUMB_TOKENS)))
+    return token
+
+
+def thumb_url_for(token):
+    with THUMB_LOCK:
+        return THUMB_TOKENS.get(str(token or ""))
+
+
+# ---------------- 边下边播：当前任务的可播性 ----------------
+PLAY_LOCK = threading.Lock()
+PLAY_STATE = {"raw_path": "", "outdir": "", "cfg": {}, "ok": False,
+              "reason": "还没有开始下载"}
+
+
+def _play_verdict(ok, reason, emit):
+    with PLAY_LOCK:
+        PLAY_STATE["ok"] = bool(ok)
+        PLAY_STATE["reason"] = reason
+    emit({"type": "playable", "ok": bool(ok), "reason": reason})
+
+
+def _play_probe_loop(raw, cfg, outdir, emit):
+    """后台判断能否边下边播。只读不转码，不占下载带宽。"""
+    if fmt_is_separated(cfg):
+        return _play_verdict(False, "此源音视频分离，边下边播不适用（改用单文件模式或关掉此开关）", emit)
+    if cfg.get("aria"):
+        return _play_verdict(False, "aria2c 外部下载器的文件布局不可控，边下边播不适用", emit)
+    reason = "文件还没写出来"
+    deadline = time.time() + 3
+    for _ in range(3):
+        # 「≥256KB」与「≥3 秒」任一满足即探：慢源不干等体积，快源不白等 3 秒
+        while time.time() < deadline:
+            with PLAY_LOCK:
+                if PLAY_STATE["raw_path"] != raw:
+                    return
+            p = real_download_path(raw)
+            try:
+                if p and os.path.getsize(p) >= 256 * 1024:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.5)
+        with PLAY_LOCK:
+            if PLAY_STATE["raw_path"] != raw:
+                return
+        p = real_download_path(raw)
+        if p:
+            v = probe_playable(p)
+            if v["ok"]:
+                return _play_verdict(True, "", emit)
+            reason = v["reason"]
+        deadline = time.time() + 5
+    return _play_verdict(False, "此源要下完才能播：%s" % reason, emit)
+
+
+def _start_play_probe(raw, cfg, outdir, emit):
+    with PLAY_LOCK:
+        PLAY_STATE.update({"raw_path": raw, "outdir": outdir, "cfg": dict(cfg),
+                           "ok": False, "reason": "正在判断能否边下边播…"})
+    emit({"type": "playable", "ok": False, "reason": "正在判断能否边下边播…"})
+    threading.Thread(target=_play_probe_loop, args=(raw, dict(cfg), outdir, emit),
+                     daemon=True).start()
 
 
 class Runner:
@@ -190,7 +275,9 @@ def run_detect(cfg, urls, emit, abort=None, keepalive=None):
             s = line.strip()
             if s.startswith("{"):
                 try:
-                    emit({"type": "row", "data": info_from_json(json.loads(s))})
+                    info = info_from_json(json.loads(s))
+                    info["thumb_id"] = register_thumb(info.get("thumb"))
+                    emit({"type": "row", "data": info})
                     continue
                 except Exception:
                     pass
@@ -224,29 +311,34 @@ def run_download(cfg, urls, emit, no_playlist=False, abort=None, keepalive=None)
     # 失败后按「直连 → 换浏览器指纹 → 换传输方式」阶梯自愈，专治 ConnectionReset(10054)
     tried = set()
     name, extra = "normal", {}
-    while True:
-        c = cfg if not extra else dict(cfg, **extra)
-        if name != "normal":
-            emit({"type": "log", "level": "warn",
-                  "text": "[自动重试] 换用%s重试（已下载部分会续传）" % NET_PLAN_LABEL[name]})
-        code, tail, stopped, done_count = _download_attempt(
-            c, urls, emit, no_playlist, abort, outdir, keepalive)
-        if code is None:          # 启动失败，launch 已自行上报
-            return
-        if code == 0 or stopped:
-            emit({"type": "done", "code": code, "elapsed": round(time.time() - t0, 1),
-                  "done_count": done_count,
-                  "diag": diagnose(tail) if code != 0 else []})
-            return
-        tried.add(name)
-        # 用原始 cfg 推导 Origin：no-referer 那招已经把 referer 清空了
-        nxt = next_net_plan(tail, tried, cfg, url=urls[0]) if (
-            cfg.get("net_hard", True) and is_net_failure(tail)) else None
-        if not nxt:
-            emit({"type": "done", "code": code, "elapsed": round(time.time() - t0, 1),
-                  "done_count": done_count, "diag": diagnose(tail)})
-            return
-        name, extra = nxt
+    try:
+        while True:
+            c = cfg if not extra else dict(cfg, **extra)
+            if name != "normal":
+                emit({"type": "log", "level": "warn",
+                      "text": "[自动重试] 换用%s重试（已下载部分会续传）" % NET_PLAN_LABEL[name]})
+            code, tail, stopped, done_count = _download_attempt(
+                c, urls, emit, no_playlist, abort, outdir, keepalive)
+            if code is None:          # 启动失败，launch 已自行上报
+                return
+            if code == 0 or stopped:
+                emit({"type": "done", "code": code, "elapsed": round(time.time() - t0, 1),
+                      "done_count": done_count,
+                      "diag": diagnose(tail) if code != 0 else []})
+                return
+            tried.add(name)
+            # 用原始 cfg 推导 Origin：no-referer 那招已经把 referer 清空了
+            nxt = next_net_plan(tail, tried, cfg, url=urls[0]) if (
+                cfg.get("net_hard", True) and is_net_failure(tail)) else None
+            if not nxt:
+                emit({"type": "done", "code": code, "elapsed": round(time.time() - t0, 1),
+                      "done_count": done_count, "diag": diagnose(tail)})
+                return
+            name, extra = nxt
+    finally:
+        clear_preview_links(outdir)
+        with PLAY_LOCK:
+            PLAY_STATE.update({"raw_path": "", "ok": False, "reason": "还没有开始下载"})
 
 
 def _download_attempt(cfg, urls, emit, no_playlist, abort, outdir, keepalive=None):
@@ -271,6 +363,12 @@ def _download_attempt(cfg, urls, emit, no_playlist, abort, outdir, keepalive=Non
                       "item_i": state["item_i"], "item_total": state["item_total"],
                       "done_count": len(state["done"]),
                       "text": line if ev["kind"] == "file" else progress_text(state)})
+                raw = state.get("raw_path") or ""
+                if raw and cfg.get("play_while"):
+                    with PLAY_LOCK:
+                        known = PLAY_STATE["raw_path"]
+                    if raw != known:
+                        _start_play_probe(raw, cfg, outdir, emit)
                 continue
             buf.append(line)
             emit({"type": "log", "level": classify_line(line), "text": line})
@@ -750,6 +848,29 @@ class Handler(BaseHTTPRequestHandler):
                 "busy": RUNNER.busy(), "kind": RUNNER.kind,
                 "elapsed": round(time.time() - RUNNER.started_at, 1) if RUNNER.started_at else 0,
             })
+        if p == "/api/thumb":
+            qs = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            if "url" in qs:
+                return self._json({"error": "不接受客户端指定封面地址"}, 400)
+            url = thumb_url_for((qs.get("id") or [""])[0])
+            if not url:
+                return self._json({"error": "封面不存在或已过期"}, 404)
+            path, err = core.fetch_thumb(url, load_config())
+            if err:
+                return self._json({"error": err}, 502)
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError as e:
+                return self._json({"error": "封面读取失败：%s" % e}, 502)
+            ctype = _THUMB_CTYPE.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if p == "/api/sniff/log":
             return self._json(sniff_log_json())
         self._json({"error": "not found"}, 404)
@@ -906,6 +1027,28 @@ class Handler(BaseHTTPRequestHandler):
             ok = RUNNER.stop()
             return self._json({"ok": ok})
 
+        if p == "/api/play":
+            # 路径由服务端自己掌握：客户端传路径等于让它指定打开本机任意文件
+            if body.get("path") or body.get("url"):
+                return self._json({"error": "不接受客户端指定路径"}, 400)
+            if not RUNNER.busy() or RUNNER.kind != "download":
+                return self._json({"error": "当前没有正在下载的任务"}, 409)
+            with PLAY_LOCK:
+                st = dict(PLAY_STATE)
+            if not st.get("ok"):
+                return self._json({"error": st.get("reason") or "此源不支持边下边播"}, 400)
+            real = real_download_path(st.get("raw_path"))
+            if not real:
+                return self._json({"error": "文件还没写出来"}, 400)
+            link, err = make_preview_link(real, st.get("outdir"))
+            if err:
+                return self._json({"error": err}, 400)
+            try:
+                os.startfile(link)
+            except Exception as e:
+                return self._json({"error": "打开播放器失败：%s（建议安装 VLC 或 PotPlayer）" % e}, 500)
+            return self._json({"ok": True})
+
         if p == "/api/open":
             cfg = load_config()
             root = cfg.get("outdir") or os.path.join(BASE_DIR, "downloads")
@@ -954,8 +1097,24 @@ def purge_stale_cookie_files():
         pass
 
 
+def purge_stale_thumbs():
+    """异常退出会残留封面缓存，启动时清掉过期的（与 cookie 临时文件同一套 6 小时口径）。"""
+    cutoff = time.time() - 6 * 3600
+    try:
+        for name in os.listdir(core.THUMB_CACHE_DIR):
+            path = os.path.join(core.THUMB_CACHE_DIR, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def main():
     purge_stale_cookie_files()
+    purge_stale_thumbs()
     # 允许 --port 指定端口，否则在 8765-8775 内自动避让占用
     arg_port = None
     for i, a in enumerate(sys.argv):

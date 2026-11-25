@@ -1147,5 +1147,51 @@ class TestPlayWhileCmd(unittest.TestCase):
         self.assertIs(cfg["play_while"], True)
 
 
+class TestThumbTokens(unittest.TestCase):
+    def setUp(self):
+        self.srv = load_web_server()
+        with self.srv.THUMB_LOCK:
+            self.srv.THUMB_TOKENS.clear()
+
+    def test_register_and_lookup(self):
+        t = self.srv.register_thumb("https://a/x.jpg")
+        self.assertTrue(t)
+        self.assertEqual(self.srv.thumb_url_for(t), "https://a/x.jpg")
+
+    def test_empty_url_gives_empty_token(self):
+        self.assertEqual(self.srv.register_thumb(""), "")
+
+    def test_unknown_token(self):
+        self.assertIsNone(self.srv.thumb_url_for("nope"))
+        self.assertIsNone(self.srv.thumb_url_for(""))
+
+    def test_fifo_cap(self):
+        for i in range(self.srv.THUMB_TOKEN_MAX + 5):
+            self.srv.register_thumb("https://a/%d.jpg" % i)
+        with self.srv.THUMB_LOCK:
+            self.assertLessEqual(len(self.srv.THUMB_TOKENS), self.srv.THUMB_TOKEN_MAX)
+
+
+class TestPlayState(unittest.TestCase):
+    def setUp(self):
+        self.srv = load_web_server()
+
+    def test_separated_source_verdict(self):
+        out = []
+        self.srv._play_probe_loop("C:/d/a.f137.mp4", {"mode": "best"}, "C:/d", out.append)
+        self.assertFalse(out[-1]["ok"])
+        self.assertIn("分离", out[-1]["reason"])
+
+    def test_aria_source_verdict(self):
+        out = []
+        self.srv._play_probe_loop("C:/d/a.mp4", {"mode": "single", "aria": True}, "C:/d", out.append)
+        self.assertFalse(out[-1]["ok"])
+        self.assertIn("aria2c", out[-1]["reason"])
+
+    def test_play_state_defaults_not_playable(self):
+        with self.srv.PLAY_LOCK:
+            self.assertFalse(self.srv.PLAY_STATE["ok"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
