@@ -3,6 +3,7 @@
 server.py 不是包，用 importlib 按文件路径载入；载入本身没有副作用（没有起服务）。
 """
 import importlib.util
+import json
 import os
 import sys
 import threading
@@ -16,19 +17,6 @@ _PATH = os.path.join(os.path.dirname(_HERE), "YtDlpWeb", "server.py")
 _spec = importlib.util.spec_from_file_location("ytdlp_web_server", _PATH)
 server = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(server)
-
-
-class TestValidateConfig(unittest.TestCase):
-    def test_unc_and_device_paths_rejected(self):
-        for v in ("\\\\server\\share", "//server/share"):
-            self.assertTrue(server.validate_config_value("outdir", v), v)
-
-    def test_template_cannot_escape_outdir(self):
-        for v in ("../x", "..\\x", "C:\\x\\%(title)s.%(ext)s", "\\\\srv\\x"):
-            self.assertTrue(server.validate_config_value("tpl", v), v)
-        self.assertIsNone(server.validate_config_value("tpl", "%(title)s.%(ext)s"))
-        self.assertIsNone(server.validate_config_value("outdir", "D:\\media\\dl"))
-        self.assertIsNone(server.validate_config_value("outdir", "downloads"))
 
 
 class TestRunnerReserve(unittest.TestCase):
@@ -84,17 +72,6 @@ class TestSniffTokenIsolation(unittest.TestCase):
         server.SNIFF_STATE.update({"token": 7, "lines": [], "prog": None, "done": False})
         server.sniff_emit({"type": "log", "text": "x"})
         self.assertEqual(server.SNIFF_STATE["lines"], ["x"])
-
-
-class TestThumbTokenTtl(unittest.TestCase):
-    def test_expired_token_is_dropped(self):
-        server.THUMB_TOKENS.clear()
-        token = server.register_thumb("https://cdn.example/a.jpg")
-        self.assertIsNotNone(server.thumb_url_for(token))
-        url, ts = server.THUMB_TOKENS[token]
-        server.THUMB_TOKENS[token] = (url, ts - server.THUMB_TOKEN_TTL - 1)
-        self.assertIsNone(server.thumb_url_for(token))
-        self.assertNotIn(token, server.THUMB_TOKENS)
 
 
 def _write(path, data):
@@ -454,3 +431,40 @@ class TestTaskSink(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestSniffClear(unittest.TestCase):
+    def test_clear_empties_list(self):
+        server.SNIFF_ITEMS.clear()
+        server.register_sniff_items([{"url": "https://cdn.example.com/a.mp4", "kind": "mp4"}])
+        self.assertEqual(len(server.sniff_items_json()["items"]), 1)
+        server.clear_sniff_items()
+        self.assertEqual(server.sniff_items_json()["items"], [])
+
+
+class TestUiRoutesRetired(unittest.TestCase):
+    def test_web_ui_and_ui_only_apis_are_gone(self):
+        import urllib.error
+        import urllib.request
+        svc = server.start_service(port=8896)
+        try:
+            def code(method, path, body=None):
+                req = urllib.request.Request(
+                    svc.url + path, method=method,
+                    data=json.dumps(body).encode() if body is not None else None,
+                    headers={"Content-Type": "application/json"})
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        return r.status
+                except urllib.error.HTTPError as e:
+                    return e.code
+            for method, path, body in (("GET", "/", None), ("GET", "/index.html", None),
+                                       ("GET", "/api/config", None),
+                                       ("GET", "/api/thumb?id=x", None),
+                                       ("POST", "/api/config", {}),
+                                       ("POST", "/api/detect", {"urls": []}),
+                                       ("POST", "/api/download", {"urls": []}),
+                                       ("POST", "/api/open", {})):
+                self.assertEqual(code(method, path, body), 404, path)
+            self.assertEqual(code("GET", "/api/status"), 200)
+        finally:
+            svc.shutdown()

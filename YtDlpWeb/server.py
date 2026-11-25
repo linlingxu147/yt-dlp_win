@@ -1,18 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-yt-dlp 下载器 · Web 界面服务端
+yt-dlp 下载器 · 浏览器扩展服务（无网页界面）
 
-纯 Python 标准库实现（无第三方依赖）：
-  GET  /                 界面
-  GET  /api/config       读取配置      POST /api/config  保存配置
-  GET  /api/status       当前任务状态
-  POST /api/detect       探测资源（SSE 流式返回条目）
-  POST /api/download     开始下载（SSE 流式返回进度）
-  POST /api/formats      列出可用格式（SSE）
-  POST /api/stop         停止当前任务
-  POST /api/open         打开输出目录
-  POST /api/sniff        接收浏览器扩展嗅探到的地址，立即交给 yt-dlp 下载
+纯 Python 标准库实现（无第三方依赖），日常由桌面版内嵌启动：
+  GET  /api/status       当前任务状态（扩展靠它发现服务）
+  POST /api/sniff/items  登记扩展嗅探到的媒体地址
+  POST /api/sniff/preview 给直链生成缩略图 / 短片段 / 时长
+  GET  /api/sniff/media  按 token 取预览字节
+  POST /api/sniff        提交嗅探地址，下载交还桌面版流水线
   GET  /api/sniff/log    嗅探下载任务的进度与日志（扩展轮询用）
+  POST /api/stop         停止当前任务
+  POST /api/play         边下边播（硬链接 .part 后交系统播放器）
 
 默认假设（业务信息未指定时的合理兜底，界面设置区同样标注）：
   1. 单任务队列：同一时间只运行一个探测/下载任务，避免日志与进度混淆。
@@ -33,23 +31,21 @@ import sys
 import tempfile
 import threading
 import time
-import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 # 与桌面版共用的核心（模式表、命令构建、进度解析、自愈阶梯、配置读写）都在这里。
-# 放在项目根目录，网页版只是它的一个前端。
+# 放在项目根目录，本服务与桌面版都是它的前端。
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ytdlp_core as core  # noqa: E402
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = core.BASE_DIR
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
-INDEX_FILE = os.path.join(APP_DIR, "index.html")
 
 PORT_RANGE = core.PORT_RANGE
 APP_ID = "yt-dlp-web"          # 扩展靠它确认「端口上跑的是本项目」，而不是别的服务
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 
 # 唯一被放行的扩展 ID——由 sniffer_extension\manifest.json 里的 "key" 决定（打包后固定不变）。
 # 以前这里是「任何 chrome-extension:// 都放行」，等于让本机的其它扩展也能改配置、
@@ -63,41 +59,6 @@ LOCAL_HOSTNAMES = ("127.0.0.1", "localhost", "::1")
 MAX_BODY_BYTES = 1 << 20           # 单次请求体上限 1MB，防内存被撑爆
 
 # /api/open 会调用 os.startfile，等于「按系统的默认方式打开」——可执行文件会被直接运行。
-OPEN_DENY_EXT = (".exe", ".msi", ".bat", ".cmd", ".com", ".scr", ".ps1", ".psm1",
-                 ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh", ".jar", ".lnk",
-                 ".hta", ".cpl", ".scf", ".msc", ".reg", ".url", ".pif", ".cer")
-
-
-_ABS_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]{1,2})")
-
-
-def validate_config_value(key, value):
-    """校验 /api/config 里的结构化字段，返回错误文案或 None。
-
-    为什么「附加参数」要黑名单、而这里可以放心收：extra/aria_args 是自由文本，
-    可以拼出任意 yt-dlp 参数；outdir/tpl/cookie 是结构化字段，含义固定，
-    只要把「盘符/绝对路径/..」这几个越界口子堵住，就只是「指定下载到哪」。
-    """
-    if key in ("outdir", "cookie") and isinstance(value, str):
-        v = value.strip().strip('"')
-        if v.startswith(("\\\\", "//")):
-            return "不支持网络路径（UNC）"
-        if key == "outdir" and v and _ABS_PATH_RE.match(v) and not os.path.isabs(v):
-            return "输出目录写法不认识，请用完整的本地路径"
-        return None
-    if key == "tpl" and isinstance(value, str):
-        v = value.strip()
-        if not v:
-            return "文件名模板不能为空"
-        if v.startswith(("/", "\\\\")) or _ABS_PATH_RE.match(v):
-            return "文件名模板不能带盘符或绝对路径"
-        # 模板只决定「下载目录内的名字」，出现 .. 就等于允许写到目录外
-        if ".." in v.replace("\\", "/").split("/"):
-            return "文件名模板里不能出现 .."
-        return None
-    return None
-
-
 def extension_origin_ok(origin):
     """Origin 是否属于本项目那份被固定的嗅探扩展。"""
     for scheme in _EXTENSION_SCHEMES:
@@ -120,8 +81,6 @@ from ytdlp_core import (  # noqa: E402
 
 
 # 诊断规则、模式表、格式表达式都在 ytdlp_core；网页版只保留自己的默认配置。
-DEFAULT_CONFIG = core.default_config()
-
 
 def set_config_file(path):
     """让宿主（比如桌面版）指定用哪一份 config.json。
@@ -140,74 +99,10 @@ def load_config(warn=None):
     return core.load_config(CONFIG_FILE, warn=warn)
 
 
-def save_config(cfg, warn=None):
-    return core.save_config(CONFIG_FILE, cfg, warn=warn)
-
-
 def build_download_cmd(cfg, urls, no_playlist=False, warn=None):
     return core.build_download_cmd(cfg, urls, no_playlist=no_playlist, warn=warn)
 
 
-def build_detect_cmd(cfg, urls):
-    return core.build_detect_cmd(cfg, urls)
-
-
-def bad_urls_msg(bad, fallback):
-    if not bad:
-        return fallback
-    return "无法识别这些链接：%s" % "、".join(bad[:3])
-
-
-def warn_bad_urls(emit, bad):
-    if not bad:
-        return
-    emit({"type": "log", "level": "warn",
-          "text": "已忽略 %d 个无法识别的链接：%s" % (len(bad), "、".join(bad[:3]))})
-
-
-# ---------------- 预浏览：封面 token 表 ----------------
-# 客户端只拿 token，不能传 URL 让服务端去 fetch——否则这就是个能探内网的 SSRF 洞。
-THUMB_LOCK = threading.Lock()
-THUMB_TOKENS = {}
-THUMB_TOKEN_MAX = 512
-THUMB_TOKEN_TTL = 6 * 3600          # token 只活一轮浏览：过期就重新探测，别长期有效
-
-_THUMB_CTYPE = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-                ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
-                ".img": "application/octet-stream"}
-
-
-def register_thumb(url):
-    if not url:
-        return ""
-    token = secrets.token_urlsafe(12)
-    now = time.time()
-    with THUMB_LOCK:
-        # 顺手清过期项：表里只有 URL 没有秘密，但让过期地址一直可被取图没有意义
-        for k, (_, ts) in list(THUMB_TOKENS.items()):
-            if now - ts > THUMB_TOKEN_TTL:
-                THUMB_TOKENS.pop(k, None)
-        THUMB_TOKENS[token] = (str(url), now)
-        while len(THUMB_TOKENS) > THUMB_TOKEN_MAX:
-            THUMB_TOKENS.pop(next(iter(THUMB_TOKENS)))
-    return token
-
-
-def thumb_url_for(token):
-    item = None
-    with THUMB_LOCK:
-        item = THUMB_TOKENS.get(str(token or ""))
-    if not item:
-        return None
-    url, ts = item
-    if time.time() - ts > THUMB_TOKEN_TTL:
-        with THUMB_LOCK:
-            THUMB_TOKENS.pop(str(token), None)
-        return None
-    return url
-
-
-# ---------------- 边下边播：当前任务的可播性 ----------------
 PLAY_LOCK = threading.Lock()
 PLAY_STATE = {"raw_path": "", "outdir": "", "cfg": {}, "ok": False,
               "reason": "还没有开始下载"}
@@ -338,45 +233,6 @@ def watch_note(why):
     """把 iter_lines_watch 的结束原因翻译成日志文案。"""
     return {"client": "[客户端已断开，任务终止]",
             "stall": "[长时间没有输出，已终止本次任务]"}.get((why or {}).get("reason"), "")
-
-
-def run_detect(cfg, urls, emit, abort=None, keepalive=None):
-    cmd = build_detect_cmd(cfg, urls)
-    emit({"type": "cmd", "text": command_text(cmd)})
-    # 探测不写文件，工作目录固定在 BASE_DIR（输出目录可能尚未创建）
-    if not RUNNER.launch(cmd, BASE_DIR, "detect", emit, adopt=True):
-        return
-    proc = RUNNER.proc
-    t0 = time.time()
-    buf = []
-    why = {}
-    try:
-        for line in iter_lines_watch(proc, abort, keepalive, why=why):
-            s = line.strip()
-            if s.startswith("{"):
-                try:
-                    info = info_from_json(json.loads(s))
-                    info["thumb_id"] = register_thumb(info.get("thumb"))
-                    emit({"type": "row", "data": info})
-                    continue
-                except Exception:
-                    pass
-            level = None
-            low = s.lower()
-            if "error" in low:
-                level = "err"
-            elif "warning" in low:
-                level = "warn"
-            buf.append(s)
-            emit({"type": "log", "level": level, "text": s})
-    finally:
-        note = watch_note(why)
-        if note:
-            emit({"type": "log", "level": "warn", "text": note})
-        code = proc.wait() if proc else -1
-        RUNNER.finish()
-        emit({"type": "done", "code": code, "elapsed": round(time.time() - t0, 1),
-              "diag": diagnose("\n".join(buf[-300:]))})
 
 
 def run_download(cfg, urls, emit, no_playlist=False, abort=None, keepalive=None):
@@ -623,7 +479,7 @@ def register_sniff_items(items, page_url=""):
             rec = SNIFF_ITEMS.get(url) or {"url": url, "first_ts": now}
             rec.update({
                 # 分片/清单的判定只有一份定义（ytdlp_core），扩展也照同一套扩展名走；
-                # 网页版据此默认把「有清单时的分片」折叠起来。
+                # 桌面版「扩展嗅探」页据此默认把分片折叠起来。
                 "seg": core.looks_like_segment(url),
                 "manifest": core.looks_like_manifest(url),
                 "kind": str(it.get("kind") or rec.get("kind") or "")[:16],
@@ -647,6 +503,12 @@ def sniff_items_json():
         items = list(SNIFF_ITEMS.values())
     items.sort(key=lambda r: r.get("ts") or 0, reverse=True)
     return {"ok": True, "items": items[:SNIFF_MAX_ITEMS], "busy": RUNNER.busy()}
+
+
+def clear_sniff_items():
+    """清空嗅探列表：只清列表，不动正在跑的任务与预览缓存。"""
+    with SNIFF_ITEMS_LOCK:
+        SNIFF_ITEMS.clear()
 
 
 def _preview_path(url, kind):
@@ -828,170 +690,6 @@ def run_sniff_task(cfg, url, kind, token=None):
                 pass
 
 
-def run_formats(cfg, url, emit, abort=None, keepalive=None):
-    # 以前这里只带 proxy/cookie，需要 UA/Referer/浏览器 Cookies 的站点
-    # 会「下载得了却看不到格式表」，现在与下载/探测共用同一套凭据
-    cmd = core.build_formats_cmd(cfg, url)
-    emit({"type": "cmd", "text": command_text(cmd)})
-    if not RUNNER.launch(cmd, BASE_DIR, "formats", emit, adopt=True):
-        return
-    proc = RUNNER.proc
-    why = {}
-    try:
-        for line in iter_lines_watch(proc, abort, keepalive, why=why):
-            row = parse_format_line(line)
-            if row:
-                emit({"type": "fmt", "data": row})
-            else:
-                emit({"type": "log", "level": None, "text": line})
-    finally:
-        note = watch_note(why)
-        if note:
-            emit({"type": "log", "level": "warn", "text": note})
-        code = proc.wait() if proc else -1
-        RUNNER.finish()
-        emit({"type": "done", "code": code, "elapsed": 0})
-
-
-def _probe_once(cmd, emit, abort=None, timeout=25):
-    """跑一条探测命令，拿到 JSON 即算成功。
-
-    超时交给 iter_lines_watch 兜底，不再另起读线程：这样既能保证子进程一定被回收，
-    也避免了「线程卡在管道上、RUNNER 槽位被占住」的老问题。
-    """
-    if not RUNNER.launch(cmd, BASE_DIR, "troubleshoot", emit, adopt=True):
-        return False, "无法启动 yt-dlp", 0.0, []
-    proc = RUNNER.proc
-    t0 = time.time()
-    lines = []
-    why = {}
-    got_json = False
-    timed_out = []
-
-    def expired():
-        if abort and abort():
-            return True
-        if time.time() - t0 >= timeout:
-            timed_out.append(True)
-            return True
-        return False
-
-    try:
-        for line in iter_lines_watch(proc, expired, why=why):
-            s = line.strip()
-            if not s:
-                continue
-            lines.append(s)
-            if s.startswith("{") and _json_ok(s):
-                got_json = True
-                break
-    finally:
-        if proc and proc.poll() is None:   # 提前拿到结果也得把进程收干净
-            kill_tree(proc)
-        if proc:
-            proc.wait()
-        RUNNER.finish()
-    sec = round(time.time() - t0, 1)
-    if got_json:
-        return True, "成功解析出条目", sec, lines
-    if timed_out:
-        return False, "超时 %ss（网络不通，或站点响应极慢）" % timeout, sec, lines[-25:]
-    if why.get("reason") == "client":
-        return False, "已取消（页面已关闭）", sec, lines[-25:]
-    return False, (lines[-1][:120] if lines else "无输出"), sec, lines[-25:]
-
-
-def run_troubleshoot(cfg, url, emit, abort=None):
-    """依次尝试多套访问配置，找出第一个能解析成功的方案。"""
-    for key, label, fix in PROBE_VARIANTS:
-        if abort and abort():
-            break
-        cmd = build_probe_cmd(cfg, url, key)
-        emit({"type": "probe_start", "key": key, "label": label,
-              "cmd": " ".join(('"%s"' % a) if " " in a else a for a in cmd)})
-        ok, msg, sec, tail = _probe_once(cmd, emit, abort)
-        if not ok:
-            for l in tail:
-                emit({"type": "log", "level": "warn", "text": l})
-        emit({"type": "probe", "key": key, "label": label,
-              "ok": ok, "msg": msg, "sec": sec, "fix": fix})
-        if ok:
-            break
-    emit({"type": "done", "code": 0, "elapsed": 0})
-
-
-def run_update(cfg, emit, abort=None, keepalive=None):
-    """更新 yt-dlp 本体——站点改版后，多数「嗅探不到」靠更新就能解决。"""
-    yt = cfg.get("yt_dlp_path") or find_tool("yt-dlp.exe")
-    cmd = [yt, "-U"]
-    if (cfg.get("proxy") or "").strip():
-        cmd += ["--proxy", str(cfg["proxy"]).strip()]
-    emit({"type": "cmd", "text": " ".join(cmd)})
-    if not RUNNER.launch(cmd, BASE_DIR, "update", emit, adopt=True):
-        return
-    proc = RUNNER.proc
-    why = {}
-    try:
-        for line in iter_lines_watch(proc, abort, keepalive, why=why):
-            emit({"type": "log", "level": None, "text": line})
-    finally:
-        note = watch_note(why)
-        if note:
-            emit({"type": "log", "level": "warn", "text": note})
-        code = proc.wait() if proc else -1
-        RUNNER.finish()
-        emit({"type": "done", "code": code, "elapsed": 0})
-
-
-class SSE:
-    """手写 chunked 编码的 Server-Sent Events 输出。"""
-
-    def __init__(self, handler):
-        self.h = handler
-        self.closed = False
-
-    def is_closed(self):
-        """供任务循环调用：客户端断开时及时终止子进程，避免空跑。"""
-        return self.closed
-
-    def heartbeat(self):
-        """空闲时发一条 SSE 注释帧。
-
-        写失败就说明对端已经不在了；顺带也防止浏览器/代理把静默连接判死。
-        返回 False 表示连接不可用，调用方据此终止子进程。
-        """
-        if self.closed:
-            return False
-        try:
-            data = b": ping\n\n"
-            self.h.wfile.write(b"%X\r\n" % len(data) + data + b"\r\n")
-            self.h.wfile.flush()
-            return True
-        except Exception:
-            self.closed = True
-            return False
-
-    def send(self, obj):
-        if self.closed:
-            return
-        try:
-            data = ("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8")
-            self.h.wfile.write(b"%X\r\n" % len(data) + data + b"\r\n")
-            self.h.wfile.flush()
-        except Exception:
-            self.closed = True
-
-    def close(self):
-        if self.closed:
-            return
-        try:
-            self.h.wfile.write(b"0\r\n\r\n")
-            self.h.wfile.flush()
-        except Exception:
-            pass
-        self.closed = True
-
-
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "yt-dlp-web/%s" % (APP_VERSION,)
@@ -1063,27 +761,6 @@ class Handler(BaseHTTPRequestHandler):
             return False
 
         return True
-
-    def _html(self):
-        try:
-            with open(INDEX_FILE, "rb") as f:
-                body = f.read()
-        except Exception:
-            body = b"<h1>index.html missing</h1>"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy",
-                         "default-src 'self'; script-src 'self' 'unsafe-inline'; "
-                         "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-                         "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; "
-                         "form-action 'none'")
-        self.end_headers()
-        self.wfile.write(body)
 
     def _drain_chunked(self, limit=MAX_BODY_BYTES):
         """消费掉分块请求体。
@@ -1188,66 +865,16 @@ class Handler(BaseHTTPRequestHandler):
                            "error": "已有任务正在运行（%s），请先停止或等待结束"
                                     % (RUNNER.kind or "未知")}, 409)
 
-    def _sse_headers(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("X-Accel-Buffering", "no")
-        self.send_header("Transfer-Encoding", "chunked")
-        self.end_headers()
-
-    # ---- routes ----
     def do_GET(self):
         if not self._guard():
             return
         p = self.path.split("?")[0]
-        if p in ("/", "/index.html"):
-            return self._html()
-        if p == "/api/config":
-            cfg = load_config()
-            cfg["env"] = {
-                "yt_dlp_path": find_tool("yt-dlp.exe"),
-                "yt_dlp_version": yt_dlp_version(),
-                "ffmpeg": os.path.isfile(os.path.join(BASE_DIR, "ffmpeg.exe")),
-                "aria2c": bool(core.which_tool("aria2c.exe")),
-                # 下载模式、UA 预设只有一份定义（ytdlp_core）：页面按这里的键渲染，
-                # 不再自带一张中文表，改文案不会让两端判据分叉。
-                "modes": [{"key": k, "label": lb} for k, lb in core.MODE_LABELS],
-                "mode_fmt": core.MODE_FMT,
-                "ua_presets": core.UA_PRESETS,
-            }
-            return self._json(cfg)
         if p == "/api/status":
             return self._json({
                 "app": APP_ID, "version": APP_VERSION,
                 "busy": RUNNER.busy(), "kind": RUNNER.kind,
                 "elapsed": round(time.time() - RUNNER.started_at, 1) if RUNNER.started_at else 0,
             })
-        if p == "/api/thumb":
-            qs = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
-            if "url" in qs:
-                return self._json({"error": "不接受客户端指定封面地址"}, 400)
-            url = thumb_url_for((qs.get("id") or [""])[0])
-            if not url:
-                return self._json({"error": "封面不存在或已过期"}, 404)
-            path, err = core.fetch_thumb(url, load_config())
-            if err:
-                return self._json({"error": err}, 502)
-            try:
-                with open(path, "rb") as f:
-                    data = f.read()
-            except OSError as e:
-                return self._json({"error": "封面读取失败：%s" % e}, 502)
-            ctype = _THUMB_CTYPE.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
-            self.send_response(200)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
-            # 站点给的封面字节一律别让浏览器猜类型：猜成 HTML 就是一个同源脚本执行点
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.end_headers()
-            self.wfile.write(data)
-            return
         if p == "/api/sniff/log":
             return self._json(sniff_log_json())
         if p == "/api/sniff/items":
@@ -1267,148 +894,6 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body()
         if getattr(self, "_body_too_large", False):
             return self._json({"error": "请求体过大"}, 413)
-
-        if p == "/api/config":
-            cfg = load_config()
-            for k, v in body.items():
-                if k not in DEFAULT_CONFIG:
-                    continue
-                bad = validate_config_value(k, v)
-                if bad:
-                    return self._json({"error": bad}, 400)
-                # 附加参数能干的事远超「下载」，命中危险项直接拒绝
-                if k in ("extra", "aria_args"):
-                    bad = unsafe_arg_in(v if isinstance(v, str) else "")
-                    if bad:
-                        return self._json({"error": "「附加参数」里不允许使用 %s" % bad}, 400)
-                if k == "outdir" and isinstance(v, str):
-                    v = v.strip().strip('"')
-                cfg[k] = v
-            cfg["yt_dlp_path"] = find_tool("yt-dlp.exe")
-            notes = []
-            ok = save_config(cfg, warn=notes.append)
-            # 回读一次：headers 等会被规范化，界面拿到的就是真正生效的内容；
-            # 整理过程中的提醒一并回给前端，别让「填了没生效」变成静默失败。
-            fresh = load_config(warn=notes.append)
-            return self._json({"ok": ok, "config": fresh, "warnings": notes})
-
-        if p == "/api/detect":
-            cfg = load_config()
-            urls, bad = sanitize_urls(body.get("urls") or [])
-            if not urls:
-                return self._json({"error": bad_urls_msg(bad, "请先填写链接")}, 400)
-            if not RUNNER.reserve("detect"):
-                return self._busy_json()
-            self._sse_headers()
-            sse = SSE(self)
-            try:
-                warn_bad_urls(sse.send, bad)
-                run_detect(cfg, urls, sse.send, sse.is_closed, sse.heartbeat)
-            finally:
-                RUNNER.finish()          # 占位异常退出也要放行，别把任务槽锁死
-                sse.close()
-            return
-
-        if p == "/api/download":
-            cfg = load_config()
-            urls, bad = sanitize_urls(body.get("urls") or [])
-            if not urls:
-                return self._json({"error": bad_urls_msg(bad, "请先选择要下载的内容")}, 400)
-            if TASK_SINK is not None:
-                self._sse_headers()
-                sse = SSE(self)
-
-                def emit(obj):
-                    sse.send(obj)
-                    if obj.get("type") == "done":
-                        sse.close()
-
-                def beat():
-                    while not sse.is_closed():
-                        sse.heartbeat()
-                        time.sleep(5)
-
-                threading.Thread(target=beat, daemon=True).start()
-                warn_bad_urls(emit, bad)
-                task = {"urls": urls, "cfg": cfg, "emit": emit,
-                        "no_playlist": bool(body.get("no_playlist"))}
-                if not TASK_SINK(task):
-                    emit({"type": "error", "text": "桌面版已有任务正在进行，请先停止或等待结束"})
-                    emit({"type": "done", "code": -1})   # 收尾事件不能少，否则前端状态栏卡住
-                return
-            if not RUNNER.reserve("download"):
-                return self._busy_json()
-            self._sse_headers()
-            sse = SSE(self)
-            try:
-                warn_bad_urls(sse.send, bad)
-                run_download(cfg, urls, sse.send, no_playlist=bool(body.get("no_playlist")),
-                             abort=sse.is_closed, keepalive=sse.heartbeat)
-            finally:
-                RUNNER.finish()
-                sse.close()
-            return
-
-        if p == "/api/formats":
-            cfg = load_config()
-            url = clean_media_url(body.get("url"))
-            if not core.is_http_url(url):
-                return self._json({"error": "请填写以 http:// 或 https:// 开头的链接"}, 400)
-            if not RUNNER.reserve("formats"):
-                return self._busy_json()
-            self._sse_headers()
-            sse = SSE(self)
-            try:
-                run_formats(cfg, url, sse.send, sse.is_closed, sse.heartbeat)
-            finally:
-                RUNNER.finish()
-                sse.close()
-            return
-
-        if p == "/api/command":
-            # 只构建不执行：供界面「复制命令」使用
-            cfg = load_config()
-            urls, bad = sanitize_urls(body.get("urls") or [])
-            warns = []
-            cmd = build_download_cmd(cfg, urls, no_playlist=bool(body.get("no_playlist")),
-                                     warn=warns)
-            return self._json({"cmd": cmd, "text": command_text(cmd), "ignored": bad,
-                               "notes": warns})
-
-        if p == "/api/reset":
-            cfg = dict(DEFAULT_CONFIG)
-            cfg["yt_dlp_path"] = find_tool("yt-dlp.exe")
-            save_config(cfg)
-            return self._json({"ok": True, "config": cfg})
-
-        if p == "/api/troubleshoot":
-            cfg = load_config()
-            url = clean_media_url(body.get("url"))
-            if not core.is_http_url(url):
-                return self._json({"error": "请填写以 http:// 或 https:// 开头的链接"}, 400)
-            if not RUNNER.reserve("troubleshoot"):
-                return self._busy_json()
-            self._sse_headers()
-            sse = SSE(self)
-            try:
-                run_troubleshoot(cfg, url, sse.send, sse.is_closed)
-            finally:
-                RUNNER.finish()
-                sse.close()
-            return
-
-        if p == "/api/update":
-            cfg = load_config()
-            if not RUNNER.reserve("update"):
-                return self._busy_json()
-            self._sse_headers()
-            sse = SSE(self)
-            try:
-                run_update(cfg, sse.send, sse.is_closed, sse.heartbeat)
-            finally:
-                RUNNER.finish()
-                sse.close()
-            return
 
         if p == "/api/sniff/items":
             items = body.get("items")
@@ -1517,39 +1002,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "打开播放器失败：%s（建议安装 VLC 或 PotPlayer）" % e}, 500)
             return self._json({"ok": True})
 
-        if p == "/api/open":
-            cfg = load_config()
-            root = cfg.get("outdir") or os.path.join(BASE_DIR, "downloads")
-            path = str(body.get("path") or root).strip().strip('"')
-            if not path:
-                return self._json({"error": "路径为空"}, 400)
-            # UNC 路径会让 Windows 主动向远端 SMB 认证（泄露 NTLM 哈希），一律拒绝
-            if path.startswith(("\\\\", "//")):
-                return self._json({"error": "不支持网络路径"}, 400)
-            path = os.path.normpath(path if os.path.isabs(path) else os.path.join(root, path))
-            if not path_inside(path, root):
-                return self._json({"error": "只允许打开下载目录内的路径"}, 403)
-            # os.startfile 对可执行文件等于「直接运行」：下载目录里的东西不能被这样点开
-            if path.lower().endswith(OPEN_DENY_EXT):
-                return self._json({"error": "出于安全考虑，不直接打开可执行文件"}, 400)
-            try:
-                os.makedirs(path, exist_ok=True)
-                # 校验用 realpath，打开也必须用 realpath：两次解析之间被换成快捷方式
-                # 就是典型的检查/使用时间差（TOCTOU）。
-                target = os.path.realpath(path)
-                if not path_inside(target, root) or target.lower().endswith(OPEN_DENY_EXT):
-                    return self._json({"error": "只允许打开下载目录内的普通文件"}, 403)
-                os.startfile(target)
-                return self._json({"ok": True})
-            except Exception as e:
-                return self._json({"error": "打开失败：%s" % e}, 500)
-
         self._json({"error": "not found"}, 404)
-
-
-def yt_dlp_version():
-    """读取 yt-dlp 版本——版本过旧是「站点嗅探不到」的常见原因，界面会显示出来。"""
-    return core.yt_dlp_version(find_tool("yt-dlp.exe"))
 
 
 def purge_stale_cookie_files():
@@ -1690,19 +1143,15 @@ def main():
         return 1
 
     print("=" * 56)
-    print("  yt-dlp 下载器 · Web 界面已启动")
-    print(f"  访问地址：  {svc.url}")
+    print("  yt-dlp 下载器 · 扩展服务已启动（无网页界面）")
+    print(f"  服务地址：  {svc.url}")
     print("  访问范围：  仅本机（不监听局域网，手机无法访问）")
+    print("  用途：      浏览器扩展直连；日常请用桌面版 YtDlpGUI\\启动.bat")
     print("  停止服务：  关闭本窗口，或按 Ctrl+C")
     print("=" * 56)
     if svc.skipped:
         print("  注意：端口 %s 已被占用（可能是另一个实例还在运行），已改用 %s。"
               % (", ".join(str(x) for x in svc.skipped), svc.port))
-    if "--no-browser" not in sys.argv:
-        try:
-            webbrowser.open(svc.url)
-        except Exception:
-            pass
     try:
         while svc.thread.is_alive():
             svc.thread.join(0.5)

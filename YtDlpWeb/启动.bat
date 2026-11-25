@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 setlocal
-title yt-dlp Web UI
+title yt-dlp 扩展服务
 cd /d "%~dp0"
 
 rem 依次探测可用的 Python：不再写死 E:\python 这类个人机器上的路径。
@@ -13,8 +13,8 @@ if not defined PY (
 
 if not defined PY goto nopy
 
-rem 网页版是控制台程序：这里不隐藏窗口，方便看「访问地址」和错误信息。
-rem 额外参数（例如 --port 8770、--no-browser）会原样转发给 server.py。
+rem 本服务无网页界面：只给浏览器扩展用。日常请开桌面版 YtDlpGUI\启动.bat（自带本服务）。
+rem 这里不隐藏窗口，方便看「服务地址」和错误信息。额外参数（例如 --port 8770）原样转发。
 %PY% server.py %*
 echo.
 echo Service stopped.

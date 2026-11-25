@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """yt-dlp 下载器的共用核心。
 
-桌面版（YtDlpGUI\\main.py）与网页版（YtDlpWeb\\server.py）原先各自复制了一份
+桌面版（YtDlpGUI\\main.py）与扩展服务（YtDlpWeb\\server.py，原网页版）原先各自复制了一份
 1500 行代码，改一处要改两处、还容易漂移。这里把「与界面无关」的部分集中起来：
 
   * 模式 / 格式表达式 / 预设 UA / 浏览器列表 / 诊断规则
@@ -346,7 +346,7 @@ def path_inside(path, root):
         p = os.path.normcase(os.path.realpath(path))
         r = os.path.normcase(os.path.realpath(root))
         # 目录根（"C:\\"）本身就以分隔符结尾，再拼一次会变成 "c:\\\\"，
-        # 于是整个盘里的路径都被判成「不在里面」——/api/open 与边下边播都受影响。
+        # 于是整个盘里的路径都被判成「不在里面」——边下边播的预览链接校验会受影响。
         if not r.endswith(os.sep):
             r += os.sep
         if not p.endswith(os.sep):
@@ -1205,7 +1205,7 @@ def _write_lock(path, timeout=2.0):
 def atomic_write_text(path, text, backup=True):
     """先写临时文件再替换，避免断电/强杀留下半截配置。
 
-    临时名用 mkstemp 而不是固定的 path+".tmp"：桌面版和网页版共用一个 config.json，
+    临时名用 mkstemp 而不是固定的 path+".tmp"：桌面版和内嵌/独立服务共用一个 config.json，
     两个进程同时保存时会互相覆盖临时文件的内容。
     """
     d = os.path.dirname(os.path.abspath(path))

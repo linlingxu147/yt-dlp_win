@@ -738,77 +738,6 @@ class TestCookieJar(unittest.TestCase):
         self.assertIsNone(server.write_cookie_jar([{"value": "x"}], "https://a.com"))
 
 
-class TestSSEFraming(unittest.TestCase):
-    """SSE 是手写 chunked 帧，写坏了浏览器只会「卡在探测中」，所以按字节校验。"""
-
-    @staticmethod
-    def decode(raw):
-        frames, i = [], 0
-        while i < len(raw):
-            nl = raw.index(b"\r\n", i)
-            size = int(raw[i:nl], 16)
-            if size == 0:
-                return frames, raw[nl + 2:]
-            end = nl + 2 + size
-            assert raw[end:end + 2] == b"\r\n", "帧尾缺 CRLF"
-            frames.append(raw[nl + 2:end])
-            i = end + 2
-        return frames, b""
-
-    def make(self):
-        server = load_web_server()
-
-        class H:
-            wfile = io.BytesIO()
-
-        return server.SSE(H()), H
-
-    def test_send_frame_shape(self):
-        sse, h = self.make()
-        sse.send({"type": "log", "text": "中文"})
-        frames, rest = self.decode(h.wfile.getvalue())
-        self.assertEqual(len(frames), 1)
-        self.assertTrue(frames[0].startswith(b"data: "))
-        self.assertTrue(frames[0].endswith(b"\n\n"))
-        self.assertEqual(json.loads(frames[0][6:].decode("utf-8"))["text"], "中文")
-        self.assertEqual(rest, b"")
-
-    def test_heartbeat_is_a_comment_frame(self):
-        sse, h = self.make()
-        self.assertTrue(sse.heartbeat())
-        frames, _ = self.decode(h.wfile.getvalue())
-        self.assertEqual(frames, [b": ping\n\n"])
-
-    def test_close_writes_zero_length_terminator(self):
-        sse, h = self.make()
-        sse.send({"a": 1})
-        sse.close()
-        frames, rest = self.decode(h.wfile.getvalue())
-        self.assertEqual(len(frames), 1)
-        self.assertEqual(rest, b"\r\n")
-        self.assertTrue(sse.closed)
-
-    def test_write_failure_marks_closed(self):
-        server = load_web_server()
-
-        class Dead:
-            wfile = None
-
-        sse = server.SSE(Dead())
-        sse.send({"a": 1})
-        self.assertTrue(sse.closed)
-        self.assertFalse(sse.heartbeat())
-
-    def test_send_after_close_is_noop(self):
-        sse, h = self.make()
-        sse.close()
-        h.wfile.truncate(0)
-        h.wfile.seek(0)
-        sse.send({"a": 1})
-        sse.heartbeat()
-        self.assertEqual(h.wfile.getvalue(), b"")
-
-
 class TestLocalhostGuards(unittest.TestCase):
     def test_extension_origin_is_pinned_to_the_manifest_key(self):
         server = load_web_server()
@@ -830,12 +759,6 @@ class TestLocalhostGuards(unittest.TestCase):
         digest = hashlib.sha256(der).hexdigest()[:32]
         ext_id = "".join(chr(ord("a") + int(c, 16)) for c in digest)
         self.assertEqual(list(server.ALLOWED_EXTENSION_IDS), [ext_id])
-
-    def test_open_denies_executables(self):
-        server = load_web_server()
-        self.assertIn(".exe", server.OPEN_DENY_EXT)
-        self.assertIn(".bat", server.OPEN_DENY_EXT)
-
 
 class TestThumbSafety(unittest.TestCase):
     def test_public_https_ok(self):
@@ -1157,31 +1080,6 @@ class TestPlayWhileCmd(unittest.TestCase):
         self.assertIs(cfg["play_while"], False)
         cfg, _ = core.coerce_config({"play_while": "开"})
         self.assertIs(cfg["play_while"], True)
-
-
-class TestThumbTokens(unittest.TestCase):
-    def setUp(self):
-        self.srv = load_web_server()
-        with self.srv.THUMB_LOCK:
-            self.srv.THUMB_TOKENS.clear()
-
-    def test_register_and_lookup(self):
-        t = self.srv.register_thumb("https://a/x.jpg")
-        self.assertTrue(t)
-        self.assertEqual(self.srv.thumb_url_for(t), "https://a/x.jpg")
-
-    def test_empty_url_gives_empty_token(self):
-        self.assertEqual(self.srv.register_thumb(""), "")
-
-    def test_unknown_token(self):
-        self.assertIsNone(self.srv.thumb_url_for("nope"))
-        self.assertIsNone(self.srv.thumb_url_for(""))
-
-    def test_fifo_cap(self):
-        for i in range(self.srv.THUMB_TOKEN_MAX + 5):
-            self.srv.register_thumb("https://a/%d.jpg" % i)
-        with self.srv.THUMB_LOCK:
-            self.assertLessEqual(len(self.srv.THUMB_TOKENS), self.srv.THUMB_TOKEN_MAX)
 
 
 class TestPlayState(unittest.TestCase):

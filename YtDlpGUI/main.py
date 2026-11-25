@@ -116,6 +116,11 @@ class App:
         self.detecting = False
         self.diag_buf = ""      # 上一次任务的原始输出，用于失败时诊断
 
+        # 扩展嗅探页
+        self._sniff_items = []
+        self._sniff_sig = None
+        self._sniff_clip = ""
+
         self.has_aria2c = bool(core.which_tool("aria2c.exe"))
         self.pstate = new_progress_state()      # 进度解析状态（与网页版共用核心）
 
@@ -143,10 +148,20 @@ class App:
     # ---------------- 界面 ----------------
     def _build_ui(self):
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(5, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        # 两页：下载（原有全部控件）/ 扩展嗅探（浏览器扩展上报的媒体地址）
+        self.nb = ttk.Notebook(self.root)
+        self.nb.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        self.dl_page = ttk.Frame(self.nb)
+        self.sn_page = ttk.Frame(self.nb)
+        self.nb.add(self.dl_page, text="  下载  ")
+        self.nb.add(self.sn_page, text="  扩展嗅探  ")
+        self.dl_page.columnconfigure(0, weight=1)
+        self.dl_page.rowconfigure(5, weight=1)
 
         # 顶部
-        top = ttk.Frame(self.root)
+        top = ttk.Frame(self.dl_page)
         top.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
         ttk.Label(top, text="yt-dlp 下载器", font=("Microsoft YaHei UI", 13, "bold")).pack(side="left")
         ttk.Label(top, text=f"  yt-dlp: {self.cfg.get('yt_dlp_path') or find_tool('yt-dlp.exe')}",
@@ -160,7 +175,7 @@ class App:
         self.lbl_svc.pack(side="right", padx=(0, 14))
 
         # 主体：左右两列分区
-        body = ttk.Frame(self.root)
+        body = ttk.Frame(self.dl_page)
         body.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
@@ -182,7 +197,7 @@ class App:
         self._build_advanced(rcol, 3)
 
         # 按钮
-        bf = ttk.Frame(self.root)
+        bf = ttk.Frame(self.dl_page)
         bf.grid(row=2, column=0, sticky="ew", padx=10, pady=(6, 2))
         self.btn_start = ttk.Button(bf, text="开始下载", command=self.start_download)
         self.btn_start.pack(side="left", padx=(0, 6))
@@ -202,6 +217,7 @@ class App:
         self._build_progress(3)
         self._build_results(4)
         self._build_log(5)
+        self._build_sniff_page(self.sn_page)
 
     def _build_source(self, parent):
         lf = ttk.LabelFrame(parent, text=" ① 下载链接 ")
@@ -435,7 +451,7 @@ class App:
                                                           padx=6, pady=(0, 6))
 
     def _build_progress(self, row):
-        lf = ttk.LabelFrame(self.root, text=" 下载进度 ")
+        lf = ttk.LabelFrame(self.dl_page, text=" 下载进度 ")
         lf.grid(row=row, column=0, sticky="ew", padx=10, pady=(4, 2))
         lf.columnconfigure(0, weight=1)
         self.lbl_file = ttk.Label(lf, text="等待开始", font=FONT, foreground="#57606a")
@@ -457,7 +473,7 @@ class App:
         self._play_ok = False
 
     def _build_results(self, row):
-        lf = ttk.LabelFrame(self.root, text=" 探测结果（点 ✓ 列勾选要下载的条目） ")
+        lf = ttk.LabelFrame(self.dl_page, text=" 探测结果（点 ✓ 列勾选要下载的条目） ")
         lf.grid(row=row, column=0, sticky="nsew", padx=10, pady=(2, 2))
         lf.columnconfigure(0, weight=1)
         lf.rowconfigure(0, weight=1)
@@ -505,7 +521,7 @@ class App:
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
     def _build_log(self, row):
-        lf = ttk.LabelFrame(self.root, text=" 运行日志 ")
+        lf = ttk.LabelFrame(self.dl_page, text=" 运行日志 ")
         lf.grid(row=row, column=0, sticky="nsew", padx=10, pady=(2, 10))
         lf.columnconfigure(0, weight=1)
         lf.rowconfigure(0, weight=1)
@@ -973,6 +989,8 @@ class App:
                     self._set_playable(rest[0], rest[1] if len(rest) > 1 else "")
                 elif kind == "exttask":
                     self._start_external(rest[0])
+                elif kind == "sniffpv":
+                    self._on_sniff_preview(rest[0])
         except queue.Empty:
             pass
         self.root.after(100, self._pump)
@@ -1684,6 +1702,170 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     # ---------------- 内嵌扩展服务 ----------------
+    # ---------------- 扩展嗅探页 ----------------
+    def _build_sniff_page(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+        bar = ttk.Frame(parent)
+        bar.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
+        ttk.Label(bar, text="浏览器扩展嗅探到的媒体地址（开着扩展的页面会自动出现在这里）",
+                  font=FONT_S, foreground="#8c959f").pack(side="left")
+        self.sn_fold = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="折叠分片", variable=self.sn_fold,
+                        command=self._sniff_refresh).pack(side="right")
+        ttk.Button(bar, text="清空列表", command=self._sniff_clear).pack(side="right", padx=(0, 6))
+        ttk.Button(bar, text="刷新", command=self._sniff_refresh).pack(side="right", padx=(0, 6))
+        cols = ("title", "url", "kind", "size", "source", "page", "ts")
+        self.sn_tree = ttk.Treeview(parent, columns=cols, show="headings",
+                                    selectmode="extended", height=12)
+        for key, text, width in (("title", "标题", 180), ("url", "地址", 380),
+                                 ("kind", "类型", 60), ("size", "大小", 80),
+                                 ("source", "来源", 90), ("page", "页面", 200),
+                                 ("ts", "时间", 70)):
+            self.sn_tree.heading(key, text=text)
+            self.sn_tree.column(key, width=width, anchor="w")
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=self.sn_tree.yview)
+        self.sn_tree.configure(yscrollcommand=vsb.set)
+        self.sn_tree.grid(row=1, column=0, sticky="nsew", padx=(10, 0), pady=4)
+        vsb.grid(row=1, column=1, sticky="ns", pady=4)
+        self.sn_tree.tag_configure("seg", foreground="#8c959f")
+        bf = ttk.Frame(parent)
+        bf.grid(row=2, column=0, sticky="ew", padx=10, pady=(4, 2))
+        ttk.Button(bf, text="下载选中", command=self._sniff_download).pack(side="left", padx=(0, 6))
+        ttk.Button(bf, text="预览选中", command=self._sniff_preview).pack(side="left", padx=(0, 6))
+        self.sn_lbl = ttk.Label(bf, text="", font=FONT_S, foreground="#8c959f")
+        self.sn_lbl.pack(side="right")
+        pv = ttk.LabelFrame(parent, text=" 预览（缩略图 / 时长 / 短片段） ")
+        pv.grid(row=3, column=0, columnspan=2, sticky="ew", padx=10, pady=(4, 10))
+        self.sn_img = ttk.Label(pv)
+        self.sn_img.pack(side="left", padx=8, pady=6)
+        right = ttk.Frame(pv)
+        right.pack(side="left", fill="both", expand=True, padx=8, pady=6)
+        self.sn_pv_lbl = ttk.Label(right, text="选中一条后点「预览选中」", font=FONT_S,
+                                   foreground="#8c959f", wraplength=520, justify="left")
+        self.sn_pv_lbl.pack(anchor="w")
+        self.sn_play = ttk.Button(right, text="播放片段", command=self._sniff_play_clip,
+                                  state="disabled")
+        self.sn_play.pack(anchor="w", pady=(6, 0))
+        self.root.after(3000, self._sniff_tick)
+
+    def _sniff_tick(self):
+        # 只在本页可见时刷新：别在其它页面上打扰用户的选择状态
+        try:
+            if self.nb.index(self.nb.select()) == 1:
+                self._sniff_refresh()
+        except Exception:
+            pass
+        self.root.after(3000, self._sniff_tick)
+
+    def _sniff_refresh(self):
+        mod = self._web_mod
+        if mod is None:
+            self.sn_lbl.config(text="扩展服务未启用（「高级」里勾选启用浏览器扩展支持）")
+            return
+        items = (mod.sniff_items_json() or {}).get("items") or []
+        fold = bool(self.sn_fold.get())
+        shown = [r for r in items if not (fold and r.get("seg"))]
+        sig = (fold, tuple((r.get("url"), r.get("ts"), r.get("size")) for r in shown))
+        self.sn_lbl.config(text="共 %d 条（折叠分片：%s）" % (len(shown), "开" if fold else "关"))
+        if sig == self._sniff_sig:
+            return
+        self._sniff_sig = sig
+        self._sniff_items = shown
+        self.sn_tree.delete(*self.sn_tree.get_children())
+        for i, r in enumerate(shown):
+            size = r.get("size") or 0
+            self.sn_tree.insert("", "end", iid=str(i), values=(
+                r.get("title") or "", r.get("url") or "", r.get("kind") or "",
+                fmt_size(size) if size else "", r.get("source") or "",
+                r.get("page_url") or "",
+                time.strftime("%H:%M:%S", time.localtime(r.get("ts") or 0))),
+                tags=("seg",) if r.get("seg") else ())
+
+    def _sniff_clear(self):
+        if self._web_mod is not None:
+            self._web_mod.clear_sniff_items()
+        self._sniff_sig = None
+        self._sniff_refresh()
+
+    def _sniff_selected(self):
+        sel = self.sn_tree.selection()
+        return [self._sniff_items[int(i)] for i in sel
+                if i.isdigit() and int(i) < len(self._sniff_items)]
+
+    def _sniff_download(self):
+        items = self._sniff_selected()
+        if not items:
+            messagebox.showinfo("扩展嗅探", "先在列表里选中要下载的条目")
+            return
+        cfg = dict(self.cfg)
+        # 直链媒体没有封面/元数据：强行 embed 只会让 ffmpeg 报错、把成功判成失败
+        cfg.update({"fmt": "b", "play_while": True, "thumb": False, "meta": False,
+                    "sub": False, "embedsub": False})
+        if len(items) == 1:
+            it = items[0]
+            if it.get("referer") or it.get("page_url"):
+                cfg["referer"] = it.get("referer") or it.get("page_url")
+            if it.get("ua"):
+                cfg["ua"] = it["ua"]
+        task = {"urls": [it["url"] for it in items], "kind": "media", "cfg": cfg,
+                "emit": None, "no_playlist": True}
+        if not self.submit_server_task(task):
+            messagebox.showwarning("扩展嗅探", "已有任务正在进行（%s），请先停止或等待结束"
+                                   % TASK_LABELS.get(self.task_kind, self.task_kind or ""))
+            return
+        self.nb.select(self.dl_page)
+
+    def _sniff_preview(self):
+        items = self._sniff_selected()
+        if len(items) != 1:
+            messagebox.showinfo("扩展嗅探", "预览一次只选一条")
+            return
+        url = items[0]["url"]
+        self.sn_pv_lbl.config(text="正在抓预览…（%s）" % url[:90])
+        self.sn_play.config(state="disabled")
+        self._sniff_clip = ""
+        mod = self._web_mod
+
+        def work():
+            try:
+                res = mod.build_sniff_preview(url)
+            except Exception as e:
+                res = {"ok": False, "error": str(e)}
+            self.q.put(("sniffpv", res))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_sniff_preview(self, res):
+        if not res.get("ok"):
+            self.sn_pv_lbl.config(text="预览失败：%s" % (res.get("error") or "未知原因"))
+            return
+        dur = res.get("duration")
+        txt = "时长 %s" % (fmt_dur(dur) if dur else "未知")
+        mod = self._web_mod
+        if res.get("thumb"):
+            path, _ = mod.preview_token_lookup(res["thumb"], "thumb")
+            if path:
+                try:
+                    img = tk.PhotoImage(file=path)
+                    self.sn_img.config(image=img)
+                    self.sn_img.image = img      # 留住引用，否则 Tk 会把图回收
+                except Exception:
+                    pass
+        if res.get("clip"):
+            path, _ = mod.preview_token_lookup(res["clip"], "clip")
+            self._sniff_clip = path or ""
+        self.sn_play.config(state="normal" if self._sniff_clip else "disabled")
+        self.sn_pv_lbl.config(text=txt + ("　片段已就绪，可播放" if self._sniff_clip
+                                          else "　（此源没有可抓的片段）"))
+
+    def _sniff_play_clip(self):
+        if not self._sniff_clip:
+            return
+        try:
+            os.startfile(self._sniff_clip)
+        except Exception as e:
+            messagebox.showwarning("扩展嗅探", "打开播放器失败：%s" % e)
+
     def _set_svc_label(self, text, ok=True):
         if not hasattr(self, "lbl_svc"):
             return
@@ -1758,7 +1940,28 @@ def main():
         root.call("tk", "scaling", 1.2)
     except Exception:
         pass
-    app = App(root, ext_service=("--selftest" not in sys.argv))
+    app = App(root, ext_service=("--selftest" not in sys.argv
+                                 and "--selftest-snifftab" not in sys.argv))
+    if "--selftest-snifftab" in sys.argv:
+        mod = load_web_server()
+        app._web_mod = mod
+        mod.register_sniff_items([
+            {"url": "https://cdn.example.com/v/master.m3u8", "kind": "hls",
+             "source": "网络请求", "title": "示例清单"},
+            {"url": "https://cdn.example.com/v/seg-1.ts", "kind": "ts", "source": "网络请求"},
+            {"url": "https://cdn.example.com/v/clip.mp4", "kind": "mp4", "size": 12345,
+             "source": "页面请求"},
+        ], page_url="https://example.com/watch")
+        app._sniff_refresh()
+        folded = len(app.sn_tree.get_children())
+        app.sn_fold.set(False)
+        app._sniff_refresh()
+        total = len(app.sn_tree.get_children())
+        assert folded == 2 and total == 3, (folded, total)
+        print(json.dumps({"ok": True, "folded": folded, "all": total}, ensure_ascii=False))
+        sys.stdout.flush()
+        root.destroy()
+        return
     if "--selftest" in sys.argv:
         print(json.dumps(app.build_cmd(["https://www.youtube.com/watch?v=TEST"]), ensure_ascii=False, indent=2))
         sys.stdout.flush()          # 退出前必须 flush，否则看不到输出（项目备忘）
