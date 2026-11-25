@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
+<title>yt-dlp 下载器</title>
+</head>
+<body>
+<h1>桥探针</h1>
+<pre id="out">等待…</pre>
+<script type="module" src="js/bridge.js"></script>
+<script type="module">
+import { call, ready, on } from './js/bridge.js';
+await ready;
+const r = await call('ping');
+document.getElementById('out').textContent = 'ping → ' + r;
+on('probe', ev => document.getElementById('out').textContent += ' / probe ' + ev.n);
+window.__probeDone = true;
+</script>
+</body>
+</html>
