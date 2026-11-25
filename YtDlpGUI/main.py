@@ -146,6 +146,17 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
     # ---------------- 界面 ----------------
+    def _dl_wheel(self, e):
+        # 滚轮：下载页内滚整页；Text / Treeview 保留自己的滚动，不被整页抢走
+        w = e.widget
+        while w is not None:
+            if w is self.dl_canvas:
+                self.dl_canvas.yview_scroll(int(-e.delta / 120) * 3, "units")
+                return
+            if isinstance(w, (tk.Text, ttk.Treeview)):
+                return
+            w = getattr(w, "master", None)
+
     def _build_ui(self):
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
@@ -157,11 +168,25 @@ class App:
         self.sn_page = ttk.Frame(self.nb)
         self.nb.add(self.dl_page, text="  下载  ")
         self.nb.add(self.sn_page, text="  扩展嗅探  ")
-        self.dl_page.columnconfigure(0, weight=1)
-        self.dl_page.rowconfigure(5, weight=1)
+        # 下载页内容约 1100px 高，小窗口装不下：整页包一层可滚动画布，
+        # 任何窗口高度都能滚到日志与结果表（以前直接被裁掉看不见）
+        self.dl_canvas = tk.Canvas(self.dl_page, highlightthickness=0, bd=0)
+        self.dl_vsb = ttk.Scrollbar(self.dl_page, orient="vertical", command=self.dl_canvas.yview)
+        self.dl_canvas.configure(yscrollcommand=self.dl_vsb.set)
+        self.dl_vsb.pack(side="right", fill="y")
+        self.dl_canvas.pack(side="left", fill="both", expand=True)
+        self.dl_inner = ttk.Frame(self.dl_canvas)
+        self.dl_win = self.dl_canvas.create_window((0, 0), window=self.dl_inner, anchor="nw")
+        self.dl_inner.bind("<Configure>",
+                           lambda e: self.dl_canvas.configure(scrollregion=self.dl_canvas.bbox("all")))
+        self.dl_canvas.bind("<Configure>",
+                            lambda e: self.dl_canvas.itemconfigure(self.dl_win, width=e.width))
+        self.root.bind_all("<MouseWheel>", self._dl_wheel)
+        self.dl_inner.columnconfigure(0, weight=1)
+        self.dl_inner.rowconfigure(5, weight=1)
 
         # 顶部
-        top = ttk.Frame(self.dl_page)
+        top = ttk.Frame(self.dl_inner)
         top.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
         ttk.Label(top, text="yt-dlp 下载器", font=("Microsoft YaHei UI", 13, "bold")).pack(side="left")
         ttk.Label(top, text=f"  yt-dlp: {self.cfg.get('yt_dlp_path') or find_tool('yt-dlp.exe')}",
@@ -175,7 +200,7 @@ class App:
         self.lbl_svc.pack(side="right", padx=(0, 14))
 
         # 主体：左右两列分区
-        body = ttk.Frame(self.dl_page)
+        body = ttk.Frame(self.dl_inner)
         body.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
         body.columnconfigure(0, weight=1)
         body.columnconfigure(1, weight=1)
@@ -197,7 +222,7 @@ class App:
         self._build_advanced(rcol, 3)
 
         # 按钮
-        bf = ttk.Frame(self.dl_page)
+        bf = ttk.Frame(self.dl_inner)
         bf.grid(row=2, column=0, sticky="ew", padx=10, pady=(6, 2))
         self.btn_start = ttk.Button(bf, text="开始下载", command=self.start_download)
         self.btn_start.pack(side="left", padx=(0, 6))
@@ -451,7 +476,7 @@ class App:
                                                           padx=6, pady=(0, 6))
 
     def _build_progress(self, row):
-        lf = ttk.LabelFrame(self.dl_page, text=" 下载进度 ")
+        lf = ttk.LabelFrame(self.dl_inner, text=" 下载进度 ")
         lf.grid(row=row, column=0, sticky="ew", padx=10, pady=(4, 2))
         lf.columnconfigure(0, weight=1)
         self.lbl_file = ttk.Label(lf, text="等待开始", font=FONT, foreground="#57606a")
@@ -473,7 +498,7 @@ class App:
         self._play_ok = False
 
     def _build_results(self, row):
-        lf = ttk.LabelFrame(self.dl_page, text=" 探测结果（点 ✓ 列勾选要下载的条目） ")
+        lf = ttk.LabelFrame(self.dl_inner, text=" 探测结果（点 ✓ 列勾选要下载的条目） ")
         lf.grid(row=row, column=0, sticky="nsew", padx=10, pady=(2, 2))
         lf.columnconfigure(0, weight=1)
         lf.rowconfigure(0, weight=1)
@@ -521,7 +546,7 @@ class App:
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
     def _build_log(self, row):
-        lf = ttk.LabelFrame(self.dl_page, text=" 运行日志 ")
+        lf = ttk.LabelFrame(self.dl_inner, text=" 运行日志 ")
         lf.grid(row=row, column=0, sticky="nsew", padx=10, pady=(2, 10))
         lf.columnconfigure(0, weight=1)
         lf.rowconfigure(0, weight=1)
@@ -1958,7 +1983,19 @@ def main():
         app._sniff_refresh()
         total = len(app.sn_tree.get_children())
         assert folded == 2 and total == 3, (folded, total)
-        print(json.dumps({"ok": True, "folded": folded, "all": total}, ensure_ascii=False))
+        # 下载页可滚性：小窗口里滚到底必须能看见完整日志（以前直接被裁掉）
+        app.nb.select(app.dl_page)
+        root.update_idletasks()
+        root.update()
+        app.dl_canvas.yview_moveto(1.0)
+        root.update_idletasks()
+        root.update()
+        log_h = app.log.winfo_height()
+        log_bottom = app.log.winfo_rooty() + log_h
+        assert log_h > 80 and log_bottom <= root.winfo_rooty() + root.winfo_height() + 2, \
+            (log_h, log_bottom)
+        print(json.dumps({"ok": True, "folded": folded, "all": total,
+                          "scroll_ok": True}, ensure_ascii=False))
         sys.stdout.flush()
         root.destroy()
         return
