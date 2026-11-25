@@ -90,5 +90,48 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("svc_url", env)
 
 
+class HistoryTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load_host()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.host = self.mod.Host(os.path.join(self.tmp.name, "config.json"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_record_defaults_and_roundtrip(self):
+        self.host.record_history({"urls": ["https://x/v"], "status": "ok", "code": 0})
+        again = self.mod.Host(self.host.config_file)
+        self.assertEqual(len(again.history), 1)
+        rec = again.history[0]
+        self.assertEqual(rec["status"], "ok")
+        self.assertEqual(rec["source"], "gui")
+        self.assertIn("ts", rec)
+
+    def test_fifo_cap_500(self):
+        for i in range(505):
+            self.host.record_history({"urls": ["u%d" % i], "status": "ok", "code": 0})
+        self.assertEqual(len(self.host.history), 500)
+        self.assertEqual(self.host.history[0]["urls"], ["u5"])
+
+    def test_list_newest_first(self):
+        self.host.record_history({"urls": ["a"], "status": "ok", "code": 0})
+        self.host.record_history({"urls": ["b"], "status": "failed", "code": 1})
+        self.assertEqual(self.host.history_list()[0]["urls"], ["b"])
+
+    def test_corrupt_file_falls_back_empty(self):
+        with open(self.host.history_file, "w", encoding="utf-8") as f:
+            f.write("{bad json")
+        again = self.mod.Host(self.host.config_file)
+        self.assertEqual(again.history, [])
+
+    def test_clear(self):
+        self.host.record_history({"urls": ["a"], "status": "ok", "code": 0})
+        self.host.history_clear()
+        self.assertEqual(self.host.history_list(), [])
+        again = self.mod.Host(self.host.config_file)
+        self.assertEqual(again.history, [])
+
+
 if __name__ == "__main__":
     unittest.main()

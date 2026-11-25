@@ -133,6 +133,34 @@ class Host:
             return True
         return False
 
-    # ---------------- 历史（Task 3 补全） ----------------
+    # ---------------- 下载历史 ----------------
     def _load_history(self):
-        return []
+        try:
+            with open(self.history_file, encoding="utf-8") as f:
+                data = json.load(f)
+            return [r for r in data if isinstance(r, dict)][-HISTORY_MAX:]
+        except Exception:
+            return []
+
+    def record_history(self, entry):
+        rec = {"ts": time.time(), "urls": [], "title": "", "outdir": "",
+               "status": "failed", "code": -1, "elapsed": 0, "done_count": 0,
+               "mode": "", "source": "gui"}
+        rec.update(entry or {})
+        self.history.append(rec)
+        del self.history[:-HISTORY_MAX]
+        try:
+            core.atomic_write_text(self.history_file,
+                                   json.dumps(self.history, ensure_ascii=False, indent=1))
+        except Exception:
+            pass
+
+    def history_list(self):
+        return list(reversed(self.history))
+
+    def history_clear(self):
+        self.history = []
+        try:
+            core.atomic_write_text(self.history_file, "[]")
+        except Exception:
+            pass
