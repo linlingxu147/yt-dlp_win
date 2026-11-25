@@ -397,5 +397,55 @@ class TestAria2cFallback(unittest.TestCase):
         self.assertEqual(warns, [])
 
 
+class TestCookieDatabaseFallback(unittest.TestCase):
+    """浏览器开着时 Chromium 会独占锁住自己的 Cookies 数据库（yt-dlp issue #7271）。
+
+    真实报错：ERROR: Could not copy Chrome cookie database.
+    读取必然失败，不能让整个下载跟着失败——先按「不带登录态」重试一次。
+    """
+
+    ERR = ("ERROR: Could not copy Chrome cookie database. See "
+           "https://github.com/yt-dlp/yt-dlp/issues/7271 for more info")
+
+    def test_copy_failure_is_recognised(self):
+        self.assertTrue(core.cookie_copy_failed(self.ERR))
+        self.assertFalse(core.cookie_copy_failed("HTTP Error 403: Forbidden"))
+
+    def test_copy_failure_shows_a_dedicated_diagnosis(self):
+        hits = core.diagnose(self.ERR)
+        self.assertTrue(hits, hits)
+        self.assertEqual(hits[0]["code"], "cookies")
+        self.assertIn("Cookies", hits[0]["title"])
+
+    def test_plan_drops_browser_cookies_exactly_once(self):
+        name, extra = core.next_cookie_plan(self.ERR, set(), {"browser": "edge"})
+        self.assertEqual(name, "no-cookie")
+        self.assertEqual(extra["browser"], "（不使用）")
+        self.assertIsNone(core.next_cookie_plan(self.ERR, {"no-cookie"}, {"browser": "edge"}))
+        self.assertIsNone(core.next_cookie_plan(self.ERR, set(), {"browser": ""}))
+
+    def test_plan_is_offered_before_the_network_ladder(self):
+        # 这不是网络问题，is_net_failure 认不出来，所以必须单独判一次
+        self.assertFalse(core.is_net_failure(self.ERR))
+
+    def test_sniff_jar_wins_over_the_browser_database(self):
+        with tempfile.TemporaryDirectory() as d:
+            jar = os.path.join(d, "sniff_cookies.txt")
+            with io.open(jar, "w", encoding="utf-8") as f:
+                f.write("# Netscape HTTP Cookie File\n")
+            cfg = dict(core.DEFAULT_CONFIG, browser="edge", browser_profile="Default",
+                       cookie=jar, _sniff_cookie_file=jar, outdir=d)
+            cmd = core.build_download_cmd(cfg, ["https://x/v.mp4"])
+        self.assertNotIn("--cookies-from-browser", cmd)
+        i = cmd.index("--cookies")
+        self.assertEqual(cmd[i + 1], jar)
+
+    def test_browser_database_still_used_when_no_jar_was_sniffed(self):
+        cfg = dict(core.DEFAULT_CONFIG, browser="edge", browser_profile="Default")
+        cmd = core.build_download_cmd(cfg, ["https://x/v.mp4"])
+        self.assertIn("--cookies-from-browser", cmd)
+        self.assertIn("edge:Default", cmd)
+
+
 if __name__ == "__main__":
     unittest.main()

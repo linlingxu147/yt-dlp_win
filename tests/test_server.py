@@ -353,5 +353,31 @@ class TestServiceLifecycle(unittest.TestCase):
             sys.stderr = saved
 
 
+class TestPortProbe(unittest.TestCase):
+    """Windows 上 SO_REUSEADDR 允许绑定别人已在监听的端口，先探一下才不会撞车。"""
+
+    def _listen(self):
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        self.addCleanup(s.close)
+        return s.getsockname()[1]
+
+    def test_listening_port_is_reported_as_taken(self):
+        self.assertTrue(server._port_taken(self._listen()))
+
+    def test_free_port_is_not_reported_as_taken(self):
+        port = self._listen()
+        self.assertFalse(server._port_taken(port + 1000))
+
+    def test_pick_port_refuses_the_port_someone_already_listens_on(self):
+        port = self._listen()
+        p, httpd, skipped = server.pick_port(port)
+        self.assertIsNone(p)
+        self.assertIsNone(httpd)
+        self.assertEqual(skipped, [port])
+
+
 if __name__ == "__main__":
     unittest.main()

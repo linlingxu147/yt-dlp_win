@@ -103,6 +103,7 @@ ERROR: [generic] 1: Unable to download webpage: HTTP Error 400: Bad Request
 
 ## 版本
 
+- **v1.7.2**：桌面版开着浏览器（Edge/Chrome）时，Chromium 会独占锁住 Cookies 数据库，以前扩展提交的任务会因 `Could not copy Chrome cookie database` 直接失败。现在扩展送来的 cookie 罐**优先于**浏览器直读（完全不碰数据库）；桌面版手工下载遇到这个错会自动脱掉登录态重试一次
 - **v1.7.0**：服务端改为可被桌面版内嵌——开着桌面版就能用扩展，不必再开一个黑框窗口（桌面版右上角显示「扩展服务：127.0.0.1:8765」，关窗口即停止）；服务端新增 `start_service()` / `Service.shutdown()`，独立模式（`启动.bat` / `python server.py`）行为不变
 - **v1.6.1**：分片不再刷屏——同一页嗅到 `.m3u8` / `.mpd` 清单后不再收后续 `.ts` / `.m4s` 分片，清单晚到会把先到的分片清掉；并发默认开 `-N 4`；没装 aria2c 时不再拼必然失败的 `--external-downloader`
 - **v1.6.0**：每条结果带缩略图、时长与试播（本机 ffmpeg 现场截帧 / 抓 6 秒片段），下载途中可「边下边播」；嗅探结果回流网页版

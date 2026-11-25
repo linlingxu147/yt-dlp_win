@@ -52,7 +52,8 @@ from ytdlp_core import (  # noqa: E402
     build_detect_cmd, build_formats_cmd, build_probe_cmd, PROBE_VARIANTS,
     spawn, iter_lines_watch, kill_tree, command_text,
     new_progress_state, progress_event, progress_text, classify_line,
-    is_net_failure, next_net_plan, NET_PLAN_LABEL,
+    is_net_failure, next_net_plan, next_cookie_plan,
+    NET_PLAN_LABEL, COOKIE_PLAN_LABEL,
 )
 # 桌面版的下拉框直接显示 UA 原文（核心按「名称 → UA」存放，顺序与原来一致）
 UA_PRESETS = list(core.UA_PRESETS.values())
@@ -968,15 +969,18 @@ class App:
         if not cfg.get("net_hard", True):
             return False
         tail = self.diag_buf or ""
-        if not is_net_failure(tail):
-            return False
         self.net_tried.add(self.net_name)
-        nxt = next_net_plan(tail, self.net_tried, cfg, url=self.dl_urls[0])
+        # 浏览器 Cookies 数据库被独占锁住：先脱掉登录态重试一次（公开内容不需要它）
+        nxt = next_cookie_plan(tail, self.net_tried, cfg)
+        if not nxt:
+            if not is_net_failure(tail):
+                return False
+            nxt = next_net_plan(tail, self.net_tried, cfg, url=self.dl_urls[0])
         if not nxt:
             return False
         self.net_name, extra = nxt
         self.log_line("[自动重试] 换用%s重试（已下载部分会续传）\n"
-                      % NET_PLAN_LABEL.get(self.net_name, self.net_name), "warn")
+                      % (NET_PLAN_LABEL.get(self.net_name) or COOKIE_PLAN_LABEL), "warn")
         cmd = self.build_cmd(self.dl_urls, no_playlist=self.dl_no_playlist,
                              cfg=dict(cfg, **extra))
         self.log_line("> " + command_text(cmd) + "\n", "cmd")

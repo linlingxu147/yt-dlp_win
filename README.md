@@ -189,6 +189,7 @@ yt-dlp_win\
 | `WinError 10054` 连接被重置 | 直连 → `--impersonate Chrome` + IPv4 → Edge 指纹 + `--http-chunk-size 10M` |
 | HTTP 400（带 Referer 被拒） | 去 Referer → 补 Origin/Accept → 指纹 + IPv4 → Edge 指纹 + 10M 分块 |
 | HTTP 403 / 需要登录 | 浏览器 cookies / UA / Referer / 通用提取器兜底（诊断面板可「一键应用修复」） |
+| 浏览器 Cookies 读不出来（`Could not copy Chrome cookie database`） | 脱掉浏览器登录态重试一次（公开内容照常能下）；登录态内容请关掉浏览器，或用扩展面板点下载 |
 
 重试会自动续传；手动点「停止」不会再触发重试；403/404/不支持的站点直接放弃，不浪费等待时间。
 「失败后自动换姿势重试」（配置项 `net_hard`，两边界面都有勾选框）可以整开关掉这套阶梯。
@@ -200,11 +201,11 @@ yt-dlp_win\
 ## 自测
 
 ```powershell
-# 核心逻辑单元测试（210 个用例：命令构建、进度解析、诊断规则、
+# 核心逻辑单元测试（223 个用例：命令构建、进度解析、诊断规则、
 # 重试阶梯、配置读写与类型校正、路径校验、SSE 分帧、Cookie 罐、看门狗、
 # 封面取图与公网校验、可播性探测、硬链接预览、边下边播不改命令、
 # 直链预览（ffmpeg 截帧/抓片段/时长）、嗅探条目登记与预览 token、
-# 分片识别、配置迁移到 v3、aria2c 缺失降级）
+# 分片识别、配置迁移到 v3、aria2c 缺失降级、浏览器 Cookies 被锁时的降级、端口占用探测）
 py -3 -m unittest discover -s tests
 
 # 桌面版命令构建自检（不打开窗口，打印将执行的命令）
@@ -238,6 +239,11 @@ node tests\extension_smoke.js
 - 边下边播不支持音视频分离的源与 aria2c；渐进式 mp4 要下完才能播。
 - 下载目录在 exFAT/FAT32 U 盘上时建不了硬链接，边下边播会置灰并说明原因。
 - 个别播放器以独占方式打开文件时可能挡住续写，遇到就换 VLC / PotPlayer。
+- 浏览器开着的时候，Chromium 系（Edge / Chrome）会**独占锁住自己的 Cookies 数据库**，
+  yt-dlp 复制不出来就会报 `Could not copy Chrome cookie database`（
+  [yt-dlp#7271](https://github.com/yt-dlp/yt-dlp/issues/7271)）。这不是本项目的 bug，
+  两条路：完全退出浏览器，或者改用扩展面板里的「下载」——扩展直接把本页 cookie 交给程序，
+  根本不碰那个数据库。程序也会自动降级重试一次，只是那一次不带登录态。
 - 播放器还占着预览链接时，Windows 会拒绝删除，`.preview\` 会留到下一个任务结束才清掉
   （只是空目录里的硬链接，不占额外空间，也不影响下载产物）。
 

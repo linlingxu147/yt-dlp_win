@@ -110,6 +110,14 @@ DIAG_RULES = [
       "勾选「通用提取器兜底」再试一次",
       "确认填的是具体视频页，而不是首页、频道页或搜索页"],
      {"generic": True}),
+    (r"(?i)could not copy \w*(?:\s+\w+)?\s*cookie database|"
+     r"failed to (?:copy|read|decrypt) .{0,24}cookie database|"
+     r"cookie database is locked",
+     "cookies", "浏览器 Cookies 读不出来（数据库被浏览器独占）",
+     ["这个浏览器的 Cookies 数据库正被它自己锁着：完全退出浏览器后重试最直接",
+      "更省事：用浏览器扩展面板里的「下载」——扩展直接把本页 cookie 交给本程序，不碰数据库",
+      "或者导出 cookies.txt，填到「Cookies 文件」"],
+     {}),
     (r"(?i)http error 403|forbidden|hotlink|防盗链|referer",
      "403", "被防盗链拦截（403）",
      ["填「Referer」为该站点域名，例如 https://www.example.com/",
@@ -1278,7 +1286,12 @@ def add_access_args(cmd, cfg):
     """
     browser = str(cfg.get("browser") or "（不使用）").strip()
     cookie_file = str(cfg.get("cookie") or "").strip()
-    if browser and browser != "（不使用）":
+    sniff_jar = str(cfg.get("_sniff_cookie_file") or "").strip()
+    if sniff_jar and os.path.exists(sniff_jar):
+        # 扩展刚把本页的 cookie 直接交过来：既是最新的，也不用去碰浏览器那个
+        # 被独占锁住的 Cookies 数据库（--cookies-from-browser 会因此直接失败）。
+        cmd += ["--cookies", sniff_jar]
+    elif browser and browser != "（不使用）":
         # 直接从浏览器读取登录态，省去手工导出 cookies.txt
         arg = browser
         if str(cfg.get("browser_profile") or "").strip():
@@ -1732,6 +1745,31 @@ NET_FAILURE_HINTS = (
     "timed out", "timeout", "temporary failure", "getaddrinfo",
     "proxy", "tunnel", "no route to host", "network is unreachable",
 )
+
+# 浏览器 Cookies 数据库被独占锁住：与网络无关，关掉浏览器能解决，但用户未必愿意。
+# 先去掉 --cookies-from-browser 重试一遍——公开内容不需要登录态，多半照常能下。
+COOKIE_COPY_RE = re.compile(
+    r"could not copy \w*(?:\s+\w+)?\s*cookie database|"
+    r"failed to (?:copy|read|decrypt) .{0,24}cookie database|"
+    r"cookie database is locked", re.I)
+COOKIE_PLAN_LABEL = "临时不用浏览器 Cookies（公开内容照常，需要登录态的内容得关掉浏览器或用扩展）"
+
+
+def cookie_copy_failed(text):
+    """失败原因是不是「读不出浏览器 Cookies 数据库」。"""
+    return bool(COOKIE_COPY_RE.search(str(text or "")))
+
+
+def next_cookie_plan(tail, tried, cfg=None):
+    """数据库被锁时给出一招「去掉浏览器读取」的重试计划；否则返回 None。"""
+    cfg = cfg or {}
+    if "no-cookie" in (tried or ()) or not cookie_copy_failed(tail):
+        return None
+    browser = str(cfg.get("browser") or "").strip()
+    if not browser or browser == "（不使用）":
+        return None
+    return "no-cookie", {"browser": "（不使用）", "browser_profile": ""}
+
 
 # HTTP 400 允许的重试次数：这类错误多半是请求头的问题，试两招就够，
 # 不设上限会让用户白等好几套 25 秒的方案。

@@ -28,6 +28,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import sys
 import tempfile
 import threading
@@ -48,7 +49,7 @@ INDEX_FILE = os.path.join(APP_DIR, "index.html")
 
 PORT_RANGE = core.PORT_RANGE
 APP_ID = "yt-dlp-web"          # 扩展靠它确认「端口上跑的是本项目」，而不是别的服务
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.7.2"
 
 # 唯一被放行的扩展 ID——由 sniffer_extension\manifest.json 里的 "key" 决定（打包后固定不变）。
 # 以前这里是「任何 chrome-extension:// 都放行」，等于让本机的其它扩展也能改配置、
@@ -109,7 +110,8 @@ from ytdlp_core import (  # noqa: E402
     NET_PLAN_LABEL, PROBE_VARIANTS, build_probe_cmd, classify_line, clean_media_url,
     clear_preview_links, command_text, diagnose, find_tool, fmt_is_separated,
     info_from_json, is_net_failure, iter_lines_watch, json_ok as _json_ok, kill_tree,
-    make_preview_link, new_progress_state, next_net_plan, parse_format_line, path_inside,
+    COOKIE_PLAN_LABEL, make_preview_link, new_progress_state, next_cookie_plan,
+    next_net_plan, parse_format_line, path_inside,
     probe_playable, progress_event, progress_text, real_download_path, sanitize_urls,
     scrub_header_value, spawn, unsafe_arg_in,
 )
@@ -394,7 +396,8 @@ def run_download(cfg, urls, emit, no_playlist=False, abort=None, keepalive=None)
             c = cfg if not extra else dict(cfg, **extra)
             if name != "normal":
                 emit({"type": "log", "level": "warn",
-                      "text": "[自动重试] 换用%s重试（已下载部分会续传）" % NET_PLAN_LABEL[name]})
+                      "text": "[自动重试] 换用%s重试（已下载部分会续传）"
+                              % (NET_PLAN_LABEL.get(name) or COOKIE_PLAN_LABEL)})
             code, tail, stopped, done_count = _download_attempt(
                 c, urls, emit, no_playlist, abort, outdir, keepalive)
             if code is None:          # 启动失败，launch 已自行上报
@@ -405,9 +408,12 @@ def run_download(cfg, urls, emit, no_playlist=False, abort=None, keepalive=None)
                       "diag": diagnose(tail) if code != 0 else []})
                 return
             tried.add(name)
-            # 用原始 cfg 推导 Origin：no-referer 那招已经把 referer 清空了
-            nxt = next_net_plan(tail, tried, cfg, url=urls[0]) if (
-                cfg.get("net_hard", True) and is_net_failure(tail)) else None
+            # 浏览器 Cookies 数据库被独占锁住：先脱掉登录态重试一次，
+            # 公开内容不需要它，读不出来不该让整个下载直接失败。
+            nxt = next_cookie_plan(tail, tried, cfg)
+            if not nxt and cfg.get("net_hard", True) and is_net_failure(tail):
+                # 用原始 cfg 推导 Origin：no-referer 那招已经把 referer 清空了
+                nxt = next_net_plan(tail, tried, cfg, url=urls[0])
             if not nxt:
                 emit({"type": "done", "code": code, "elapsed": round(time.time() - t0, 1),
                       "done_count": done_count, "diag": diagnose(tail)})
@@ -1404,6 +1410,10 @@ class Handler(BaseHTTPRequestHandler):
                     if path:
                         cfg["cookie"] = path
                         cfg["_sniff_cookie_file"] = path
+                        # 扩展已经把本页 cookie 直接交过来了：别再让 yt-dlp 去读
+                        # 浏览器那个大概率被独占锁住的 Cookies 数据库（读了必失败）。
+                        cfg["browser"] = "（不使用）"
+                        cfg["browser_profile"] = ""
                 if not cfg.get("cookie"):
                     # 兜底：只有 Cookie 头字符串（或临时文件没写成）时原样透传。
                     # 注意别截断：Cookie 少一段，站点照样判你没登录。
@@ -1553,11 +1563,33 @@ class Service:
             pass
 
 
+def _port_taken(port):
+    """端口上是否已经有人在监听。
+
+    ThreadingHTTPServer 默认 allow_reuse_address=1，而 Windows 的 SO_REUSEADDR
+    语义是「可以绑定别人已在监听的端口」——直接 bind 会静默抢同一个端口，
+    结果两个实例（比如桌面版和网页版）看起来都起来了，其实只有一个能收到请求。
+    所以先探一下，有人听就跳过。
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            return s.connect_ex((LISTEN_HOST, port)) == 0
+    except OSError:
+        return False
+
+
 def pick_port(port=None):
-    """占一个端口：优先用指定的，否则在 PORT_RANGE 里避让。返回 (port, 被占用的列表)。"""
+    """占一个端口：优先用指定的，否则在 PORT_RANGE 里避让。
+
+    返回 (port, httpd, 被占用的列表)；全被占满时 port 和 httpd 都是 None。
+    """
     ports = [port] if port else list(PORT_RANGE)
     skipped = []
     for p in ports:
+        if _port_taken(p):
+            skipped.append(p)
+            continue
         try:
             httpd = ThreadingHTTPServer((LISTEN_HOST, p), Handler)
             return p, httpd, skipped
