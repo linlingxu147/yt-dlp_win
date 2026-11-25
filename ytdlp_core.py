@@ -12,17 +12,23 @@
 约定：本模块只依赖标准库，绝不 import tkinter / http.server。
 """
 
+import hashlib
+import ipaddress
 import json
 import os
 import queue
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
+from urllib.parse import urlsplit
 
 # 本文件就在项目根目录：yt-dlp.exe / ffmpeg.exe / downloads 都相对它定位
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -354,6 +360,147 @@ _BARE_DOMAIN_RE = re.compile(r"^(?:[\w\-]+\.)+[A-Za-z]{2,}(?:[:/?#]\S*)?$")
 
 def is_http_url(url):
     return bool(re.match(r"^https?://\S+$", str(url or "").strip(), re.I))
+
+
+# ---------------- 封面预浏览 ----------------
+
+THUMB_CACHE_DIR = os.path.join(tempfile.gettempdir(), "ytdlp_thumbs")
+THUMB_MAX_BYTES = 2 * 1024 * 1024
+THUMB_TIMEOUT = 8
+_THUMB_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp")
+
+_PRIVATE_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10"))
+
+
+def is_public_http_url(url):
+    """封面地址必须是公网 http(s)。
+
+    站点可以在 -j 的 thumbnail 里塞一个指向 127.0.0.1 的地址，让本地服务替它探内网。
+    只看字面 IP 挡不住「公网域名解析到私网」，所以解析之后再判。
+    """
+    s = str(url or "").strip()
+    if not is_http_url(s):
+        return False
+    host = urlsplit(s).hostname
+    if not host or host.lower() in ("localhost", "localhost.localdomain"):
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split("%")[0])
+        except ValueError:
+            return False
+        if any(ip in net for net in _PRIVATE_NETS):
+            return False
+    return True
+
+
+def thumb_cache_path(url, cache_dir=None):
+    """同一 URL 永远落到同一个缓存文件；扩展名只认图片白名单。"""
+    d = cache_dir or THUMB_CACHE_DIR
+    ext = os.path.splitext(urlsplit(str(url or "")).path)[1].lower()
+    if ext not in _THUMB_EXTS:
+        ext = ".img"
+    return os.path.join(d, hashlib.sha1(str(url).encode("utf-8")).hexdigest() + ext)
+
+
+def thumb_headers(cfg):
+    """取图用与下载同一套凭据，否则防盗链站点会 403。"""
+    h = {}
+    ua = str(cfg.get("ua") or "").strip()
+    if ua:
+        h["User-Agent"] = ua
+    ref = str(cfg.get("referer") or "").strip()
+    if ref:
+        h["Referer"] = ref
+    for line in normalize_headers(cfg.get("headers")).splitlines():
+        name, _, value = line.partition(":")
+        if name.strip() and value.strip():
+            h[name.strip()] = value.strip()
+    cookie = scrub_header_value(cfg.get("cookie_header"))
+    if cookie.lower().startswith("cookie:"):
+        cookie = cookie[7:].strip()
+    if cookie:
+        h["Cookie"] = cookie
+    return h
+
+
+def fetch_thumb_via_ytdlp(url, cfg, cache_dir=None):
+    """兜底：让 yt-dlp 自己取封面。
+
+    urllib 拿不到浏览器 cookie 文件、也没有浏览器指纹；这两样正是本项目
+    对付 hostile 站点的看家本领，所以失败时复用现成通路再试一次。
+    """
+    d = cache_dir or THUMB_CACHE_DIR
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError as e:
+        return "", f"无法创建封面缓存目录：{e}"
+    cmd = [_exe(cfg), "--skip-download", "--write-thumbnail", "--no-write-info-json",
+           "-P", d, "-o", "thumb_%(id)s.%(ext)s"]
+    add_access_args(cmd, cfg)
+    cmd += ["--", str(url)]
+    try:
+        proc = spawn(cmd, d)
+        out, _ = proc.communicate(timeout=60)
+    except Exception as e:
+        return "", f"封面兜底取图失败：{e}"
+    if proc.returncode != 0:
+        tail = decode_bytes(out or b"").strip().splitlines()
+        return "", "封面兜底取图失败：%s" % (tail[-1] if tail else "yt-dlp 返回非零")
+    best, best_mtime = "", -1.0
+    try:
+        for name in os.listdir(d):
+            if not name.startswith("thumb_"):
+                continue
+            p = os.path.join(d, name)
+            if os.path.splitext(name)[1].lower() not in _THUMB_EXTS:
+                continue
+            m = os.path.getmtime(p)
+            if m > best_mtime:
+                best, best_mtime = p, m
+    except OSError:
+        pass
+    if not best:
+        return "", "站点没有提供封面"
+    return best, None
+
+
+def fetch_thumb(url, cfg, cache_dir=None, timeout=THUMB_TIMEOUT, max_bytes=THUMB_MAX_BYTES):
+    """取封面到本地缓存，返回 (本地路径, 失败原因)。永不向调用方抛异常。"""
+    if not is_public_http_url(url):
+        return "", "封面地址不是公网 http(s)，已拒绝"
+    path = thumb_cache_path(url, cache_dir)
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path, None
+    except OSError:
+        pass
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as e:
+        return "", f"无法创建封面缓存目录：{e}"
+    req = urllib.request.Request(str(url), headers=thumb_headers(cfg))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read(max_bytes + 1)
+    except Exception:
+        return fetch_thumb_via_ytdlp(url, cfg, cache_dir)
+    if len(data) > max_bytes:
+        return "", "封面超过 2 MB，已跳过"
+    if not data:
+        return "", "封面是空响应"
+    try:
+        with open(path, "wb") as f:
+            f.write(data)
+    except OSError as e:
+        return "", f"封面写盘失败：{e}"
+    return path, None
 
 
 def sanitize_urls(urls, allow_other=False):

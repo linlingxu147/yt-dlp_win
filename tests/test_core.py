@@ -823,5 +823,100 @@ class TestLocalhostGuards(unittest.TestCase):
         self.assertIn(".bat", server.OPEN_DENY_EXT)
 
 
+class TestThumbSafety(unittest.TestCase):
+    def test_public_https_ok(self):
+        with mock.patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]):
+            self.assertTrue(core.is_public_http_url("https://i.ytimg.com/vi/x/hqdefault.jpg"))
+
+    def test_non_http_schemes_rejected(self):
+        for u in ("file:///C:/a.jpg", "ftp://x/a.jpg", "blob:https://a/b", "data:image/png;base64,AA", ""):
+            self.assertFalse(core.is_public_http_url(u), u)
+
+    def test_literal_private_addresses_rejected(self):
+        for u in ("http://127.0.0.1/a.jpg", "http://10.1.2.3/a.jpg", "http://192.168.1.1/a.jpg",
+                  "http://172.16.0.1/a.jpg", "http://169.254.1.1/a.jpg", "http://[::1]/a.jpg",
+                  "http://localhost/a.jpg"):
+            self.assertFalse(core.is_public_http_url(u), u)
+
+    def test_public_hostname_resolving_to_private_rejected(self):
+        # 只看字面 IP 挡不住这一招：域名是公网的，解析结果指向本机
+        with mock.patch("socket.getaddrinfo", return_value=[(2, 1, 6, "", ("127.0.0.1", 0))]):
+            self.assertFalse(core.is_public_http_url("https://evil.example/a.jpg"))
+
+    def test_resolution_failure_rejected(self):
+        with mock.patch("socket.getaddrinfo", side_effect=OSError("no such host")):
+            self.assertFalse(core.is_public_http_url("https://nope.invalid/a.jpg"))
+
+    def test_cache_path_is_stable_and_extension_whitelisted(self):
+        u = "https://i.ytimg.com/vi/x/hqdefault.jpg"
+        a = core.thumb_cache_path(u, "C:/tmp/x")
+        b = core.thumb_cache_path(u, "C:/tmp/x")
+        self.assertEqual(a, b)
+        self.assertTrue(a.endswith(".jpg"))
+        self.assertEqual(core.thumb_cache_path("https://a/b?x=1", "C:/tmp/x")[-4:], ".img")
+
+    def test_headers_carry_access_credentials(self):
+        cfg = {"ua": "UA/1", "referer": "https://a.com/", "headers": "X-Token: abc",
+               "cookie_header": "Cookie: sid=1"}
+        h = core.thumb_headers(cfg)
+        self.assertEqual(h["User-Agent"], "UA/1")
+        self.assertEqual(h["Referer"], "https://a.com/")
+        self.assertEqual(h["X-Token"], "abc")
+        self.assertEqual(h["Cookie"], "sid=1")
+
+    def test_fetch_rejects_private_before_any_request(self):
+        with mock.patch("urllib.request.urlopen") as op:
+            path, err = core.fetch_thumb("http://127.0.0.1/a.jpg", {})
+        op.assert_not_called()
+        self.assertEqual(path, "")
+        self.assertTrue(err)
+
+    def test_fetch_cache_hit_skips_network(self):
+        with tempfile.TemporaryDirectory() as d:
+            u = "https://cdn.example/a.jpg"
+            p = core.thumb_cache_path(u, d)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(b"\xff\xd8\xff")
+            with mock.patch("ytdlp_core.is_public_http_url", return_value=True), \
+                 mock.patch("urllib.request.urlopen") as op:
+                path, err = core.fetch_thumb(u, {}, cache_dir=d)
+        op.assert_not_called()
+        self.assertEqual(path, p)
+        self.assertIsNone(err)
+
+    def test_fetch_size_cap(self):
+        big = b"x" * (core.THUMB_MAX_BYTES + 1)
+        resp = mock.MagicMock()
+        resp.read.return_value = big
+        resp.__enter__ = mock.Mock(return_value=resp)
+        resp.__exit__ = mock.Mock(return_value=False)
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch("ytdlp_core.is_public_http_url", return_value=True), \
+                 mock.patch("urllib.request.urlopen", return_value=resp):
+                path, err = core.fetch_thumb("https://cdn.example/a.jpg", {}, cache_dir=d)
+        self.assertEqual(path, "")
+        self.assertIn("2 MB", err)
+
+    def test_fetch_network_error_falls_back_to_ytdlp(self):
+        # 兜底会真起 yt-dlp 进程，测试里必须替身掉，否则单测会联网
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch("ytdlp_core.is_public_http_url", return_value=True), \
+                 mock.patch("urllib.request.urlopen", side_effect=OSError("reset")), \
+                 mock.patch("ytdlp_core.fetch_thumb_via_ytdlp",
+                            return_value=("", "兜底也失败")) as fb:
+                path, err = core.fetch_thumb("https://cdn.example/a.jpg", {}, cache_dir=d)
+        fb.assert_called_once()
+        self.assertEqual(path, "")
+        self.assertEqual(err, "兜底也失败")
+
+    def test_ytdlp_fallback_reports_reason_without_network(self):
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch("ytdlp_core.spawn", side_effect=OSError("no exe")):
+                path, err = core.fetch_thumb_via_ytdlp("https://cdn.example/a.jpg", {}, cache_dir=d)
+        self.assertEqual(path, "")
+        self.assertIn("no exe", err)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
