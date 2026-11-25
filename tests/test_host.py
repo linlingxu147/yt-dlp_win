@@ -235,5 +235,59 @@ class DownloadTest(unittest.TestCase):
         self.assertTrue(any(e.get("type") == "done" for e in emitted))
 
 
+class DetectTroubleTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load_host()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.events = []
+        self.host = self.mod.Host(os.path.join(self.tmp.name, "config.json"),
+                                  emit=self.events.append)
+        self.host.mark_ready()
+        self.cfg = dict(self.host.cfg)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_detect_collects_rows(self):
+        row = json.dumps({"id": "x", "title": "T", "duration": 60,
+                          "webpage_url": "https://x/v"})
+        with mock.patch.object(self.mod, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod, "iter_lines_watch", fake_iter([row])):
+            r = self.host.detect(["https://x/v"], self.cfg)
+            self.assertTrue(r["ok"], r)
+            self.host._worker.join(5)
+        self.host.pump_once()
+        self.assertEqual(len(self.host.results), 1)
+        self.assertEqual(self.host.results[0]["title"], "T")
+        self.assertTrue(any(e["type"] == "detdone" for e in self.events))
+
+    def test_formats_returns_lines_event(self):
+        with mock.patch.object(self.mod, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod, "iter_lines_watch",
+                               fake_iter(["ID EXT RES", "137 mp4 1080p"])):
+            r = self.host.fetch_formats("https://x/v", self.cfg)
+            self.assertTrue(r["ok"], r)
+            self.host._worker.join(5)
+        self.host.pump_once()
+        fmt = [e for e in self.events if e["type"] == "formats"]
+        self.assertEqual(fmt[0]["code"], 0)
+        self.assertIn("137 mp4 1080p", fmt[0]["lines"])
+
+    def test_copy_cmd_text(self):
+        r = self.host.copy_cmd(["https://x/v"], self.cfg)
+        self.assertTrue(r["ok"])
+        self.assertIn("yt-dlp", r["text"])
+
+    def test_trouble_applies_fix(self):
+        row = json.dumps({"id": "x", "title": "T"})
+        with mock.patch.object(self.mod, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod, "iter_lines_watch", fake_iter([row])):
+            r = self.host.troubleshoot(["https://x/v"], self.cfg)
+            self.assertTrue(r["ok"], r)
+            self.host._worker.join(5)
+        self.host.pump_once()
+        self.assertTrue(any(e["type"] == "trodone" for e in self.events))
+
+
 if __name__ == "__main__":
     unittest.main()

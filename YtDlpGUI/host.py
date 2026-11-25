@@ -116,6 +116,12 @@ class Host:
                 if t == "exttask":
                     self.start_external(ev["task"])
                     continue
+                if t == "detdone" and self.task_kind == "detect":
+                    self.on_detect_done(ev["code"])
+                    continue
+                if t == "trodone" and self.task_kind in ("trouble", "update"):
+                    self.on_trodone(ev["ok"], ev.get("task", "trouble"))
+                    continue
                 self.emit(ev)
         if logs:
             self.emit({"type": "logbatch", "items": logs})
@@ -470,3 +476,247 @@ class Host:
     def _set_playable(self, ok, reason):
         self._play_ok = bool(ok)
         self._put({"type": "playable", "ok": bool(ok), "reason": reason})
+
+    # ---------------- 探测 ----------------
+    def detect(self, urls, cfg):
+        if self.task_kind:
+            return self._busy()
+        good, _ = sanitize_urls(urls or [])
+        if not good:
+            return {"ok": False, "error": "没有可用的链接"}
+        self.save_config(cfg)
+        if not self._reserve("detect"):
+            return self._busy()
+        self.results = []
+        self.user_stopped = False
+        self._task_ev()
+        self._status("探测中…", "run")
+        cmd = build_detect_cmd(cfg, good)
+        self._log("> " + command_text(cmd) + "\n", "cmd")
+        self._worker = threading.Thread(target=self._detect_run, args=(cmd,), daemon=True)
+        self._worker.start()
+        return {"ok": True}
+
+    def _detect_run(self, cmd):
+        try:
+            proc = spawn(cmd, core.BASE_DIR)
+        except Exception as e:
+            self._log("启动失败：%s\n" % e, "err")
+            self._put({"type": "detdone", "code": -1})
+            return
+        self.proc = proc
+        buf = []
+        why = {}
+        try:
+            for line in iter_lines_watch(proc, abort=lambda: self.user_stopped,
+                                         stall_seconds=GUI_STALL_SECONDS, why=why):
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith("{"):
+                    try:
+                        info = info_from_json_raw(json.loads(line))
+                        self.results.append(info)
+                        self._put({"type": "detrow", "info": info})
+                        continue
+                    except Exception:
+                        pass
+                buf.append(line)
+                self._handle_line(line)
+        except Exception as e:
+            self._log("读取输出出错：%s\n" % e, "err")
+        if why.get("reason") == "stall":
+            self._log("[长时间没有输出，已自动停止探测]\n", "warn")
+        self.diag_buf = "\n".join(buf[-300:])
+        self.proc = None
+        self._put({"type": "detdone", "code": proc.wait()})
+
+    def on_detect_done(self, code):
+        self.task_kind = None
+        self._release_runner()
+        self._task_ev()
+        n = len(self.results)
+        if n:
+            self._status("探测完成 · %d 条" % n, "ok")
+            self._log("=== 探测完成：%d 条 ===\n" % n, "ok")
+        else:
+            self._status("探测结束，没有拿到条目", "err")
+            self._log("=== 探测结束，退出码 %s ===\n" % code, "err")
+            self._log_diag()
+        self._put({"type": "detdone", "code": code, "count": n})
+
+    # ---------------- 排障 ----------------
+    def troubleshoot(self, urls, cfg):
+        if self.task_kind:
+            return self._busy()
+        good, _ = sanitize_urls(urls or [])
+        if not good:
+            return {"ok": False, "error": "没有可用的链接"}
+        self.save_config(cfg)
+        if not self._reserve("trouble"):
+            return self._busy()
+        self.user_stopped = False
+        self._task_ev()
+        self._status("排障中…", "run")
+        self._log("=== 自动排障：依次尝试 4 套访问配置（每套最多 25 秒）===\n", "cmd")
+        self._worker = threading.Thread(target=self._trouble_run, args=(good[0], dict(cfg)),
+                                        daemon=True)
+        self._worker.start()
+        return {"ok": True}
+
+    def _trouble_run(self, url, cfg):
+        collected, hit = [], None
+        for key, label, fix in PROBE_VARIANTS:
+            if self.user_stopped:
+                self._log("[已取消，剩余方案未尝试]\n", "warn")
+                break
+            cmd = build_probe_cmd(cfg, url, key)
+            self._log("> " + command_text(cmd) + "\n", "cmd")
+            ok, msg, out = self._probe_once(cmd, timeout=25)
+            self._log(("✓ " if ok else "✗ ") + label + "：" + msg + "\n", "ok" if ok else "warn")
+            collected.append(out)
+            if ok:
+                hit = (label, fix, url)
+                break
+        if hit:
+            label, fix, u = hit
+            touched, manual = core.apply_probe_fix(cfg, u, fix)
+            self.save_config(cfg)
+            self._put({"type": "applyfix", "cfg": cfg, "touched": touched, "manual": manual})
+            self._log("=== 排障「%s」：已应用 %s ===\n" % (label, "、".join(touched) or "无"), "ok")
+        else:
+            diag = diagnose_pairs("\n".join(collected))
+            for title, advices in diag:
+                self._log("· " + title + "\n", "warn")
+                for a in advices:
+                    self._log("    - " + a + "\n", None)
+        self._put({"type": "trodone", "ok": 1 if hit else 0, "task": "trouble"})
+
+    def _probe_once(self, cmd, timeout=25):
+        try:
+            proc = spawn(cmd, core.BASE_DIR)
+        except Exception as e:
+            return False, "启动失败：" + str(e), ""
+        self.proc = proc
+        lines, timed_out = [], []
+        t0 = time.time()
+
+        def expired():
+            if self.user_stopped:
+                return True
+            if time.time() - t0 >= timeout:
+                timed_out.append(True)
+                return True
+            return False
+
+        got_json = False
+        try:
+            for line in iter_lines_watch(proc, abort=expired):
+                s = line.strip()
+                if not s:
+                    continue
+                lines.append(s)
+                if s.startswith("{") and core.json_ok(s):
+                    got_json = True
+                    break
+        finally:
+            if proc.poll() is None:
+                kill_tree(proc)
+            proc.wait()
+            self.proc = None
+        if got_json:
+            msg = "成功解析出条目"
+        elif timed_out:
+            msg = "超时 %ss" % timeout
+        elif self.user_stopped:
+            msg = "已取消"
+        else:
+            msg = lines[-1][:120] if lines else "无输出"
+        return got_json, msg, "\n".join(lines[-25:])
+
+    def on_trodone(self, ok, task):
+        self.task_kind = None
+        self._release_runner()
+        self._task_ev()
+        if task == "update":
+            self._status("更新完成" if ok else "更新失败", "ok" if ok else "err")
+        else:
+            self._status("排障完成 · 已找到可用方案" if ok else "排障结束 · 四套方案都失败",
+                         "ok" if ok else "err")
+        self._put({"type": "trodone", "ok": ok, "task": task})
+
+    # ---------------- 更新 ----------------
+    def update_ytdlp(self, proxy):
+        if self.task_kind:
+            return self._busy()
+        yt = self.cfg.get("yt_dlp_path") or find_tool("yt-dlp.exe")
+        cmd = [yt, "-U"]
+        if (proxy or "").strip():
+            cmd += ["--proxy", proxy.strip()]
+        if not self._reserve("update"):
+            return self._busy()
+        self.user_stopped = False
+        self._task_ev()
+        self._status("更新 yt-dlp…", "run")
+        self._log("> " + command_text(cmd) + "\n", "cmd")
+        self._worker = threading.Thread(target=self._update_run, args=(cmd,), daemon=True)
+        self._worker.start()
+        return {"ok": True}
+
+    def _update_run(self, cmd):
+        try:
+            proc = spawn(cmd, core.BASE_DIR)
+        except Exception as e:
+            self._log("启动失败：%s\n" % e, "err")
+            self._put({"type": "trodone", "ok": 0, "task": "update"})
+            return
+        self.proc = proc
+        code = -1
+        try:
+            for line in iter_lines_watch(proc, abort=lambda: self.user_stopped, keep_blank=True):
+                self._log(line + "\n", None)
+            code = proc.wait()
+        except Exception as e:
+            self._log("更新出错：%s\n" % e, "err")
+        finally:
+            self.proc = None
+        self._log("=== 更新完成，请重新探测 ===\n" if code == 0
+                  else "=== 更新失败，通常是网络/代理不通 ===\n", "ok" if code == 0 else "err")
+        self._put({"type": "trodone", "ok": 1 if code == 0 else 0, "task": "update"})
+
+    # ---------------- 格式表 ----------------
+    def fetch_formats(self, url, cfg):
+        if self.task_kind:
+            return self._busy()
+        good, _ = sanitize_urls([url])
+        if not good:
+            return {"ok": False, "error": "请先填写一个有效链接"}
+        if not self._reserve("formats"):
+            return self._busy()
+        self.user_stopped = False
+        self._task_ev()
+        cmd = build_formats_cmd(cfg, good[0])
+        self._worker = threading.Thread(target=self._formats_run, args=(cmd,), daemon=True)
+        self._worker.start()
+        return {"ok": True}
+
+    def _formats_run(self, cmd):
+        try:
+            proc = spawn(cmd, core.BASE_DIR)
+            self.proc = proc
+            out = list(iter_lines_watch(proc, abort=lambda: self.user_stopped,
+                                        keep_blank=True, stall_seconds=120))
+            code = proc.wait()
+        except Exception as e:
+            out, code = [str(e)], -1
+        self.proc = None
+        if self.task_kind == "formats":
+            self.task_kind = None
+            self._release_runner()
+            self._task_ev()
+        self._put({"type": "formats", "lines": out, "code": code})
+
+    def copy_cmd(self, urls, cfg):
+        good, _ = sanitize_urls(urls or [])
+        cmd = core.build_download_cmd(cfg, good)
+        return {"ok": True, "text": command_text(cmd)}
