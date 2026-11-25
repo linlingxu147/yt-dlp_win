@@ -178,7 +178,11 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 // ---------------- 本机服务端口发现 ----------------
 
+// 最近一次「端口有响应但把我们拒了」的状态码：用来区分「没起服务」和「服务不认这个扩展」
+let lastReject = 0;
+
 async function findPort() {
+    lastReject = 0;
     try {
         const st = await chrome.storage.local.get("server_port");
         if (st.server_port && await ping(st.server_port)) return st.server_port;
@@ -195,7 +199,11 @@ async function findPort() {
 async function ping(port) {
     try {
         const r = await fetch(`http://127.0.0.1:${port}/api/status`, { method: "GET" });
-        if (!r.ok) return false;
+        if (!r.ok) {
+            // 403 = 服务在跑，但 Origin 里的扩展 ID 不在服务端白名单里
+            lastReject = r.status;
+            return false;
+        }
         const data = await r.json();
         // 新版服务返回 app 标识；老版本只有 busy，仍然认它（升级过渡期不至于失联）
         if (data.app !== undefined) return data.app === APP_ID;
@@ -205,11 +213,18 @@ async function ping(port) {
     }
 }
 
+function serviceMissingHint() {
+    if (lastReject === 403) {
+        return "本机服务在跑，但拒绝了本扩展（HTTP 403）：扩展 ID 与服务端白名单不一致。"
+            + "请到扩展页确认加载的是本目录的 sniffer_extension，并点「重新加载」，然后刷新页面。";
+    }
+    return "找不到 yt-dlp 服务：请先开着桌面版（YtDlpGUI\\启动.bat，右上角应显示 127.0.0.1:8765），"
+        + "或运行 YtDlpWeb\\启动.bat。";
+}
+
 async function serverPost(path, body) {
     const port = await findPort();
-    if (!port) {
-        return { ok: false, error: "找不到 yt-dlp 服务（请先运行 YtDlpWeb\\启动.bat）" };
-    }
+    if (!port) return { ok: false, error: serviceMissingHint() };
     try {
         const r = await fetch(`http://127.0.0.1:${port}${path}`, {
             method: "POST",

@@ -1111,6 +1111,19 @@ def coerce_types(merged, warnings=None):
             merged[key] = bool(v) if v is not None else bool(DEFAULT_CONFIG.get(key))
 
 
+def _stderr_note(prefix, msg):
+    """往 stderr 打一行提示。pythonw（无控制台）下 stderr/stdout 都可能是 None，
+    这时静默跳过——提示没了可以接受，为一行日志把调用方炸掉不行。"""
+    try:
+        stream = getattr(sys, "stderr", None) or getattr(sys, "stdout", None)
+        if stream is None:
+            return
+        stream.write("%s%s\n" % (prefix, msg))
+        stream.flush()
+    except Exception:
+        pass
+
+
 def load_config(path, defaults=None, warn=None):
     """读配置：缺失/损坏时退回默认值，并把问题通过 warn 回调报出来。"""
     base = dict(defaults or DEFAULT_CONFIG)
@@ -1128,7 +1141,7 @@ def load_config(path, defaults=None, warn=None):
             if warn:
                 warn(msg)
             else:
-                print("[warn] " + msg, file=sys.stderr)
+                _stderr_note("[warn] ", msg)
             data = {}
     try:
         cfg, warnings = coerce_config(data, base)
@@ -1238,7 +1251,7 @@ def save_config(path, cfg, warn=None):
         if warn:
             warn(msg)
         else:
-            print("[err] " + msg, file=sys.stderr)
+            _stderr_note("[err] ", msg)
         return False
     for w in warnings:
         if warn:
@@ -1252,7 +1265,7 @@ def save_config(path, cfg, warn=None):
         if warn:
             warn(msg)
         else:
-            print("[err] " + msg, file=sys.stderr)
+            _stderr_note("[err] ", msg)
         return False
 
 

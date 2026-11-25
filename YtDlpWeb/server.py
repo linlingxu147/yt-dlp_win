@@ -48,7 +48,7 @@ INDEX_FILE = os.path.join(APP_DIR, "index.html")
 
 PORT_RANGE = core.PORT_RANGE
 APP_ID = "yt-dlp-web"          # 扩展靠它确认「端口上跑的是本项目」，而不是别的服务
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 
 # 唯一被放行的扩展 ID——由 sniffer_extension\manifest.json 里的 "key" 决定（打包后固定不变）。
 # 以前这里是「任何 chrome-extension:// 都放行」，等于让本机的其它扩展也能改配置、
@@ -978,8 +978,17 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "yt-dlp-web/%s" % (APP_VERSION,)
 
     def log_message(self, fmt, *args):
-        if "/api/" in (self.path or ""):
-            sys.stderr.write("%s %s\n" % (self.command, self.path))
+        # pythonw 启动时 sys.stderr 是 None（没有控制台），写入会抛 AttributeError。
+        # 这行日志只用于独立模式看访问记录，绝不能因为它让响应变成「空回复」。
+        if "/api/" not in (self.path or ""):
+            return
+        stream = getattr(sys, "stderr", None)
+        if stream is None:
+            return
+        try:
+            stream.write("%s %s\n" % (self.command, self.path))
+        except Exception:
+            pass
 
     def handle_one_request(self):
         """浏览器/SSE 客户端随时可能掐断连接：这类错误不值得打一整段 traceback。"""

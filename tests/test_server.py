@@ -4,6 +4,7 @@ server.py 不是包，用 importlib 按文件路径载入；载入本身没有�
 """
 import importlib.util
 import os
+import sys
 import threading
 import time
 import unittest
@@ -326,6 +327,30 @@ class TestServiceLifecycle(unittest.TestCase):
                 self.assertTrue(os.path.isdir(os.path.dirname(target)))
             finally:
                 server.set_config_file(old)
+
+
+    def test_status_still_answers_without_stderr(self):
+        """pythonw 启动时 sys.stderr 是 None：写日志失败绝不能把响应变成空回复。
+
+        这是真实踩过的坑——扩展报「找不到服务」，浏览器访问是 ERR_EMPTY_RESPONSE。
+        """
+        import json
+        import urllib.request
+
+        saved = sys.stderr
+        try:
+            sys.stderr = None
+            try:
+                svc = server.start_service()
+            except OSError as e:
+                self.skipTest("端口都被占用：%s" % e)
+            try:
+                body = json.loads(urllib.request.urlopen(svc.url + "/api/status", timeout=5).read())
+                self.assertEqual(body["app"], "yt-dlp-web")
+            finally:
+                svc.shutdown()
+        finally:
+            sys.stderr = saved
 
 
 if __name__ == "__main__":
