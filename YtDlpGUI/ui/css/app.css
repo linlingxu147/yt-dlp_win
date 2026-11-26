@@ -93,6 +93,7 @@ td { border-block-end: 1px solid var(--border); }
 td.ellipsis { max-inline-size: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 tr.checked td { color: var(--accent); }
 tr.seg td { color: var(--muted); }
+tr.audio td { color: var(--muted); }
 
 .preview img { max-inline-size: 320px; border-radius: 6px; }
 

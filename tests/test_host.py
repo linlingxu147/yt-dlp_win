@@ -157,7 +157,9 @@ class DownloadTest(unittest.TestCase):
         self.host = self.mod.Host(os.path.join(self.tmp.name, "config.json"),
                                   emit=self.events.append)
         self.host.mark_ready()
-        self.cfg = dict(self.host.cfg, outdir=os.path.join(self.tmp.name, "out"))
+        # 测试不许真的弹资源管理器：临时目录随后会被删，Explorer 会留下「位置不可用」弹窗
+        self.cfg = dict(self.host.cfg, outdir=os.path.join(self.tmp.name, "out"),
+                        open_after=False)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -283,10 +285,90 @@ class DetectTroubleTest(unittest.TestCase):
         self.assertEqual(fmt[0]["code"], 0)
         self.assertIn("137 mp4 1080p", fmt[0]["lines"])
 
+    COOKIE_ERR = ("ERROR: Could not copy Chrome cookie database. "
+                  "See https://github.com/yt-dlp/yt-dlp/issues/7271 for more info")
+
+    def _cookie_cfg(self):
+        return dict(self.cfg, browser="edge", browser_profile="Default")
+
+    def _iter_queue(self, batches):
+        queue = list(batches)
+
+        def it(proc, abort=None, keepalive=None, **kw):
+            for ln in queue.pop(0):
+                yield ln
+        return it
+
+    def test_detect_retries_without_cookies_when_db_locked(self):
+        row = json.dumps({"id": "x", "title": "T", "webpage_url": "https://x/v"})
+        calls = []
+
+        def spawn2(cmd, cwd=None):
+            calls.append(cmd)
+            return FakeProc(1 if len(calls) == 1 else 0)
+
+        it = self._iter_queue([[self.COOKIE_ERR], [row]])
+        with mock.patch.object(self.mod, "spawn", side_effect=spawn2), \
+             mock.patch.object(self.mod, "iter_lines_watch", it):
+            r = self.host.detect(["https://x/v"], self._cookie_cfg())
+            self.assertTrue(r["ok"], r)
+            self.host._worker.join(5)
+        self.host.pump_once()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--cookies-from-browser", calls[0])
+        self.assertNotIn("--cookies-from-browser", calls[1])
+        self.assertEqual(len(self.host.results), 1)
+        done = [e for e in self.events if e["type"] == "detdone"]
+        self.assertEqual(done[-1]["code"], 0)
+        logs = " ".join(i["text"] for b in self.events if b["type"] == "logbatch"
+                        for i in b["items"])
+        self.assertIn("自动重试", logs)
+
+    def test_formats_retries_without_cookies_when_db_locked(self):
+        calls = []
+
+        def spawn2(cmd, cwd=None):
+            calls.append(cmd)
+            return FakeProc(1 if len(calls) == 1 else 0)
+
+        it = self._iter_queue([[self.COOKIE_ERR],
+                               ["ID EXT RES", "137 mp4 1080p"]])
+        with mock.patch.object(self.mod, "spawn", side_effect=spawn2), \
+             mock.patch.object(self.mod, "iter_lines_watch", it):
+            r = self.host.fetch_formats("https://x/v", self._cookie_cfg())
+            self.assertTrue(r["ok"], r)
+            self.host._worker.join(5)
+        self.host.pump_once()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--cookies-from-browser", calls[0])
+        self.assertNotIn("--cookies-from-browser", calls[1])
+        fmt = [e for e in self.events if e["type"] == "formats"][-1]
+        self.assertEqual(fmt["code"], 0)
+        self.assertIn("137 mp4 1080p", fmt["lines"])
+
     def test_copy_cmd_text(self):
         r = self.host.copy_cmd(["https://x/v"], self.cfg)
         self.assertTrue(r["ok"])
         self.assertIn("yt-dlp", r["text"])
+
+    def test_cookie_lock_line_becomes_one_warning(self):
+        err = ("ERROR: Could not copy Chrome cookie database. See "
+               "https://github.com/yt-dlp/yt-dlp/issues/7271 for more info")
+        self.host._handle_line(err)
+        self.host._handle_line(err)
+        self.host.pump_once()
+        logs = [i for b in self.events if b["type"] == "logbatch"
+                for i in b["items"]]
+        hits = [i for i in logs if "浏览器 Cookies" in i["text"]]
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["tag"], "warn")
+
+    def test_other_error_lines_stay_red(self):
+        self.host._handle_line("ERROR: unable to download: HTTP Error 403")
+        self.host.pump_once()
+        logs = [i for b in self.events if b["type"] == "logbatch"
+                for i in b["items"]]
+        self.assertTrue(any(i["tag"] == "err" for i in logs))
 
     def test_trouble_applies_fix(self):
         row = json.dumps({"id": "x", "title": "T"})

@@ -389,6 +389,30 @@ class TestSegmentRecognition(unittest.TestCase):
             self.assertFalse(core.looks_like_manifest(url), url)
 
 
+class TestAudioRecognition(unittest.TestCase):
+    """B 站 DASH 音频轨是单条 m4s（302xx），嗅探列表要能单独标注/隐藏。"""
+
+    def test_bilibili_audio_streams(self):
+        for url in ("https://x/43630595935-1-30280.m4s",
+                    "https://x/43736042152_qe1-1-30216.m4s?token=1",
+                    "https://x/a-30232.m4s#t=1",
+                    "https://x/a_30251.m4s"):
+            self.assertTrue(core.looks_like_audio(url), url)
+
+    def test_plain_audio_extensions(self):
+        for url in ("https://x/a.m4a", "https://x/a.MP3?x=1", "https://x/a.aac",
+                    "https://x/a.flac", "https://x/a.wav", "https://x/a.opus"):
+            self.assertTrue(core.looks_like_audio(url), url)
+
+    def test_video_and_manifests_are_not_audio(self):
+        for url in ("https://x/43630595935-1-100026.m4s",
+                    "https://x/a-30080.m4s", "https://x/a.mp4",
+                    "https://x/p.m3u8", "https://x/a.ts",
+                    "https://data.bilibili.com/log/web?x=.m4s",
+                    "", "not a url"):
+            self.assertFalse(core.looks_like_audio(url), url)
+
+
 class TestConcurrencyDefaults(unittest.TestCase):
     """-N 4 是实测甜点（本机 4.88→6.36 MiB/s，再高反而回落）。"""
 

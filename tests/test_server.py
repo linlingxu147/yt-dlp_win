@@ -130,6 +130,17 @@ class TestSniffItems(unittest.TestCase):
         self.assertFalse(got["https://cdn/a.mp4"]["seg"])
         self.assertFalse(got["https://cdn/a.mp4"]["manifest"])
 
+    def test_audio_flag_follows_core_rules(self):
+        server.register_sniff_items([
+            {"url": "https://x/a-1-30280.m4s"},
+            {"url": "https://x/a-1-100026.m4s"},
+            {"url": "https://x/a.mp3"},
+        ])
+        got = {it["url"]: it for it in server.sniff_items_json()["items"]}
+        self.assertTrue(got["https://x/a-1-30280.m4s"]["audio"])
+        self.assertFalse(got["https://x/a-1-100026.m4s"]["audio"])
+        self.assertTrue(got["https://x/a.mp3"]["audio"])
+
 
 class TestPreviewTokens(unittest.TestCase):
     def setUp(self):

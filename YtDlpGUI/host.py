@@ -63,6 +63,7 @@ class Host:
         self.net_tried = set()
         self.net_name = "normal"
         self.diag_buf = ""
+        self.cookie_warned = False
         self.results = []
         self._play_raw = ""
         self._play_ok = False
@@ -242,6 +243,7 @@ class Host:
         self.dl_urls, self.dl_no_playlist, self.dl_outdir = list(urls), no_playlist, outdir
         self.dl_source = source
         self.net_tried, self.net_name = set(), "normal"
+        self.cookie_warned = False
         self.user_stopped = False
         self.running = True
         self.pstate = new_progress_state()
@@ -287,6 +289,7 @@ class Host:
         self.dl_outdir = outdir
         self.dl_source = task.get("source") or "ext"
         self.net_tried, self.net_name = set(), "normal"
+        self.cookie_warned = False
         self.user_stopped = False
         self.running = True
         self.task_kind = "download"
@@ -352,6 +355,14 @@ class Host:
                 self._log(progress_text(st) + "\n", "prog")
             return
         tag = classify_line(line)
+        if core.cookie_copy_failed(line):
+            # 浏览器锁库是可预期的首次失败，随后会自动去掉 Cookies 重试；
+            # 按错误红字展示只会吓人（yt-dlp 还会重复打印两遍），压成一条黄色提示。
+            if not self.cookie_warned:
+                self.cookie_warned = True
+                self._log("[提示] 浏览器 Cookies 数据库被占用（浏览器可能正开着），"
+                          "已忽略 Cookies 继续\n", "warn")
+            return
         self._log(line + "\n", tag)
 
     def stop(self):
@@ -570,48 +581,64 @@ class Host:
         if not self._reserve("detect"):
             return self._busy()
         self.results = []
+        self.cookie_warned = False
         self.user_stopped = False
         self._task_ev()
         self._status("探测中…", "run")
         cmd = build_detect_cmd(cfg, good)
         self._log("> " + command_text(cmd) + "\n", "cmd")
-        self._worker = threading.Thread(target=self._detect_run, args=(cmd,), daemon=True)
+        self._worker = threading.Thread(target=self._detect_run,
+                                        args=(cmd, cfg, good), daemon=True)
         self._worker.start()
         return {"ok": True}
 
-    def _detect_run(self, cmd):
-        try:
-            proc = spawn(cmd, core.BASE_DIR)
-        except Exception as e:
-            self._log("启动失败：%s\n" % e, "err")
-            self._put({"type": "detdone", "code": -1})
-            return
-        self.proc = proc
-        buf = []
-        why = {}
-        try:
-            for line in iter_lines_watch(proc, abort=lambda: self.user_stopped,
-                                         stall_seconds=GUI_STALL_SECONDS, why=why):
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("{"):
-                    try:
-                        info = info_from_json_raw(json.loads(line))
-                        self.results.append(info)
-                        self._put({"type": "detrow", "info": info})
+    def _detect_run(self, cmd, cfg, urls):
+        retried = False
+        while True:
+            why = {}
+            try:
+                proc = spawn(cmd, core.BASE_DIR)
+            except Exception as e:
+                self._log("启动失败：%s\n" % e, "err")
+                self._put({"type": "detdone", "code": -1})
+                return
+            self.proc = proc
+            buf = []
+            try:
+                for line in iter_lines_watch(proc, abort=lambda: self.user_stopped,
+                                             stall_seconds=GUI_STALL_SECONDS, why=why):
+                    line = line.strip()
+                    if not line:
                         continue
-                    except Exception:
-                        pass
-                buf.append(line)
-                self._handle_line(line)
-        except Exception as e:
-            self._log("读取输出出错：%s\n" % e, "err")
-        if why.get("reason") == "stall":
-            self._log("[长时间没有输出，已自动停止探测]\n", "warn")
-        self.diag_buf = "\n".join(buf[-300:])
-        self.proc = None
-        self._put({"type": "detdone", "code": proc.wait()})
+                    if line.startswith("{"):
+                        try:
+                            info = info_from_json_raw(json.loads(line))
+                            self.results.append(info)
+                            self._put({"type": "detrow", "info": info})
+                            continue
+                        except Exception:
+                            pass
+                    buf.append(line)
+                    self._handle_line(line)
+            except Exception as e:
+                self._log("读取输出出错：%s\n" % e, "err")
+            if why.get("reason") == "stall":
+                self._log("[长时间没有输出，已自动停止探测]\n", "warn")
+            self.diag_buf = "\n".join(buf[-300:])
+            self.proc = None
+            code = proc.wait()
+            if not retried and not self.user_stopped and not self.results:
+                nxt = next_cookie_plan(self.diag_buf, set(), cfg)
+                if nxt:
+                    self._log("[自动重试] 换用%s…\n" % COOKIE_PLAN_LABEL, "warn")
+                    cfg = dict(cfg, **nxt[1])
+                    cmd = build_detect_cmd(cfg, urls)
+                    self._log("> " + command_text(cmd) + "\n", "cmd")
+                    self._status("探测中…（自动重试）", "run")
+                    retried = True
+                    continue
+            break
+        self._put({"type": "detdone", "code": code})
 
     def on_detect_done(self, code):
         self.task_kind = None
@@ -778,20 +805,33 @@ class Host:
         self.user_stopped = False
         self._task_ev()
         cmd = build_formats_cmd(cfg, good[0])
-        self._worker = threading.Thread(target=self._formats_run, args=(cmd,), daemon=True)
+        self._worker = threading.Thread(target=self._formats_run,
+                                        args=(cmd, cfg, good[0]), daemon=True)
         self._worker.start()
         return {"ok": True}
 
-    def _formats_run(self, cmd):
-        try:
-            proc = spawn(cmd, core.BASE_DIR)
-            self.proc = proc
-            out = list(iter_lines_watch(proc, abort=lambda: self.user_stopped,
-                                        keep_blank=True, stall_seconds=120))
-            code = proc.wait()
-        except Exception as e:
-            out, code = [str(e)], -1
-        self.proc = None
+    def _formats_run(self, cmd, cfg, url):
+        retried = False
+        while True:
+            try:
+                proc = spawn(cmd, core.BASE_DIR)
+                self.proc = proc
+                out = list(iter_lines_watch(proc, abort=lambda: self.user_stopped,
+                                            keep_blank=True, stall_seconds=120))
+                code = proc.wait()
+            except Exception as e:
+                out, code = [str(e)], -1
+            self.proc = None
+            if code != 0 and not retried and not self.user_stopped:
+                nxt = next_cookie_plan("\n".join(out[-300:]), set(), cfg)
+                if nxt:
+                    self._log("[自动重试] 换用%s…\n" % COOKIE_PLAN_LABEL, "warn")
+                    cfg = dict(cfg, **nxt[1])
+                    cmd = build_formats_cmd(cfg, url)
+                    self._log("> " + command_text(cmd) + "\n", "cmd")
+                    retried = True
+                    continue
+            break
         if self.task_kind == "formats":
             self.task_kind = None
             self._release_runner()

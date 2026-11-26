@@ -22,6 +22,7 @@
     const items = {};          // url -> {url, kind, size, source}
     const HOST_ID = "ytdlp-sniff-host";
     let host = null, root = null, panel = null, listEl = null, statusEl = null, badge = null, polling = null;
+    let showAudio = false, audioCb = null, audioText = null;
     let playerEl = null, playerTitle = null, playWhileBtn = null;
     const previewCache = {};     // url -> {done, ok, native, duration, thumb, clip, error}
     const thumbQueue = [];
@@ -67,6 +68,7 @@
             kind: kind || guessKind(url),
             size: size || 0,
             source: source || "",
+            audio: isAudioStream(url),
             ts: Date.now(),
         };
         const keys = Object.keys(items);
@@ -195,8 +197,10 @@
             border-radius: 10px; box-shadow: 0 4px 18px rgba(0,0,0,.25);
             padding: 8px;
         }
-        #head { display: flex; justify-content: space-between; align-items: center; margin: 2px 4px 6px; }
+        #head { display: flex; flex-wrap: wrap; gap: 4px; justify-content: space-between; align-items: center; margin: 2px 4px 6px; }
         #head b { font-size: 12px; font-weight: 600; }
+        #audioToggle { display: flex; align-items: center; gap: 3px; color: #57606a;
+                       font-size: 11px; cursor: pointer; white-space: nowrap; }
         #pageBtn { border: 1px solid #d0d7de; background: #f6f8fa; border-radius: 6px;
                    padding: 3px 10px; cursor: pointer; font-size: 12px; color: #1f2328; }
         #stopBtn { display: none; border: 1px solid #cf222e; background: #ffebe9; color: #cf222e;
@@ -204,6 +208,7 @@
         .row { display: flex; align-items: center; gap: 8px; padding: 4px; border-bottom: 1px solid #f0f0f0; }
         .tag { flex: none; background: #ddf4ff; color: #0969da; border-radius: 4px;
                padding: 0 6px; font-size: 11px; min-width: 34px; text-align: center; }
+        .tag.audio { background: #fff8c5; color: #9a6700; }
         .label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #1f2328; }
         .dl { flex: none; border: 1px solid #1f883d; background: #2da44e; color: #fff;
               border-radius: 6px; padding: 2px 10px; cursor: pointer; font-size: 12px; }
@@ -270,6 +275,22 @@
         verEl.setAttribute("style", "color:#8b949e;font-weight:400;font-size:11px");
         titleEl.appendChild(verEl);
         head.appendChild(titleEl);
+        const audioWrap = document.createElement("label");
+        audioWrap.id = "audioToggle";
+        audioWrap.title = "默认隐藏音频单轨（如 B 站 30280 m4s）；勾选后显示";
+        audioCb = document.createElement("input");
+        audioCb.type = "checkbox";
+        audioCb.checked = showAudio;
+        audioCb.addEventListener("change", () => {
+            showAudio = audioCb.checked;
+            try { chrome.storage.local.set({ sniff_show_audio: showAudio }); } catch (e) { /* ignore */ }
+            render();
+        });
+        audioText = document.createElement("span");
+        audioText.textContent = " 显示音频 (0)";
+        audioWrap.appendChild(audioCb);
+        audioWrap.appendChild(audioText);
+        head.appendChild(audioWrap);
         const pageBtn = document.createElement("button");
         pageBtn.id = "pageBtn";
         pageBtn.textContent = "下载本页（yt-dlp）";
@@ -348,6 +369,13 @@
 
         wrap.appendChild(panel);
         root.appendChild(wrap);
+        try {
+            chrome.storage.local.get({ sniff_show_audio: false }, (r) => {
+                showAudio = !!(r && r.sniff_show_audio);
+                if (audioCb) audioCb.checked = showAudio;
+                render();
+            });
+        } catch (e) { /* ignore */ }
     }
 
     // 挂载 + 自愈：document.write / SPA 换掉 <html> 时重新挂回去
@@ -527,8 +555,13 @@
         if (badge) badge.textContent = String(keys.length);
         lastCount = keys.length;
         syncCount(true);
+        if (audioText) {
+            const n = keys.filter((k) => items[k].audio).length;
+            audioText.textContent = " 显示音频 (" + n + ")";
+        }
         listEl.textContent = "";
-        for (const k of keys) {
+        const visible = keys.filter((k) => showAudio || !items[k].audio);
+        for (const k of visible) {
             const it = items[k];
             const row = document.createElement("div");
             row.className = "row";
@@ -543,7 +576,10 @@
 
             const kindTag = document.createElement("span");
             kindTag.className = "tag";
-            kindTag.textContent = String(it.kind || "media").toUpperCase().slice(0, 5);
+            if (it.audio) kindTag.classList.add("audio");
+            kindTag.textContent = it.audio
+                ? "音频"
+                : String(it.kind || "media").toUpperCase().slice(0, 5);
             row.appendChild(kindTag);
 
             const label = document.createElement("span");
@@ -572,10 +608,12 @@
             listEl.appendChild(row);
             observeThumb(thumb, it);
         }
-        if (!keys.length) {
+        if (!visible.length) {
             const empty = document.createElement("div");
             empty.id = "empty";
-            empty.textContent = "暂未发现媒体——播放一下视频试试";
+            empty.textContent = keys.length && !showAudio
+                ? "只发现音频单轨（已隐藏）；勾选「显示音频」可查看"
+                : "暂未发现媒体——播放一下视频试试";
             listEl.appendChild(empty);
         }
     }

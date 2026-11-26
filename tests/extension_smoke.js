@@ -141,6 +141,19 @@ function fire(listeners, name, ...args) {
   assert.ok(seen.some(([m, u]) => m === 'POST' && u.includes('/api/sniff')), '旧版服务也能提交');
   log('5) 旧版服务（无 app 字段）回退成功');
 
-  console.log('\nOK  扩展冒烟全部通过（5 项）');
+  // ---- 6) 音频流识别（content 脚本公共 helper） ----
+  const audioSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'sniffer_extension', 'audio_stream.js'), 'utf8');
+  const audioBox = {};
+  vm.createContext(audioBox);
+  vm.runInContext(audioSrc, audioBox, { filename: 'audio_stream.js' });
+  assert.ok(audioBox.isAudioStream('https://x/a-1-30280.m4s'), 'B 站 30280 是音频');
+  assert.ok(audioBox.isAudioStream('https://x/a.mp3?x=1'), 'mp3 后缀是音频');
+  assert.ok(!audioBox.isAudioStream('https://x/a-1-100026.m4s'), 'B 站视频 m4s 不是音频');
+  assert.ok(!audioBox.isAudioStream('https://data.bilibili.com/log/web?x=.m4s'),
+            '只在查询参数里出现 .m4s 的日志地址不算');
+  log('6) 音频流识别通过（302xx / 音频后缀）');
+
+  console.log('\nOK  扩展冒烟全部通过（6 项）');
   process.exit(0);
 })().catch((e) => { console.error('FAIL', e && e.message); process.exit(1); });

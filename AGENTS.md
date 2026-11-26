@@ -14,7 +14,7 @@
 ## 测试
 
 - `py -3 -m unittest discover -s tests -v`（标准库 unittest，无第三方测试依赖）
-- `node tests/extension_smoke.js`（扩展冒烟 5/5）
+- `node tests/extension_smoke.js`（扩展冒烟 6/6）
 - 测试端口避开 8765–8775（如 `--port 8799`），避免抢占正在使用的实例。
 
 ## 提交

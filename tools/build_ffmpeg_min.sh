@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 自编译最小 ffmpeg（静态、LGPL），只保留本项目的合并/封装、截帧、片段、mp3 提取能力。
+# 自编译最小 ffmpeg / ffprobe（静态、LGPL），只保留本项目的合并/封装、截帧、片段、mp3 提取能力。
 # 须在 MSYS2 MINGW64 环境运行，先安装：
 #   pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-lame \
 #            mingw-w64-x86_64-zlib mingw-w64-x86_64-libxml2 mingw-w64-x86_64-pkgconf \
@@ -46,7 +46,7 @@ make distclean >/dev/null 2>&1 || true
   --arch=x86_64 --target-os=mingw32 \
   --enable-static --disable-shared \
   --disable-everything \
-  --enable-ffmpeg --disable-ffplay --disable-ffprobe \
+  --enable-ffmpeg --enable-ffprobe --disable-ffplay \
   --disable-doc --disable-debug --disable-autodetect --enable-small \
   --extra-ldflags=-static \
   --enable-network --enable-zlib --enable-schannel \
@@ -64,9 +64,10 @@ make distclean >/dev/null 2>&1 || true
   --enable-swscale --enable-swresample
 
 make -j"$JOBS"
-strip -s ffmpeg.exe
-cp -f ffmpeg.exe "$REPO_ROOT/ffmpeg.exe"
+strip -s ffmpeg.exe ffprobe.exe
+cp -f ffmpeg.exe ffprobe.exe "$REPO_ROOT/"
 
 echo "---"
 "$REPO_ROOT/ffmpeg.exe" -version | head -1
-ls -l "$REPO_ROOT/ffmpeg.exe"
+"$REPO_ROOT/ffprobe.exe" -version | head -1
+ls -l "$REPO_ROOT/ffmpeg.exe" "$REPO_ROOT/ffprobe.exe"

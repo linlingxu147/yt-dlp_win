@@ -666,6 +666,10 @@ SNIFF_CLIP_SECONDS = 6
 # （多数还要 key 解密），嗅探结果里要能认出来、别和「完整视频」混在一起。
 SEGMENT_EXT = (".ts", ".m4s", ".f4v", ".m2ts")
 MANIFEST_EXT = (".m3u8", ".mpd")
+# B 站 DASH 的音频轨是独立 m4s，流 ID 落在 302xx（30216/30232/30280…）；
+# 视频轨是 100026/30080 这类。嗅探列表默认要把音频轨藏起来，避免只下到音轨。
+BILI_AUDIO_RE = re.compile(r"[-_]302\d{2}\.m4s$", re.I)
+AUDIO_EXT = (".m4a", ".mp3", ".aac", ".flac", ".wav", ".opus")
 SNIFF_FRAME_TIMEOUT = 40
 SNIFF_CLIP_TIMEOUT = 90
 
@@ -724,6 +728,15 @@ def looks_like_segment(url):
     except Exception:
         return False
     return os.path.splitext(path)[1] in SEGMENT_EXT
+
+
+def looks_like_audio(url):
+    """这是不是音频单轨：B 站 DASH 音频流（302xx m4s）或明确的音频后缀。"""
+    try:
+        path = urlsplit(url).path
+    except Exception:
+        return False
+    return bool(BILI_AUDIO_RE.search(path)) or os.path.splitext(path.lower())[1] in AUDIO_EXT
 
 
 def looks_like_manifest(url):

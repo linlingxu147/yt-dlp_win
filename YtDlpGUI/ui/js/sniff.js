@@ -19,6 +19,7 @@ function render() {
   shown.forEach((r, i) => {
     const tr = document.createElement('tr');
     if (r.seg) tr.classList.add('seg');
+    if (r.audio) tr.classList.add('audio');
     const tdSel = document.createElement('td');
     const cb = document.createElement('input');
     cb.type = 'checkbox';
@@ -28,8 +29,8 @@ function render() {
     });
     tdSel.appendChild(cb);
     tr.appendChild(tdSel);
-    for (const v of [r.title || '', r.url || '', r.kind || '', fmtSize(r.size),
-                     r.source || '', r.page_url || '',
+    for (const v of [r.title || '', r.url || '', r.audio ? '音频' : (r.kind || ''),
+                     fmtSize(r.size), r.source || '', r.page_url || '',
                      new Date((r.ts || 0) * 1000).toLocaleTimeString('zh-CN', { hour12: false })]) {
       const td = document.createElement('td');
       td.textContent = v;
@@ -39,8 +40,12 @@ function render() {
     }
     body.appendChild(tr);
   });
+  const fold = document.getElementById('sn-fold').checked;
+  const showAudio = document.getElementById('sn-audio').checked;
+  const audioCount = items.filter(r => r.audio).length;
+  const audioHint = audioCount ? `${showAudio ? '显示' : '隐藏'} ${audioCount} 条` : '无';
   document.getElementById('sn-count').textContent =
-    `共 ${shown.length} 条（折叠分片：${document.getElementById('sn-fold').checked ? '开' : '关'}）`;
+    `共 ${shown.length} 条（折叠分片：${fold ? '开' : '关'}；音频流：${audioHint}）`;
 }
 
 async function refresh() {
@@ -49,9 +54,11 @@ async function refresh() {
     document.getElementById('sn-count').textContent = '扩展服务未启用（「高级」里勾选启用浏览器扩展支持）';
     return;
   }
+  items = d.items || [];
   const fold = document.getElementById('sn-fold').checked;
-  shown = (d.items || []).filter(r => !(fold && r.seg));
-  const s = JSON.stringify([fold, shown.map(r => [r.url, r.ts, r.size])]);
+  const showAudio = document.getElementById('sn-audio').checked;
+  shown = items.filter(r => (r.audio ? showAudio : !(fold && r.seg)));
+  const s = JSON.stringify([fold, showAudio, shown.map(r => [r.url, r.ts, r.size])]);
   if (s === sig) return;
   sig = s;
   render();
@@ -60,6 +67,7 @@ async function refresh() {
 export function initSniff({ dialogs, tabs }) {
   document.getElementById('btn-sn-refresh').addEventListener('click', refresh);
   document.getElementById('sn-fold').addEventListener('change', () => { sig = ''; refresh(); });
+  document.getElementById('sn-audio').addEventListener('change', () => { sig = ''; refresh(); });
   document.getElementById('btn-sn-clear').addEventListener('click', async () => {
     await call('sniff_clear');
     selected.clear();

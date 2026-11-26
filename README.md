@@ -71,6 +71,10 @@ webRequest 全都能看见——以前它们会挤满列表，几千个条目谁
 一旦嗅到 `.m3u8` / `.mpd` 清单，就不再收后续分片**（清单才是能下整片的入口），桌面版
 「扩展嗅探」页签默认勾选「折叠分片」，取消勾选可以展开看。
 
+B 站这类 DASH 站点会把音频单独做成一条 `.m4s`（流 ID 302xx）。桌面嗅探页和扩展浮条
+都默认**隐藏音频单轨**，避免误点后只下到音轨；桌面页勾选「显示音频流」、扩展面板勾选
+「显示音频 (N)」即可展开并单独下载，条目会标注「音频」。
+
 嗅探结果还会**回流到桌面版**：扩展把条目 POST 给本机服务，桌面版「扩展嗅探」页签里能刷新看到、
 预览试播、勾选下载——桌面版适合批量挑选，扩展适合随手抓。
 
@@ -109,6 +113,7 @@ yt-dlp_win\
 ├─ yt-dlp.exe                  # 上游发行版（onedir 打包），升级见下文
 ├─ _internal\                  # yt-dlp.exe 的依赖目录（勿删）
 ├─ ffmpeg.exe                  # 自编译裁剪版：合并 / 转码 / 截帧 / mp3 提取
+├─ ffprobe.exe                 # 自编译裁剪版：yt-dlp 的元数据/音频探测（核心代码不调用）
 ├─ ytdlp_core.py               # ★ 共享核心：命令构建、配置读写、诊断规则、进度解析
 ├─ YtDlpGUI\                   # 桌面版（pywebview + Web 前端）
 │   ├─ main.py                 # 薄入口：建窗、装配 host/api、内嵌扩展服务
@@ -127,6 +132,7 @@ yt-dlp_win\
 │   ├─ manifest.json
 │   ├─ background.js           # webRequest 嗅探 + 与本地服务通信
 │   ├─ injected.js             # 页面主世界钩子（XHR / fetch / JSON.parse）
+│   ├─ audio_stream.js         # 音频单轨识别（302xx m4s / 音频后缀）
 │   ├─ content.js              # 浮条 UI、轮询进度、上报元素里的媒体地址
 │   └─ README.md               # 扩展单独的说明与版本历史
 ├─ tests\                       # 回归测试
@@ -233,6 +239,7 @@ py -3 YtDlpGUI\main.py --selftest-snifftab
 
 # 扩展脚本语法检查
 node --check sniffer_extension\background.js
+node --check sniffer_extension\audio_stream.js
 node --check sniffer_extension\content.js
 node --check sniffer_extension\injected.js
 
@@ -246,6 +253,29 @@ node tests\extension_smoke.js
 
 - 桌面版：窗口里有「更新 yt-dlp」按钮（等价于 `yt-dlp -U`）。
 - 手动方式：把新的 `yt-dlp.exe`（onedir 发行包需连同 `_internal\`）覆盖进来即可。
+
+---
+
+## 最小 ffmpeg / ffprobe（自编译）
+
+随包的 `ffmpeg.exe`、`ffprobe.exe` 裁剪自 **FFmpeg 8.1.3**（静态单文件，LGPL；两者合计
+约 19 MB，原全量构建是 272 MB）。只开启本项目与 yt-dlp 实际用到的能力：合并/封装
+（mp4/mkv/webm/flv/mpegts/HLS/DASH）、截帧、6 秒试播片段、mp3 提取、`ffmpeg -i` 读时长。
+核心代码已不直接调用 ffprobe——时长与可播性探测都改用 `ffmpeg -i`；保留 ffprobe 只是
+为了让 yt-dlp 的元数据/音频处理路径保持完整。
+
+在 MSYS2 MINGW64 里重建（工具链可装在任何位置，例如 `E:\envir\msys`）：
+
+```bash
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-lame \
+         mingw-w64-x86_64-libxml2 mingw-w64-x86_64-libmpg123 \
+         mingw-w64-x86_64-zlib mingw-w64-x86_64-pkgconf pkgconf make
+FFMPEG_BUILD_DIR=/e/envir/build/ffmpeg-min ./tools/build_ffmpeg_min.sh
+```
+
+脚本固定了源码版本、SHA-256 与 configure 参数，产物直接覆盖根目录的
+`ffmpeg.exe` / `ffprobe.exe`。需要新增能力（例如某个站点的特殊编码）时，往脚本的
+`--enable-decoder` / `--enable-demuxer` 列表里加一项再重建即可。
 
 ---
 
@@ -263,14 +293,15 @@ node tests\extension_smoke.js
   yt-dlp 复制不出来就会报 `Could not copy Chrome cookie database`（
   [yt-dlp#7271](https://github.com/yt-dlp/yt-dlp/issues/7271)）。这不是本项目的 bug，
   两条路：完全退出浏览器，或者改用扩展面板里的「下载」——扩展直接把本页 cookie 交给程序，
-  根本不碰那个数据库。程序也会自动降级重试一次，只是那一次不带登录态。
+  根本不碰那个数据库。程序也会自动降级重试一次（探测 / 格式表 / 下载都适用），只是那一次
+  不带登录态；日志里会以黄色提示说明「已忽略 Cookies 继续」，不再按红色错误展示。
 - 播放器还占着预览链接时，Windows 会拒绝删除，`.preview\` 会留到下一个任务结束才清掉
   （只是空目录里的硬链接，不占额外空间，也不影响下载产物）。
 
 ## 目录维护记录
 
-- `2026-11-26`：`ffprobe.exe` 退役、`ffmpeg.exe` 换为自编译裁剪版；原全量构建移到
-  `..\yt-dlp_removed_20261126\`。
+- `2026-11-26`：`ffmpeg.exe` / `ffprobe.exe` 换为同源自编译裁剪版（静态，合计约 19 MB）；
+  原全量构建移到 `..\yt-dlp_removed_20261126\`。
 - 已移出发布目录（保留在 `..\yt-dlp_removed_20261104\`）：`ffplay.exe`、`ffmpeg-master-latest-win64-lgpl\`
   （上游文档目录，本项目代码零引用）。
 - 开发备忘与 Playwright 测试脚手架已移到 `..\yt-dlp_win_dev_notes\`（`2026-11-01` / `2026-11-04` 备忘、nettest）。

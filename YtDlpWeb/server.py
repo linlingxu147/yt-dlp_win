@@ -482,6 +482,7 @@ def register_sniff_items(items, page_url=""):
                 # 桌面版「扩展嗅探」页据此默认把分片折叠起来。
                 "seg": core.looks_like_segment(url),
                 "manifest": core.looks_like_manifest(url),
+                "audio": core.looks_like_audio(url),
                 "kind": str(it.get("kind") or rec.get("kind") or "")[:16],
                 "size": int(it.get("size") or 0),
                 "source": str(it.get("source") or "")[:80],
