@@ -989,5 +989,22 @@ class TestRuntimeLayout(unittest.TestCase):
             self.assertEqual(cmd[cmd.index("--ffmpeg-location") + 1], d)
 
 
+class TestQueueNConfig(unittest.TestCase):
+    def test_default_queue_n(self):
+        self.assertEqual(core.DEFAULT_CONFIG.get("queue_n"), "2")
+
+    def test_coerce_queue_n_range(self):
+        m = {"queue_n": "3"}
+        core.coerce_types(m)
+        self.assertEqual(m["queue_n"], "3")
+
+    def test_coerce_queue_n_out_of_range_falls_back(self):
+        m = {"queue_n": "9"}
+        warns = []
+        core.coerce_types(m, warns)
+        self.assertEqual(m["queue_n"], "2")
+        self.assertTrue(any("同时下载数" in w for w in warns))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

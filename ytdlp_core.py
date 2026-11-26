@@ -992,6 +992,7 @@ DEFAULT_CONFIG = {
     "open_after": True,
     "rate": "", "proxy": "", "update_mirror": "", "cookie": "", "cookie_header": "",
     "conc": True, "conc_n": "4", "aria": False, "aria_args": "aria2c:-x 16 -s 16 -k 1M",
+    "queue_n": "2",
     "flat": False, "extra": "",
     "browser": "（不使用）", "browser_profile": "",
     "referer": "", "ua": "", "headers": "",
@@ -1088,7 +1089,8 @@ def coerce_config(cfg, defaults=None):
 # 手改配置最常见的是类型写错：数字写成中文、布尔写成 "false" 字符串
 # （非空字符串在 if 里恒为真，勾选框就会「关不掉」）。
 _INT_FIELDS = {"retries": ("重试次数", 0, 999), "conc_n": ("分片并发", 1, 64),
-               "socket_timeout": ("超时秒数", 1, 600)}
+               "socket_timeout": ("超时秒数", 1, 600),
+               "queue_n": ("同时下载数", 1, 5)}
 _BOOL_FIELDS = ("sub", "embedsub", "thumb", "meta", "pl", "open_after", "ignore",
                 "conc", "aria", "flat", "generic", "ipv4", "proxy_off", "net_hard")
 _BYTES_RE = re.compile(r"^\d+(?:\.\d+)?[KMG]?(?:-\d+(?:\.\d+)?[KMG]?)?$", re.I)
