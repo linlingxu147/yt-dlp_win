@@ -46,6 +46,7 @@ body {
 .panel-body { padding: 12px 4px; display: grid; gap: 12px; }
 
 .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.top-cols { grid-template-columns: 2fr 1fr; }
 @media (max-width: 860px) { .cols { grid-template-columns: 1fr; } }
 .col { display: grid; gap: 12px; align-content: start; }
 

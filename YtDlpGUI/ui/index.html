@@ -24,6 +24,8 @@ try {
   <div role="tablist" aria-label="功能页签">
     <button type="button" role="tab" id="tab-download" data-panel="panel-download"
             aria-selected="true" tabindex="0">下载</button>
+    <button type="button" role="tab" id="tab-settings" data-panel="panel-settings"
+            aria-selected="false" tabindex="-1">设置</button>
     <button type="button" role="tab" id="tab-sniff" data-panel="panel-sniff"
             aria-selected="false" tabindex="-1">扩展嗅探</button>
     <button type="button" role="tab" id="tab-history" data-panel="panel-history"
@@ -32,26 +34,91 @@ try {
 
   <section role="tabpanel" id="panel-download" aria-labelledby="tab-download" tabindex="0">
     <div class="panel-body">
+      <div class="cols top-cols">
+        <fieldset>
+          <legend>① 下载链接</legend>
+          <textarea id="url" rows="4" placeholder="每行一个链接，可一次粘贴多个；也可以是播放列表地址"></textarea>
+          <div class="row">
+            <button type="button" id="btn-paste">剪贴板粘贴</button>
+            <button type="button" id="btn-url-clear">清空</button>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>② 保存位置</legend>
+          <label>输出目录 <input id="outdir" type="text"></label>
+          <div class="row">
+            <button type="button" id="btn-browse-outdir">浏览…</button>
+            <button type="button" id="btn-open-outdir">打开</button>
+          </div>
+          <label>文件名 <select id="tpl"></select></label>
+          <p class="hint">占位符：title 标题、id 编号、uploader 作者、upload_date 日期、playlist_index 列表序号</p>
+        </fieldset>
+      </div>
+
+      <div class="toolbar">
+        <button type="button" id="btn-start" class="primary">开始下载</button>
+        <button type="button" id="btn-detect">探测资源</button>
+        <button type="button" id="btn-stop" disabled>停止</button>
+        <button type="button" id="btn-trouble">自动排障</button>
+        <button type="button" id="btn-update">更新 yt-dlp</button>
+        <button type="button" id="btn-copy">复制命令</button>
+        <button type="button" id="btn-clearlog">清空日志</button>
+        <span id="status" aria-live="polite">就绪</span>
+      </div>
+
+      <fieldset class="progress">
+        <legend>下载进度</legend>
+        <div id="prog-file" class="muted">等待开始</div>
+        <div class="row">
+          <progress id="prog-bar" max="100" value="0"></progress>
+          <span id="prog-pct">0%</span>
+        </div>
+        <div id="prog-detail" class="muted">—</div>
+        <div class="row">
+          <button type="button" id="btn-play" disabled>边下边播</button>
+          <span id="play-reason" class="hint">还没有开始下载</span>
+        </div>
+      </fieldset>
+
+      <fieldset class="results">
+        <legend>探测结果（点 ✓ 列勾选要下载的条目）</legend>
+        <div class="table-wrapper" tabindex="0" role="region" aria-label="探测结果表">
+          <table>
+            <thead>
+              <tr><th>✓</th><th>标题</th><th>时长</th><th>清晰度</th><th>大小</th><th>上传者</th></tr>
+            </thead>
+            <tbody id="results-body"></tbody>
+          </table>
+        </div>
+        <div class="row">
+          <button type="button" id="btn-all">全选</button>
+          <button type="button" id="btn-none">全不选</button>
+          <button type="button" id="btn-dl-sel" disabled>下载选中项</button>
+          <button type="button" id="btn-clear-results">清空列表</button>
+          <span id="result-count" class="hint">尚未探测</span>
+        </div>
+        <div class="preview row">
+          <img id="pv-img" alt="" hidden>
+          <span id="pv-img-text" class="hint">选中一行看封面</span>
+          <div>
+            <div id="pv-meta"></div>
+            <button type="button" id="btn-pv-open" disabled>打开原网页</button>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset class="logbox">
+        <legend>运行日志</legend>
+        <div id="log" tabindex="0" role="log" aria-label="运行日志"></div>
+      </fieldset>
+    </div>
+  </section>
+
+  <section role="tabpanel" id="panel-settings" aria-labelledby="tab-settings" tabindex="0" hidden>
+    <div class="panel-body">
+      <p class="hint">设置随任务启动保存；主题切换即时生效。分类：③ 内容与格式 · ④ 访问与身份 · ⑤ 播放列表与容错 · ⑥ 附加内容 · ⑦ 网络与加速 · ⑧ 高级。</p>
       <div class="cols">
         <div class="col">
-          <fieldset>
-            <legend>① 下载链接</legend>
-            <textarea id="url" rows="4" placeholder="每行一个链接，可一次粘贴多个；也可以是播放列表地址"></textarea>
-            <div class="row">
-              <button type="button" id="btn-paste">剪贴板粘贴</button>
-              <button type="button" id="btn-url-clear">清空</button>
-            </div>
-          </fieldset>
-          <fieldset>
-            <legend>② 保存位置</legend>
-            <label>输出目录 <input id="outdir" type="text"></label>
-            <div class="row">
-              <button type="button" id="btn-browse-outdir">浏览…</button>
-              <button type="button" id="btn-open-outdir">打开</button>
-            </div>
-            <label>文件名 <select id="tpl"></select></label>
-            <p class="hint">占位符：title 标题、id 编号、uploader 作者、upload_date 日期、playlist_index 列表序号</p>
-          </fieldset>
           <fieldset>
             <legend>③ 内容与格式</legend>
             <label>下载模式 <select id="mode"></select></label>
@@ -125,63 +192,6 @@ try {
           </fieldset>
         </div>
       </div>
-
-      <div class="toolbar">
-        <button type="button" id="btn-start" class="primary">开始下载</button>
-        <button type="button" id="btn-detect">探测资源</button>
-        <button type="button" id="btn-stop" disabled>停止</button>
-        <button type="button" id="btn-trouble">自动排障</button>
-        <button type="button" id="btn-update">更新 yt-dlp</button>
-        <button type="button" id="btn-copy">复制命令</button>
-        <button type="button" id="btn-clearlog">清空日志</button>
-        <span id="status" aria-live="polite">就绪</span>
-      </div>
-
-      <fieldset class="progress">
-        <legend>下载进度</legend>
-        <div id="prog-file" class="muted">等待开始</div>
-        <div class="row">
-          <progress id="prog-bar" max="100" value="0"></progress>
-          <span id="prog-pct">0%</span>
-        </div>
-        <div id="prog-detail" class="muted">—</div>
-        <div class="row">
-          <button type="button" id="btn-play" disabled>边下边播</button>
-          <span id="play-reason" class="hint">还没有开始下载</span>
-        </div>
-      </fieldset>
-
-      <fieldset class="results">
-        <legend>探测结果（点 ✓ 列勾选要下载的条目）</legend>
-        <div class="table-wrapper" tabindex="0" role="region" aria-label="探测结果表">
-          <table>
-            <thead>
-              <tr><th>✓</th><th>标题</th><th>时长</th><th>清晰度</th><th>大小</th><th>上传者</th></tr>
-            </thead>
-            <tbody id="results-body"></tbody>
-          </table>
-        </div>
-        <div class="row">
-          <button type="button" id="btn-all">全选</button>
-          <button type="button" id="btn-none">全不选</button>
-          <button type="button" id="btn-dl-sel" disabled>下载选中项</button>
-          <button type="button" id="btn-clear-results">清空列表</button>
-          <span id="result-count" class="hint">尚未探测</span>
-        </div>
-        <div class="preview row">
-          <img id="pv-img" alt="" hidden>
-          <span id="pv-img-text" class="hint">选中一行看封面</span>
-          <div>
-            <div id="pv-meta"></div>
-            <button type="button" id="btn-pv-open" disabled>打开原网页</button>
-          </div>
-        </div>
-      </fieldset>
-
-      <fieldset class="logbox">
-        <legend>运行日志</legend>
-        <div id="log" tabindex="0" role="log" aria-label="运行日志"></div>
-      </fieldset>
     </div>
   </section>
 
