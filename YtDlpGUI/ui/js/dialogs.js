@@ -61,9 +61,9 @@ export function initDialogs() {
     ftext.appendChild(tail);
   });
   on('exit_confirm', async (ev) => {
-    // 后端只在有活跃任务时发；纯辅助操作/更新时下载计数为 0，改用通用文案
+    // 后端只在有活跃任务时发；纯辅助操作/更新时三项计数全为 0，改用通用文案
     let text = (ev && ev.text) || '';
-    if (!text || /^0 个下载中 \/ 0 个排队/.test(text)) {
+    if (!text || /^0 个下载中 \/ 0 个排队(?: \/ 0 个已暂停)?[，,]/.test(text)) {
       text = '有任务正在进行，退出将停止。';
     }
     const ok = await confirm('退出', text, '退出');

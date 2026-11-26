@@ -5,6 +5,7 @@ import { call, on } from './bridge.js';
 const STATE = { queued: '排队', running: '下载中', paused: '已暂停',
                 done: '完成', failed: '失败', canceled: '已取消' };
 const ACTIVE = ['queued', 'running', 'paused'];
+const SUMMARY = { done: '成功', failed: '失败', canceled: '已取消' };
 
 let cache = [];
 let selected = null;
@@ -12,6 +13,11 @@ let follow = true;   // 默认跟随最新运行中任务；用户点行/看辅�
 let busy = false;    // 辅助操作/更新占闸时，不用队列计数覆盖状态栏
 let reqSeq = 0;      // 连发快照请求时只认最新一次，避免旧结果盖掉新状态
 let onSelect = () => {};
+let toast = () => {};
+let counts = { running: 0, queued: 0, paused: 0 };
+let wasActive = false;   // 自上轮清空后队列是否活跃过（有运行/排队任务）
+let drained = false;     // 收到 0/0 后等最新快照再汇总，避免漏掉刚结束的任务
+let counted = new Set(); // 已计入汇总的任务号，保证每轮清空只提示一次、不重复计数
 
 function detailText(t) {
   return [t.speed, t.eta, t.size].filter(Boolean).join(' · ') || '—';
@@ -50,7 +56,7 @@ function row(t) {
     return b;
   };
   if (t.state === 'running') ops.append(mk('暂停', () => call('pause_task', t.id)));
-  if (t.state === 'paused' || t.state === 'queued')
+  if (t.state === 'paused')
     ops.append(mk('继续', () => call('resume_task', t.id)));
   if (ACTIVE.includes(t.state))
     ops.append(mk('取消', async () => {
@@ -82,22 +88,55 @@ function render() {
     !cache.some(t => ACTIVE.includes(t.state));
 }
 
-function paintStat(running, queued) {
-  document.getElementById('queue-stat').textContent = `${running} 下载中 · ${queued} 排队`;
-  // 下载 executor 不发 status 事件：状态栏由队列计数驱动（辅助操作进行中不覆盖）
+function paintStatus() {
   const st = document.getElementById('status');
-  if (running || queued) {
-    st.textContent = `${running} 个下载中 · ${queued} 排队`;
+  const { running, queued, paused } = counts;
+  if (running || queued || paused) {
+    st.textContent = `${running} 个下载中 · ${queued} 排队`
+      + (paused ? ` · ${paused} 个已暂停` : '');
     st.dataset.tone = 'run';
-  } else if (!busy) {
+  } else {
     st.textContent = '就绪';
     st.dataset.tone = 'idle';
   }
 }
 
+function paintStat(running, queued) {
+  // 暂停数不在 queue_changed 里，按最近的快照缓存统计
+  counts = { running, queued, paused: cache.filter(t => t.state === 'paused').length };
+  document.getElementById('queue-stat').textContent =
+    `${running} 下载中 · ${queued} 排队`
+    + (counts.paused ? ` · ${counts.paused} 已暂停` : '');
+  // 下载 executor 不发 status 事件：状态栏由队列计数驱动（辅助操作/更新进行中不覆盖）
+  if (!busy) paintStatus();
+}
+
+// 队列从活跃变为全空（没有运行/排队/暂停）时汇总本轮完成情况，每次清空只提示一次
+function checkDrain() {
+  if (!drained) return;
+  if (counts.running || counts.queued || counts.paused) {
+    drained = false;   // 还有暂停/新任务，不算清空
+    return;
+  }
+  drained = false;
+  wasActive = false;
+  const tally = { done: 0, failed: 0, canceled: 0 };
+  for (const t of cache) {
+    if (!SUMMARY[t.state] || counted.has(t.id)) continue;
+    counted.add(t.id);
+    tally[t.state] += 1;
+  }
+  const parts = [];
+  if (tally.done) parts.push(`${tally.done} 成功`);
+  if (tally.failed) parts.push(`${tally.failed} 失败`);
+  if (tally.canceled) parts.push(`${tally.canceled} 已取消`);
+  if (parts.length) toast('队列已完成：' + parts.join(' / '));
+}
+
 function adopt(r) {
   cache = (r && r.tasks) || [];
   paintStat((r && r.running) || 0, (r && r.queued) || 0);
+  if (counts.running || counts.queued || counts.paused) wasActive = true;
   if (follow) {
     const running = cache.filter(t => t.state === 'running');
     const pick = running.length ? running[running.length - 1].id : null;
@@ -112,6 +151,7 @@ function adopt(r) {
     }
   }
   render();
+  checkDrain();
 }
 
 async function refresh() {
@@ -126,6 +166,7 @@ async function refresh() {
 }
 
 export function initQueue({ dialogs }) {
+  toast = dialogs.toast;
   window.__confirm = dialogs.confirm;
   onSelect = (id) => window.__selectLog && window.__selectLog(id);
   document.getElementById('btn-stop-all').addEventListener('click', async () => {
@@ -134,8 +175,17 @@ export function initQueue({ dialogs }) {
     const r = await call('stop_all');
     if (!r.ok) dialogs.toast(r.error || '停止失败', 'err');
   });
-  on('queue_changed', ev => paintStat(ev.running, ev.queued));
-  on('task', ev => { busy = !!ev.busy; });
+  on('queue_changed', ev => {
+    if (ev.running || ev.queued) wasActive = true;
+    else if (wasActive) drained = true;   // 本轮清空：等最新快照拿到终态后再汇总
+    paintStat(ev.running, ev.queued);
+    if (drained) refresh();
+  });
+  on('task', ev => {
+    busy = !!ev.busy;
+    // 辅助操作结束：状态栏交还队列计数；随后到达的完成/停止文案会覆盖它
+    if (!busy) paintStatus();
+  });
   on('queue', ev => {
     // 新任务入队且当前没盯活跃任务（公共日志/已结束任务）时，恢复跟随最新运行中任务
     if (ev.action === 'added') {

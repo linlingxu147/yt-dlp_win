@@ -73,6 +73,11 @@ export function applyConfig(cfg, m) {
 
 export function initDownload({ dialogs, results, tabs }) {
   document.getElementById('mode').addEventListener('change', () => syncMode(false));
+  // 同时下载数改动即时生效（host.save_config 会 set_max）；其余设置仍随任务启动保存
+  document.getElementById('queue_n').addEventListener('change', async () => {
+    const r = await call('save_config', collectCfg());
+    if (!r.ok) dialogs.toast('保存同时下载数失败', 'err');
+  });
   document.getElementById('btn-paste').addEventListener('click', async () => {
     try {
       const t = await navigator.clipboard.readText();

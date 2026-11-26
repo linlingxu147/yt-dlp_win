@@ -133,8 +133,8 @@ def main():
         if (host.aux_kind or host.updating or snap["running"] or snap["queued"]
                 or snap["paused"]):
             host._put({"type": "exit_confirm",
-                       "text": "%d 个下载中 / %d 个排队，退出将停止全部任务。"
-                               % (snap["running"], snap["queued"])})
+                       "text": "%d 个下载中 / %d 个排队 / %d 个已暂停，退出将停止全部任务。"
+                               % (snap["running"], snap["queued"], snap["paused"])})
             return False
         host.shutdown()
         return True

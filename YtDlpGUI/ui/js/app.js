@@ -30,13 +30,15 @@ on('status', ev => {
   el.textContent = ev.text;
   el.dataset.tone = ev.tone;
 });
+let downloading = false;   // 最近一次 task 事件：有没有下载任务（停止按钮据此分流）
 on('task', ev => {
+  downloading = !!ev.downloading;
   document.getElementById('btn-start').disabled = ev.kind === 'update';
   document.getElementById('btn-detect').disabled = ev.busy;
   document.getElementById('btn-trouble').disabled = ev.busy;
   document.getElementById('btn-formats').disabled = ev.busy;
   document.getElementById('btn-update').disabled = ev.busy || ev.downloading;
-  document.getElementById('btn-stop').disabled = !ev.downloading;
+  document.getElementById('btn-stop').disabled = !ev.downloading && !ev.busy;
 });
 on('done', ev => {
   if (ev.code !== 0) dialogs.toast('任务 ' + (ev.task_id ?? '') + ' 失败或中断，见日志', 'err');
@@ -75,8 +77,16 @@ document.getElementById('btn-detect').addEventListener('click', async () => {
   if (!res.ok) dialogs.toast(res.error || '无法探测', 'err');
 });
 document.getElementById('btn-stop').addEventListener('click', async () => {
-  const res = await call('stop_all');
-  if (!res.ok) dialogs.toast(res.error || '停止失败', 'err');
+  // 有下载任务时与「全部停止」同确认（清掉排队并记 stopped）；否则只停辅助操作/更新
+  if (downloading) {
+    const ok = await dialogs.confirm('全部停止', '停止所有运行中任务并清空排队？', '全部停止');
+    if (!ok) return;
+    const res = await call('stop_all');
+    if (!res.ok) dialogs.toast(res.error || '停止失败', 'err');
+  } else {
+    const res = await call('stop');
+    if (!res.ok) dialogs.toast(res.error || '没有进行中的任务');
+  }
 });
 document.getElementById('btn-trouble').addEventListener('click', async () => {
   const urls = urlsOrToast();
