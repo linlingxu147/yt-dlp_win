@@ -7,11 +7,16 @@ import io
 import ipaddress
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 import urllib.request
 from unittest import mock
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "YtDlpGUI"))
 
 import ytdlp_core as core
 
@@ -480,6 +485,31 @@ class TestCookieDatabaseFallback(unittest.TestCase):
         cmd = core.build_download_cmd(cfg, ["https://x/v.mp4"])
         self.assertIn("--cookies-from-browser", cmd)
         self.assertIn("edge:Default", cmd)
+
+
+class TestHostQueue(unittest.TestCase):
+    """T5：host 下载走共享队列，逐链接拆任务（fake submit 注入，不起真实下载）。"""
+
+    def make_host(self, tmp):
+        import importlib
+        host_mod = importlib.import_module("host")
+        cfg = os.path.join(tmp, "config.json")
+        core.save_config(cfg, {"outdir": tmp, "open_after": False, "queue_n": "2"})
+        return host_mod.Host(cfg)
+
+    def test_start_download_splits_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h = self.make_host(tmp)
+            calls = []
+            h.queue.submit = lambda spec, exe: calls.append(spec) or len(calls)
+            r = h.start_download(["http://e/a", "http://e/b"], {"outdir": tmp})
+            self.assertTrue(r["ok"])
+            self.assertEqual(len(r["task_ids"]), 2)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0]["urls"], ["http://e/a"])
+            self.assertEqual(calls[1]["urls"], ["http://e/b"])
+            self.assertEqual(calls[0]["source"], "gui")
+            h.queue.close()
 
 
 if __name__ == "__main__":

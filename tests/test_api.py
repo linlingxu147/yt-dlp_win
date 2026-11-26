@@ -26,6 +26,7 @@ class ApiTest(unittest.TestCase):
         self.api = api_mod.Api(self.host)
 
     def tearDown(self):
+        self.host.queue.close()
         self.tmp.cleanup()
 
     def test_unsafe_extra_blocked(self):
@@ -33,11 +34,18 @@ class ApiTest(unittest.TestCase):
         r = self.api.start_download(["https://x/v"], cfg)
         self.assertFalse(r["ok"])
 
-    def test_busy_semantics(self):
-        self.host.task_kind = "download"
+    def test_update_blocks_download(self):
+        self.host.updating = True
         r = self.api.start_download(["https://x/v"], dict(self.host.cfg))
         self.assertFalse(r["ok"])
-        self.assertTrue(r["busy"])
+
+    def test_queue_snapshot_shape(self):
+        r = self.api.queue_snapshot()
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["tasks"], [])
+        self.assertEqual(r["running"], 0)
+        self.assertEqual(r["queued"], 0)
+        self.assertEqual(r["max"], 2)
 
     def test_open_url_rejects_non_http(self):
         self.assertFalse(self.api.open_url("file:///C:/x")["ok"])

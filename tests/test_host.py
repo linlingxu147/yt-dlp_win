@@ -36,6 +36,7 @@ class PumpTest(unittest.TestCase):
                                   emit=self.events.append)
 
     def tearDown(self):
+        self.host.queue.close()
         self.tmp.cleanup()
 
     def test_not_ready_keeps_events_queued(self):
@@ -76,6 +77,7 @@ class ConfigTest(unittest.TestCase):
         self.host = self.mod.Host(self.path)
 
     def tearDown(self):
+        self.host.queue.close()
         self.tmp.cleanup()
 
     def test_defaults_loaded(self):
@@ -102,6 +104,7 @@ class HistoryTest(unittest.TestCase):
         self.host = self.mod.Host(os.path.join(self.tmp.name, "config.json"))
 
     def tearDown(self):
+        self.host.queue.close()
         self.tmp.cleanup()
 
     def test_record_defaults_and_roundtrip(self):
@@ -155,6 +158,8 @@ def fake_iter(lines):
 
 
 class DownloadTest(unittest.TestCase):
+    """下载走队列：fake 进程注入到 core（run_process 用 core.spawn/iter_lines_watch）。"""
+
     def setUp(self):
         self.mod = load_host()
         self.tmp = tempfile.TemporaryDirectory()
@@ -167,21 +172,35 @@ class DownloadTest(unittest.TestCase):
                         open_after=False)
 
     def tearDown(self):
+        self.host.queue.close()
         self.tmp.cleanup()
 
+    def _wait_task(self, tid, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end:
+            t = self.host.queue.get(tid)
+            if t is not None and t.state not in ("queued", "running"):
+                return t
+            time.sleep(0.02)
+        self.fail("任务 %s 未在超时内结束" % tid)
+
     def _run_download(self, lines, code):
-        with mock.patch.object(self.mod, "spawn", return_value=FakeProc(code)), \
-             mock.patch.object(self.mod, "iter_lines_watch", fake_iter(lines)):
+        with mock.patch.object(self.mod.core, "spawn", return_value=FakeProc(code)), \
+             mock.patch.object(self.mod.core, "iter_lines_watch", fake_iter(lines)):
             r = self.host.start_download(["https://x/v"], self.cfg)
             self.assertTrue(r["ok"], r)
-            self.host._worker.join(5)
+            t = self._wait_task(r["task_ids"][0])
         self.host.pump_once()
+        return t
 
     def test_success_emits_done_and_history(self):
-        self._run_download(["[download] Destination: v.mp4"], 0)
+        t = self._run_download(["[download] Destination: v.mp4"], 0)
         done = [e for e in self.events if e["type"] == "done"]
         self.assertEqual(done[0]["code"], 0)
+        self.assertEqual(done[0]["task_id"], t.id)
         self.assertEqual(self.host.history[0]["status"], "ok")
+        self.assertEqual(self.host.history[0]["task_id"], t.id)
+        self.assertEqual(t.state, "done")
         self.assertIsNone(self.host.task_kind)
 
     def test_unsafe_extra_arg_blocked(self):
@@ -190,52 +209,133 @@ class DownloadTest(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertIn("禁用", r["error"])
 
-    def test_busy_gate(self):
-        self.host.task_kind = "detect"
+    def test_update_blocks_download(self):
+        self.host.updating = True
         r = self.host.start_download(["https://x/v"], self.cfg)
         self.assertFalse(r["ok"])
-        self.assertTrue(r["busy"])
 
-    def test_net_heal_retries_once(self):
+    def test_aux_kind_does_not_block_download(self):
+        self.host.task_kind = "detect"
+        self.host.aux_kind = "detect"
+        t = self._run_download([], 0)
+        self.assertEqual(t.state, "done")
+
+    def test_queue_full_reports_error(self):
+        calls = []
+        def submit(spec, exe):
+            calls.append(spec)
+            if len(calls) > 1:
+                raise self.mod.ytdlp_queue.QueueFull("队列已满（200 个未完成任务）")
+            return len(calls)
+        self.host.queue.submit = submit
+        r = self.host.start_download(["https://x/a", "https://x/b"], self.cfg)
+        self.assertFalse(r["ok"])
+        self.assertIn("队列已满", r["error"])
+
+    def test_net_heal_retries_within_same_task(self):
         calls = []
         def spawn2(cmd, cwd=None):
             calls.append(cmd)
             return FakeProc(1 if len(calls) == 1 else 0)
         lines = ["ERROR: unable to download: ConnectionResetError 10054"]
-        with mock.patch.object(self.mod, "spawn", side_effect=spawn2), \
-             mock.patch.object(self.mod, "iter_lines_watch", fake_iter(lines)):
+        with mock.patch.object(self.mod.core, "spawn", side_effect=spawn2), \
+             mock.patch.object(self.mod.core, "iter_lines_watch", fake_iter(lines)):
             r = self.host.start_download(["https://x/v"], dict(self.cfg, net_hard=True))
             self.assertTrue(r["ok"], r)
-            self.host._worker.join(5)
-            self.host.pump_once()      # 路由 done → 自愈起新 worker
-            self.host._worker.join(5)
-            self.host.pump_once()
+            t = self._wait_task(r["task_ids"][0])
+        self.host.pump_once()
         self.assertEqual(len(calls), 2)
+        self.assertEqual(t.state, "done")
         self.assertEqual(self.host.history[-1]["status"], "ok")
+        self.assertEqual(len(self.host.history), 1)   # 自愈不另记一条历史
 
-    def test_stop_marks_stopped_history(self):
-        def stopped_iter(proc, abort=None, keepalive=None, **kw):
-            self.host.user_stopped = True   # 模拟用户点了停止
+    def test_pause_marks_task_paused(self):
+        started, release = threading.Event(), threading.Event()
+
+        def blocking_iter(proc, abort=None, keepalive=None, **kw):
+            started.set()
+            release.wait(5)
             yield "ERROR: aborted"
-        with mock.patch.object(self.mod, "spawn", return_value=FakeProc(1)), \
-             mock.patch.object(self.mod, "iter_lines_watch", stopped_iter):
+
+        with mock.patch.object(self.mod.core, "spawn", return_value=FakeProc(1)), \
+             mock.patch.object(self.mod.core, "iter_lines_watch", blocking_iter):
             r = self.host.start_download(["https://x/v"], self.cfg)
             self.assertTrue(r["ok"], r)
-            self.host._worker.join(5)
-        self.host.pump_once()
-        self.assertEqual(self.host.history[-1]["status"], "stopped")
+            tid = r["task_ids"][0]
+            self.assertTrue(started.wait(5))
+            self.host.queue.pause(tid)
+            release.set()
+            t = self._wait_task(tid)
+        self.assertEqual(t.state, "paused")
 
-    def test_submit_server_task_busy(self):
-        self.host.task_kind = "download"
+    def test_task_event_reports_downloading(self):
+        started, release = threading.Event(), threading.Event()
+
+        def blocking_iter(proc, abort=None, keepalive=None, **kw):
+            started.set()
+            release.wait(5)
+            yield "[download] Destination: v.mp4"
+
+        with mock.patch.object(self.mod.core, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod.core, "iter_lines_watch", blocking_iter):
+            r = self.host.start_download(["https://x/v"], self.cfg)
+            tid = r["task_ids"][0]
+            self.assertTrue(started.wait(5))
+            self.host.pump_once()
+            task_evs = [e for e in self.events if e["type"] == "task"]
+            self.assertTrue(task_evs[-1]["downloading"])
+            self.assertFalse(task_evs[-1]["busy"])
+            release.set()
+            self._wait_task(tid)
+        end = time.time() + 3
+        task_evs = []
+        while time.time() < end:
+            self.host.pump_once()
+            task_evs = [e for e in self.events if e["type"] == "task"]
+            if task_evs and not task_evs[-1]["downloading"]:
+                break
+            time.sleep(0.02)
+        self.assertFalse(task_evs[-1]["downloading"])
+
+    def test_open_after_opens_once_per_outdir(self):
+        self.host.open_outdir = mock.Mock()
+        cfg = dict(self.cfg, open_after=True, queue_n="1")
+        with mock.patch.object(self.mod.core, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod.core, "iter_lines_watch", fake_iter([])):
+            r = self.host.start_download(["https://x/a", "https://x/b"], cfg)
+            self.assertTrue(r["ok"], r)
+            for tid in r["task_ids"]:
+                self._wait_task(tid)
+        self.assertEqual(self.host.open_outdir.call_count, 1)
+
+    def test_update_refused_while_download_active(self):
+        gate = threading.Event()
+        def exe(task):
+            gate.wait(5)
+            task.exit_code = 0
+        tid = self.host.queue.submit(
+            {"urls": ["https://x/v"], "cfg": dict(self.cfg),
+             "outdir": self.cfg["outdir"], "source": "gui"}, exe)
+        try:
+            r = self.host.update_ytdlp("", "")
+            self.assertFalse(r["ok"])
+            self.assertTrue(r["busy"])
+        finally:
+            gate.set()
+            self._wait_task(tid)
+
+    def test_submit_server_task_refused_while_updating(self):
+        self.host.updating = True
         self.assertFalse(self.host.submit_server_task({"urls": ["https://x"]}))
 
     def test_sniff_source_recorded(self):
         task = {"urls": ["https://x/v"], "cfg": dict(self.cfg),
                 "emit": None, "no_playlist": True, "source": "sniff"}
-        with mock.patch.object(self.mod, "spawn", return_value=FakeProc(0)), \
-             mock.patch.object(self.mod, "iter_lines_watch", fake_iter([])):
-            self.host.start_external(task)
-            self.host._worker.join(5)
+        with mock.patch.object(self.mod.core, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod.core, "iter_lines_watch", fake_iter([])):
+            tid = self.host.start_external(task)
+            self.assertTrue(tid)
+            self._wait_task(tid)
         self.host.pump_once()
         self.assertEqual(self.host.history[-1]["source"], "sniff")
 
@@ -243,10 +343,11 @@ class DownloadTest(unittest.TestCase):
         emitted = []
         task = {"urls": ["https://x/v"], "cfg": dict(self.cfg),
                 "emit": emitted.append, "no_playlist": True}
-        with mock.patch.object(self.mod, "spawn", return_value=FakeProc(0)), \
-             mock.patch.object(self.mod, "iter_lines_watch", fake_iter([])):
-            self.host.start_external(task)
-            self.host._worker.join(5)
+        with mock.patch.object(self.mod.core, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod.core, "iter_lines_watch", fake_iter([])):
+            tid = self.host.start_external(task)
+            self.assertTrue(tid)
+            self._wait_task(tid)
         self.host.pump_once()
         self.assertEqual(self.host.history[-1]["source"], "ext")
         self.assertTrue(any(e.get("type") == "done" for e in emitted))
@@ -263,6 +364,7 @@ class DetectTroubleTest(unittest.TestCase):
         self.cfg = dict(self.host.cfg)
 
     def tearDown(self):
+        self.host.queue.close()
         self.tmp.cleanup()
 
     def test_detect_collects_rows(self):
@@ -396,6 +498,7 @@ class PreviewPlayTest(unittest.TestCase):
         self.host.mark_ready()
 
     def tearDown(self):
+        self.host.queue.close()
         self.tmp.cleanup()
 
     def test_thumb_returns_data_url(self):
@@ -429,27 +532,35 @@ class SniffServiceTest(unittest.TestCase):
         self.host.mark_ready()
 
     def tearDown(self):
+        self.host.queue.close()
         self.tmp.cleanup()
 
     def test_sniff_download_overrides_cfg(self):
-        captured = {}
-        def sink(task):
-            captured.update(task)
-            return True
-        self.host.submit_server_task = sink
+        captured = []
+        self.host.queue.submit = lambda spec, exe: captured.append(spec) or len(captured)
         items = [{"url": "https://cdn/x.m3u8", "referer": "https://p/", "ua": "UA"}]
         r = self.host.sniff_download(items)
         self.assertTrue(r["ok"])
-        self.assertEqual(captured["cfg"]["fmt"], "b")
-        self.assertFalse(captured["cfg"]["thumb"])
-        self.assertEqual(captured["cfg"]["referer"], "https://p/")
-        self.assertTrue(captured["no_playlist"])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0]["cfg"]["fmt"], "b")
+        self.assertFalse(captured[0]["cfg"]["thumb"])
+        self.assertEqual(captured[0]["cfg"]["referer"], "https://p/")
+        self.assertTrue(captured[0]["no_playlist"])
+        self.assertEqual(captured[0]["source"], "sniff")
 
-    def test_sniff_download_busy(self):
-        self.host.task_kind = "download"
+    def test_sniff_download_splits_items(self):
+        captured = []
+        self.host.queue.submit = lambda spec, exe: captured.append(spec) or len(captured)
+        r = self.host.sniff_download([{"url": "https://cdn/a"}, {"url": "https://cdn/b"}])
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(r["task_ids"]), 2)
+        self.assertEqual([c["urls"] for c in captured],
+                         [["https://cdn/a"], ["https://cdn/b"]])
+
+    def test_sniff_download_blocked_while_updating(self):
+        self.host.updating = True
         r = self.host.sniff_download([{"url": "https://cdn/x"}])
         self.assertFalse(r["ok"])
-        self.assertTrue(r["busy"])
 
     def test_sniff_items_without_service(self):
         d = self.host.sniff_items()
@@ -494,6 +605,7 @@ class UpdateMirrorFlowTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         host = mod.Host(os.path.join(tmp.name, "config.json"))
+        self.addCleanup(host.queue.close)
         cmd = [sys.executable, "-c", "raise SystemExit(1)"]
         host._update_run(cmd, proxy="", mirror="")
         events = []
@@ -546,6 +658,7 @@ class UpdateMirrorFlowTest(unittest.TestCase):
         self.addCleanup(srv.shutdown)
 
         host = mod.Host(os.path.join(tmp.name, "config.json"))
+        self.addCleanup(host.queue.close)
         cmd = [sys.executable, "-c", "raise SystemExit(1)"]
         with mock.patch.object(mod.core, "RUNTIME_DIR", rt), \
                 mock.patch.object(mod.updater, "verify_version",

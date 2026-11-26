@@ -13,6 +13,7 @@ import threading
 import time
 
 import ytdlp_core as core
+import ytdlp_queue
 try:
     from . import updater
 except ImportError:          # 真实入口把 YtDlpGUI/ 放进 sys.path，按顶层模块导入
@@ -48,29 +49,28 @@ class Host:
         self.cfg = core.load_config(config_file, warn=self.cfg_warnings.append)
         self.history_file = os.path.join(os.path.dirname(config_file), "history.json")
         self.history = self._load_history()
+        self._history_lock = threading.Lock()
+        # 辅助操作（探测/排障/格式表/更新）仍走单闸；下载全部进队列。
         self.task_kind = None
-        self.running = False
         self.proc = None
         self.user_stopped = False
         self.pstate = core.new_progress_state()
-        self._progress_pending = None
-        self._last_progress_ts = 0.0
+        self._progress_pending = {}
+        self._last_progress_ts = {}
         self._web_mod = None
         self.web_svc = None
-        self.ext_emit = None
-        self.ext_cfg = None
-        self.ext_cookie_file = None
-        self.dl_urls = []
-        self.dl_no_playlist = False
-        self.dl_outdir = ""
-        self.net_tried = set()
-        self.net_name = "normal"
         self.diag_buf = ""
         self.cookie_warned = False
         self.results = []
         self._sniff_clip = ""
         self._worker = None
         self.embedded = None
+        self.queue = ytdlp_queue.QueueManager(
+            max_concurrent=int(str(self.cfg.get("queue_n") or "2")),
+            emit=self._put)
+        self.aux_kind = None
+        self.updating = False
+        self._open_after_ts = {}
 
     # ---------------- 事件泵 ----------------
     def mark_ready(self):
@@ -83,24 +83,33 @@ class Host:
 
     def _log(self, text, tag=None):
         self._put({"type": "log", "text": text, "tag": tag})
-        if self.ext_emit:
-            self.ext_emit({"type": "log", "text": text.rstrip("\n")})
 
     def _status(self, text, tone="info"):
         self._put({"type": "status", "text": text, "tone": tone})
 
+    def _task_payload(self):
+        kind = self.aux_kind or ("update" if self.updating else None)
+        return {"type": "task", "kind": kind, "busy": bool(kind),
+                "downloading": self.queue.any_active()}
+
     def _task_ev(self):
-        self._put({"type": "task", "kind": self.task_kind, "busy": bool(self.task_kind)})
+        self._put(self._task_payload())
 
     def pump_once(self):
         if not self.ready:
             return
         now = time.time()
-        if self._progress_pending and now - self._last_progress_ts >= 1.0 / PROGRESS_HZ:
-            self.emit(self._progress_pending)
-            self._last_progress_ts = now
-            self._progress_pending = None
-        logs, progress = [], None
+        for tid in list(self._progress_pending):
+            if now - self._last_progress_ts.get(tid, 0.0) >= 1.0 / PROGRESS_HZ:
+                self.emit(self._progress_pending.pop(tid))
+                self._last_progress_ts[tid] = now
+        logs, progress = {}, {}
+
+        def flush_logs():
+            for tid, items in logs.items():
+                self.emit({"type": "logbatch", "task_id": tid, "items": items})
+            logs.clear()
+
         while True:
             try:
                 ev = self.q.get_nowait()
@@ -108,16 +117,12 @@ class Host:
                 break
             t = ev.get("type")
             if t == "log":
-                logs.append({"text": ev["text"], "tag": ev.get("tag")})
+                logs.setdefault(ev.get("task_id") or 0, []).append(
+                    {"text": ev["text"], "tag": ev.get("tag")})
             elif t == "progress":
-                progress = ev
+                progress[ev.get("task_id") or 0] = ev
             else:
-                if logs:
-                    self.emit({"type": "logbatch", "items": logs})
-                    logs = []
-                if t == "done" and self.running:
-                    self.on_done(ev["code"])
-                    continue
+                flush_logs()
                 if t == "exttask":
                     self.start_external(ev["task"])
                     continue
@@ -127,15 +132,18 @@ class Host:
                 if t == "trodone" and self.task_kind in ("trouble", "update"):
                     self.on_trodone(ev["ok"], ev.get("task", "trouble"))
                     continue
+                if t == "queue_changed":
+                    self.emit(ev)
+                    self.emit(self._task_payload())
+                    continue
                 self.emit(ev)
-        if logs:
-            self.emit({"type": "logbatch", "items": logs})
-        if progress:
-            if now - self._last_progress_ts >= 1.0 / PROGRESS_HZ:
-                self.emit(progress)
-                self._last_progress_ts = now
+        flush_logs()
+        for tid, ev in progress.items():
+            if now - self._last_progress_ts.get(tid, 0.0) >= 1.0 / PROGRESS_HZ:
+                self.emit(ev)
+                self._last_progress_ts[tid] = now
             else:
-                self._progress_pending = progress
+                self._progress_pending[tid] = ev
 
     def start_pump(self):
         def loop():
@@ -157,6 +165,10 @@ class Host:
         warns = []
         if core.save_config(self.config_file, c, warn=warns.append):
             self.cfg = c
+            try:
+                self.queue.set_max(int(str(c.get("queue_n") or "2")))
+            except (TypeError, ValueError):
+                pass
             for w in warns:
                 self._log("[配置] " + str(w) + "\n", "warn")
             return True
@@ -176,13 +188,15 @@ class Host:
                "status": "failed", "code": -1, "elapsed": 0, "done_count": 0,
                "mode": "", "source": "gui"}
         rec.update(entry or {})
-        self.history.append(rec)
-        del self.history[:-HISTORY_MAX]
-        try:
-            core.atomic_write_text(self.history_file,
-                                   json.dumps(self.history, ensure_ascii=False, indent=1))
-        except Exception:
-            pass
+        # 多个下载 executor 会并发写历史：追加 + 落盘要在同一把锁里
+        with self._history_lock:
+            self.history.append(rec)
+            del self.history[:-HISTORY_MAX]
+            try:
+                core.atomic_write_text(self.history_file,
+                                       json.dumps(self.history, ensure_ascii=False, indent=1))
+            except Exception:
+                pass
 
     def history_list(self):
         return list(reversed(self.history))
@@ -194,34 +208,42 @@ class Host:
         except Exception:
             pass
 
-    # ---------------- 闸门 ----------------
+    # ---------------- 闸门（辅助操作单闸；下载走队列） ----------------
     def _reserve(self, kind):
         if self.task_kind:
             return False
         if self._web_mod and not self._web_mod.RUNNER.reserve(kind):
             return False
         self.task_kind = kind
+        # 镜像到 aux_kind/updating，_task_ev 据此上报（T6 再正式拆闸）
+        if kind == "update":
+            self.updating = True
+        else:
+            self.aux_kind = kind
         return True
 
     def _release_runner(self):
         if self._web_mod:
             self._web_mod.RUNNER.finish()
 
-    def _task_cfg(self):
-        return dict(self.ext_cfg) if self.ext_cfg is not None else dict(self.cfg)
+    def _release_aux(self):
+        self.task_kind = None
+        self.aux_kind = None
+        self.updating = False
+        self._release_runner()
 
     def _busy(self):
         return {"ok": False, "busy": True,
                 "error": "「%s」正在进行，请先停止或等待结束"
                          % TASK_LABELS.get(self.task_kind, "任务")}
 
-    # ---------------- 下载 ----------------
+    # ---------------- 下载（逐链接入队，per-task executor） ----------------
     def start_download(self, urls, cfg, no_playlist=False):
-        if self.task_kind:
-            return self._busy()
+        if self.updating:
+            return {"ok": False, "error": "正在更新 yt-dlp，请等待完成"}
         bad = unsafe_arg_in(cfg.get("extra", "")) or unsafe_arg_in(cfg.get("aria_args", ""))
         if bad:
-            return {"ok": False, "error": "附加参数里有被禁用的参数 %s（会执行命令或读本机文件），已阻止" % bad}
+            return {"ok": False, "error": "附加参数里有被禁用的参数 %s，已阻止" % bad}
         good, bad_urls = sanitize_urls(urls or [])
         if not good:
             return {"ok": False, "error": "没有可用的下载链接"}
@@ -235,108 +257,199 @@ class Host:
         if bad_urls:
             self._log("[提示] 已忽略 %d 个无法识别的链接\n" % len(bad_urls), "warn")
         self.save_config(cfg)
-        if not self._reserve("download"):
-            return self._busy()
-        self._begin_download(good, cfg, no_playlist, outdir, source="gui")
-        return {"ok": True}
+        ids = []
+        try:
+            for u in good:
+                spec = {"urls": [u], "cfg": dict(cfg), "outdir": outdir,
+                        "no_playlist": no_playlist, "source": "gui"}
+                ids.append(self.queue.submit(spec, self._exec_download))
+        except ytdlp_queue.QueueFull as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "task_ids": ids}
 
-    def _begin_download(self, urls, cfg, no_playlist, outdir, source):
-        self.ext_cfg = dict(cfg) if source != "gui" else None
-        self.dl_urls, self.dl_no_playlist, self.dl_outdir = list(urls), no_playlist, outdir
-        self.dl_source = source
-        self.net_tried, self.net_name = set(), "normal"
-        self.cookie_warned = False
-        self.user_stopped = False
-        self.running = True
-        self.pstate = new_progress_state()
-        self.t_start = time.time()
-        self._task_ev()
-        self._status("下载中…", "run")
-        warns = []
-        cmd = core.build_download_cmd(cfg, urls, no_playlist=no_playlist, warn=warns)
-        for w in warns:
-            self._log("! " + w + "\n", "warn")
-        self._log("> " + command_text(cmd) + "\n", "cmd")
-        self._worker = threading.Thread(target=self._run, args=(cmd, outdir), daemon=True)
-        self._worker.start()
+    def _exec_download(self, task):
+        cfg = task.cfg
+        task._extra = {}
+        if task.source != "gui":
+            self._task_log(task, "[浏览器扩展] 嗅探地址交给桌面版下载\n", "ok")
+        while True:
+            warns = []
+            c = cfg if task.net_name == "normal" else dict(cfg, **task._extra)
+            cmd = core.build_download_cmd(c, task.urls,
+                                          no_playlist=task.no_playlist, warn=warns)
+            for w in warns:
+                self._task_log(task, "! " + w + "\n", "warn")
+            self._task_log(task, "> " + command_text(cmd) + "\n", "cmd")
+            code, tail, why = ytdlp_queue.run_process(
+                task, cmd, task.outdir, lambda ln: self._task_line(task, ln),
+                stall_seconds=GUI_STALL_SECONDS)
+            task.diag_buf = tail
+            if code is None:
+                self._task_log(task, "启动失败\n", "err")
+                task.exit_code = -1
+                self._task_done(task, -1)
+                return
+            if why.get("reason") == "stall":
+                self._task_log(task, "[长时间没有输出，已自动终止本次任务]\n", "warn")
+            if task.pause_requested or task.cancel_requested:
+                task.exit_code = code
+                return
+            if code == 0:
+                task.exit_code = 0
+                self._task_done(task, 0)
+                return
+            healed = self._task_heal(task, cfg, tail)
+            if healed:
+                continue
+            task.exit_code = code
+            self._task_done(task, code)
+            return
 
-    def submit_server_task(self, task):
-        if not self._reserve("download"):
+    def _task_log(self, task, text, tag=None):
+        task.log_ring.append({"text": text, "tag": tag})
+        self._put({"type": "log", "text": text, "tag": tag, "task_id": task.id})
+        if task.ext_emit:
+            task.ext_emit({"type": "log", "text": text.rstrip("\n")})
+
+    def _task_line(self, task, line):
+        ev = progress_event(task.pstate, line)
+        if ev:
+            st = task.pstate
+            self._put({"type": "progress", "task_id": task.id, "pct": st["pct"],
+                       "speed": st["speed"], "eta": st["eta"], "size": st["size"],
+                       "file": st["file"], "item_i": st["item_i"],
+                       "item_total": st["item_total"], "done_count": len(st["done"])})
+            if task.ext_emit:
+                task.ext_emit({"type": "progress", "pct": st["pct"], "speed": st["speed"],
+                               "eta": st["eta"], "size": st["size"], "file": st["file"],
+                               "item_i": st["item_i"], "item_total": st["item_total"]})
+            if ev["kind"] == "file":
+                self._task_log(task, (progress_text(st) if PROG_MARK in line else line) + "\n", "ok")
+            elif ev["kind"] == "item":
+                self._task_log(task, line + "\n", None)
+            else:
+                self._task_log(task, progress_text(st) + "\n", "prog")
+            return
+        if core.cookie_copy_failed(line):
+            # 浏览器锁库是可预期的首次失败，随后会自动去掉 Cookies 重试；
+            # 按错误红字展示只会吓人（yt-dlp 还会重复打印两遍），压成一条黄色提示。
+            if not task.cookie_warned:
+                task.cookie_warned = True
+                self._task_log(task, "[提示] 浏览器 Cookies 数据库被占用，已忽略 Cookies 继续\n", "warn")
+            return
+        self._task_log(task, line + "\n", classify_line(line))
+
+    def _task_heal(self, task, cfg, tail):
+        """自愈阶梯：同一任务内换配置重试，不释放槽位。"""
+        if not cfg.get("net_hard", True):
             return False
-        self._put({"type": "exttask", "task": task})
+        task.net_tried.add(task.net_name)
+        nxt = next_cookie_plan(tail, task.net_tried, cfg)
+        if not nxt and is_net_failure(tail):
+            nxt = next_net_plan(tail, task.net_tried, cfg, url=task.urls[0])
+        if not nxt:
+            return False
+        task.net_name, task._extra = nxt
+        self._task_log(task, "[自动重试] 换用%s重试（已下载部分会续传）\n"
+                       % (NET_PLAN_LABEL.get(task.net_name) or COOKIE_PLAN_LABEL), "warn")
+        task.pstate = core.new_progress_state()
         return True
 
-    def start_external(self, task):
+    def _task_done(self, task, code):
+        elapsed = time.time() - (task.started_at or task.created_at)
+        status = "ok" if code == 0 else ("canceled" if task.cancel_requested
+                                        else "stopped" if task.pause_requested else "failed")
+        self.record_history({"urls": task.urls, "outdir": task.outdir, "status": status,
+                             "code": code, "elapsed": round(elapsed, 1),
+                             "done_count": len(task.pstate.get("done") or []),
+                             "mode": task.cfg.get("mode", ""), "source": task.source,
+                             "task_id": task.id})
+        if task.ext_emit:
+            task.ext_emit({"type": "done", "code": code})
+        if task.ext_cookie_file and os.path.isfile(task.ext_cookie_file):
+            try:
+                os.remove(task.ext_cookie_file)
+            except OSError:
+                pass
+        if code == 0:
+            self._task_log(task, "=== 完成 · 耗时 %d 秒 ===\n" % int(elapsed), "ok")
+            self._maybe_open_after(task)
+        else:
+            self._task_log(task, "=== 结束，退出码 %s ===\n" % code, "err")
+            self._task_diag(task)
+        self._put({"type": "done", "code": code, "task_id": task.id,
+                   "elapsed": round(elapsed, 1)})
+
+    def _task_diag(self, task):
+        diag = diagnose_pairs(task.diag_buf or "")
+        if not diag:
+            return
+        self._task_log(task, "\n=== 可能的原因与建议 ===\n", "warn")
+        for title, advices in diag:
+            self._task_log(task, "· " + title + "\n", "warn")
+            for a in advices:
+                self._task_log(task, "    - " + a + "\n", None)
+
+    def _maybe_open_after(self, task):
+        """同一输出目录 10 秒内只弹一次资源管理器，避免并发任务各开一个。"""
+        if not task.cfg.get("open_after"):
+            return
+        d = task.outdir
+        now = time.time()
+        if now - self._open_after_ts.get(d, 0) < 10:
+            return
+        self._open_after_ts[d] = now
+        self.open_outdir(d)
+
+    # ---------------- 扩展 / 嗅探提交 ----------------
+    def _ext_spec(self, task):
         cfg = dict(task.get("cfg") or {})
         urls = list(task.get("urls") or ([task["url"]] if task.get("url") else []))
-        emit = task.get("emit")
         if not urls:
-            self._release_runner()
-            self.task_kind = None
-            return
+            return None
         outdir = cfg.get("outdir") or core.DOWNLOAD_DIR
         try:
             os.makedirs(outdir, exist_ok=True)
         except Exception as e:
+            emit = task.get("emit")
             if emit:
                 emit({"type": "log", "level": "err", "text": "无法创建输出目录：%s" % e})
                 emit({"type": "done", "code": -1})
-            self._release_runner()
-            self.task_kind = None
-            return
-        self.ext_emit, self.ext_cfg = emit, cfg
-        self.ext_cookie_file = cfg.get("_sniff_cookie_file")
-        self.dl_urls = urls
-        self.dl_no_playlist = bool(task.get("no_playlist", True))
-        self.dl_outdir = outdir
-        self.dl_source = task.get("source") or "ext"
-        self.net_tried, self.net_name = set(), "normal"
-        self.cookie_warned = False
-        self.user_stopped = False
-        self.running = True
-        self.task_kind = "download"
-        self.pstate = new_progress_state()
-        self.t_start = time.time()
-        self._task_ev()
-        self._status("下载中…（浏览器扩展）", "run")
-        warns = []
-        cmd = core.build_download_cmd(cfg, urls, no_playlist=self.dl_no_playlist, warn=warns)
-        for w in warns:
-            self._log("! " + w + "\n", "warn")
-        self._log("[浏览器扩展] 嗅探地址交给桌面版下载\n", "ok")
-        self._log("> " + command_text(cmd) + "\n", "cmd")
-        self._worker = threading.Thread(target=self._run, args=(cmd, outdir), daemon=True)
-        self._worker.start()
+            return None
+        return {"urls": urls, "cfg": cfg, "outdir": outdir,
+                "no_playlist": bool(task.get("no_playlist", True)),
+                "source": task.get("source") or "ext",
+                "title": str(task.get("title") or ""),
+                "emit": task.get("emit"),
+                "ext_cookie_file": cfg.get("_sniff_cookie_file")}
 
-    def _run(self, cmd, outdir):
+    def _bump_ext_token(self):
+        # 独立服务的 SNIFF_STATE.token 按 RUNNER.task_id+1 预分配；队列不再占
+        # RUNNER 槽位，这里只推进任务号保持镜像 token 对齐（T9 改为对齐 task_id）。
+        if self._web_mod is not None:
+            runner = self._web_mod.RUNNER
+            with runner.lock:
+                runner.task_id += 1
+
+    def submit_server_task(self, task):
+        """扩展提交入队，返回 task_id（truthy 兼容旧 bool 调用）；拒绝返回 None。"""
+        if self.updating:
+            return None
+        spec = self._ext_spec(task)
+        if spec is None:
+            return None
         try:
-            proc = spawn(cmd, outdir)
-        except FileNotFoundError:
-            self._log("找不到 yt-dlp：%s\n" % cmd[0], "err")
-            self._put({"type": "done", "code": -1})
-            return
-        except Exception as e:
-            self._log("启动失败：%s\n" % e, "err")
-            self._put({"type": "done", "code": -1})
-            return
-        self.proc = proc
-        buf = []
-        why = {}
-        try:
-            for line in iter_lines_watch(proc, abort=lambda: self.user_stopped,
-                                         stall_seconds=GUI_STALL_SECONDS, why=why):
-                buf.append(line)
-                self._handle_line(line)
-        except Exception as e:
-            self._log("读取输出出错：%s\n" % e, "err")
-        finally:
-            if why.get("reason") == "stall":
-                self._log("[长时间没有输出，已自动终止本次任务]\n", "warn")
-            self.diag_buf = "\n".join(buf[-300:])
-            self.proc = None
-            self._put({"type": "done", "code": proc.wait()})
+            tid = self.queue.submit(spec, self._exec_download)
+        except ytdlp_queue.QueueFull:
+            return None
+        self._bump_ext_token()
+        return tid
+
+    def start_external(self, task):
+        return self.submit_server_task(task)
 
     def _handle_line(self, line):
+        """辅助操作（探测）共用的逐行处理；下载走 _task_line。"""
         ev = progress_event(self.pstate, line)
         if ev:
             st = self.pstate
@@ -344,10 +457,6 @@ class Host:
                        "eta": st["eta"], "size": st["size"], "file": st["file"],
                        "item_i": st["item_i"], "item_total": st["item_total"],
                        "done_count": len(st["done"])})
-            if self.ext_emit:
-                self.ext_emit({"type": "progress", "pct": st["pct"], "speed": st["speed"],
-                               "eta": st["eta"], "size": st["size"], "file": st["file"],
-                               "item_i": st["item_i"], "item_total": st["item_total"]})
             if ev["kind"] == "file":
                 self._log((progress_text(st) if PROG_MARK in line else line) + "\n", "ok")
             elif ev["kind"] == "item":
@@ -381,85 +490,6 @@ class Host:
         kill_tree(proc)
         self._status("已停止", "err")
         self._log("[已手动停止：%s]\n" % TASK_LABELS.get(self.task_kind, "任务"), "warn")
-        return True
-
-    def _finish_task(self, code):
-        self._release_runner()
-        emit, cookie = self.ext_emit, self.ext_cookie_file
-        self.ext_emit = self.ext_cfg = self.ext_cookie_file = None
-        if emit:
-            emit({"type": "done", "code": code})
-        if cookie and os.path.isfile(cookie):
-            try:
-                os.remove(cookie)
-            except Exception:
-                pass
-
-    def on_done(self, code):
-        base = self._task_cfg()
-        was_ext = self.ext_cfg is not None
-        self.running = False
-        self.proc = None
-        self.task_kind = None
-        elapsed = time.time() - getattr(self, "t_start", 0) if getattr(self, "t_start", 0) else 0
-        done_count = len(self.pstate.get("done") or [])
-        if code == 0:
-            self._status("完成", "ok")
-            self._log("=== 完成 · 耗时 %d 秒 ===\n" % int(elapsed), "ok")
-            self.record_history({"urls": self.dl_urls, "outdir": self.dl_outdir,
-                                 "status": "ok", "code": 0, "elapsed": round(elapsed, 1),
-                                 "done_count": done_count, "mode": base.get("mode", ""),
-                                 "source": getattr(self, "dl_source", "gui")})
-            self._finish_task(code)
-            self._task_ev()
-            if base.get("open_after"):
-                self.open_outdir(base.get("outdir"))
-        else:
-            if self._net_heal():
-                return
-            status = "stopped" if self.user_stopped else "failed"
-            self._status("已停止" if self.user_stopped else "已结束（退出码 %s）" % code, "err")
-            self._log("=== 结束，退出码 %s ===\n" % code, "err")
-            self._log_diag()
-            self.record_history({"urls": self.dl_urls, "outdir": self.dl_outdir,
-                                 "status": status, "code": code, "elapsed": round(elapsed, 1),
-                                 "done_count": done_count, "mode": base.get("mode", ""),
-                                 "source": getattr(self, "dl_source", "gui")})
-            self._finish_task(code)
-            self._task_ev()
-        self._put({"type": "done", "code": code, "elapsed": round(elapsed, 1),
-                   "done_count": done_count})
-
-    def _net_heal(self):
-        if self.user_stopped or not self.dl_urls:
-            return False
-        cfg = self._task_cfg()
-        if not cfg.get("net_hard", True):
-            return False
-        tail = self.diag_buf or ""
-        self.net_tried.add(self.net_name)
-        nxt = next_cookie_plan(tail, self.net_tried, cfg)
-        if not nxt:
-            if not is_net_failure(tail):
-                return False
-            nxt = next_net_plan(tail, self.net_tried, cfg, url=self.dl_urls[0])
-        if not nxt:
-            return False
-        self.net_name, extra = nxt
-        self._log("[自动重试] 换用%s重试（已下载部分会续传）\n"
-                  % (NET_PLAN_LABEL.get(self.net_name) or COOKIE_PLAN_LABEL), "warn")
-        cfg2 = dict(cfg, **extra)
-        self.ext_cfg = cfg2 if self.ext_cfg is not None else None
-        cmd = core.build_download_cmd(cfg2, self.dl_urls, no_playlist=self.dl_no_playlist)
-        self._log("> " + command_text(cmd) + "\n", "cmd")
-        self.pstate = new_progress_state()
-        self.t_start = time.time()
-        self.running = True
-        self.task_kind = "download"
-        self._task_ev()
-        self._status("下载中…（自动重试）", "run")
-        self._worker = threading.Thread(target=self._run, args=(cmd, self.dl_outdir), daemon=True)
-        self._worker.start()
         return True
 
     def _log_diag(self):
@@ -571,8 +601,7 @@ class Host:
         self._put({"type": "detdone", "code": code})
 
     def on_detect_done(self, code):
-        self.task_kind = None
-        self._release_runner()
+        self._release_aux()
         self._task_ev()
         n = len(self.results)
         if n:
@@ -674,8 +703,7 @@ class Host:
         return got_json, msg, "\n".join(lines[-25:])
 
     def on_trodone(self, ok, task):
-        self.task_kind = None
-        self._release_runner()
+        self._release_aux()
         self._task_ev()
         if task == "update":
             self._status("更新完成" if ok else "更新失败", "ok" if ok else "err")
@@ -688,6 +716,9 @@ class Host:
     def update_ytdlp(self, proxy, mirror=""):
         if self.task_kind:
             return self._busy()
+        if self.queue.any_active():
+            return {"ok": False, "busy": True,
+                    "error": "有下载任务正在进行，请先停止或等待结束"}
         proxy = str(proxy or "").strip()
         mirror = str(mirror or "").strip()
         self.save_config({"proxy": proxy, "update_mirror": mirror})
@@ -854,8 +885,7 @@ class Host:
                     continue
             break
         if self.task_kind == "formats":
-            self.task_kind = None
-            self._release_runner()
+            self._release_aux()
             self._task_ev()
         self._put({"type": "formats", "lines": out, "code": code})
 
@@ -964,24 +994,35 @@ class Host:
     def sniff_download(self, items):
         if not items:
             return {"ok": False, "error": "先选中要下载的条目"}
-        if self.task_kind:
-            return self._busy()
+        if self.updating:
+            return {"ok": False, "error": "正在更新 yt-dlp，请等待完成"}
         cfg = dict(self.cfg)
         cfg.update({"fmt": "b", "thumb": False, "meta": False,
                     "sub": False, "embedsub": False})
-        if len(items) == 1:
-            it = items[0]
-            if it.get("referer") or it.get("page_url"):
-                cfg["referer"] = it.get("referer") or it.get("page_url")
-                cfg["_referer_explicit"] = True
-            if it.get("ua"):
-                cfg["ua"] = it["ua"]
-        task = {"urls": [it["url"] for it in items], "kind": "media", "cfg": cfg,
-                "emit": None, "no_playlist": True, "source": "sniff"}
-        if not self.submit_server_task(task):
-            return self._busy()
+        outdir = (cfg.get("outdir") or "").strip() or core.DOWNLOAD_DIR
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except Exception as e:
+            return {"ok": False, "error": "无法创建输出目录：%s" % e}
+        ids = []
+        try:
+            for it in items:
+                c = dict(cfg)
+                if len(items) == 1:
+                    if it.get("referer") or it.get("page_url"):
+                        c["referer"] = it.get("referer") or it.get("page_url")
+                        c["_referer_explicit"] = True
+                    if it.get("ua"):
+                        c["ua"] = it["ua"]
+                spec = {"urls": [it["url"]], "cfg": c, "outdir": outdir,
+                        "no_playlist": True, "source": "sniff",
+                        "title": str(it.get("title") or ""),
+                        "ext_cookie_file": c.get("_sniff_cookie_file")}
+                ids.append(self.queue.submit(spec, self._exec_download))
+        except ytdlp_queue.QueueFull as e:
+            return {"ok": False, "error": str(e)}
         self._put({"type": "sniff_started"})
-        return {"ok": True}
+        return {"ok": True, "task_ids": ids}
 
     def sniff_preview(self, url):
         if self._web_mod is None:
@@ -1022,9 +1063,14 @@ class Host:
     def shutdown(self):
         self.save_config({})
         try:
+            self.queue.stop_all()
+        except Exception:
+            pass
+        try:
             self.stop()
         except Exception:
             pass
+        self.queue.close()
         self.close_embedded_browser()
         self.stop_ext_service()
         self._stop_flag = True

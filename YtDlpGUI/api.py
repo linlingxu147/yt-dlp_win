@@ -70,6 +70,9 @@ class Api:
     def stop(self):
         return {"ok": self.host.stop()}
 
+    def queue_snapshot(self):
+        return {"ok": True, **self.host.queue.snapshot()}
+
     def troubleshoot(self, urls, cfg):
         return self._guard(self.host.troubleshoot, urls, cfg)
 
