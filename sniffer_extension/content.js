@@ -633,7 +633,8 @@
                 return;
             }
             ownTask = true;
-            setStatus("已交给 yt-dlp，开始下载…", "#1a7f37");
+            // 后台按服务端 queue_position 给出文案（排队时「已加入队列，第 N 位」）
+            setStatus(resp.message || "已交给 yt-dlp，开始下载…", "#1a7f37");
             startPolling();
         });
     }

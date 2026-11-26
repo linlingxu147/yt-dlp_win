@@ -351,6 +351,13 @@ async function cookieJarFor(url) {
     }
 }
 
+// 提交成功后的面板文案：服务端排队时回 queue_position（1 起；0 = 立即开始），
+// 旧版服务没有该字段，沿用原提示。task_id 原样透传备用。
+function submitStatusMessage(resp) {
+    const pos = resp && resp.queue_position;
+    return pos ? `已加入队列，第 ${pos} 位` : "已交给 yt-dlp，开始下载…";
+}
+
 async function submit(msg) {
     const url = String(msg.url || "").trim();
     const kind = msg.kind === "page" ? "page" : "media";
@@ -373,7 +380,10 @@ async function submit(msg) {
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || typeof msg !== "object") return;
     if (msg.type === "submit") {
-        submit(msg).then(sendResponse);
+        submit(msg).then((resp) => {
+            if (resp && resp.ok) resp.message = submitStatusMessage(resp);
+            sendResponse(resp);
+        });
         return true;                                  // 异步回复
     }
     if (msg.type === "sniff_log") {

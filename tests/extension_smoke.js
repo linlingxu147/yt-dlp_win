@@ -188,6 +188,50 @@ function fire(listeners, name, ...args) {
                      'https://x/a.mp4?x=1&y=2');
   log('7) 共享嗅探规则通过');
 
-  console.log('\nOK  扩展冒烟全部通过（7 项）');
+  // ---- 8) 排队位置提示：服务端新字段 queue_position / task_id 转成面板文案 ----
+  const sniffFetch = (sniffBody) => async (url) => {
+    if (url.includes('/api/status')) {
+      return { ok: true, json: async () => ({ app: 'yt-dlp-web', busy: false }) };
+    }
+    return { ok: true, json: async () => sniffBody };
+  };
+  storage.local = {};
+  storage.session = {};
+  let qresp = null;
+  w = loadWorker(storage, calls,
+                 sniffFetch({ ok: true, busy: false, url: 'x', task_id: 12, queue_position: 3 }));
+  fire(w.listeners, 'onMessage', { type: 'submit', url: 'https://cdn.example.com/q.mp4',
+                                   kind: 'media', referer: '', ua: 'UA' },
+       { tab: { id: 9 }, frameId: 0 }, (r) => { qresp = r; });
+  await sleep(80);
+  assert.ok(qresp && qresp.ok, '排队提交仍返回成功');
+  assert.strictEqual(qresp.task_id, 12, 'task_id 原样透传');
+  assert.ok(/队列/.test(qresp.message || ''), '排队时提示文案含「队列」');
+  assert.ok(/3/.test(qresp.message || ''), '提示文案带排队位置');
+
+  // queue_position 为 0（立即开始）或字段缺失（旧版服务）：沿用原提示
+  storage.local = {};
+  let nresp = null;
+  w = loadWorker(storage, calls,
+                 sniffFetch({ ok: true, busy: false, url: 'x', task_id: 13, queue_position: 0 }));
+  fire(w.listeners, 'onMessage', { type: 'submit', url: 'https://cdn.example.com/r.mp4',
+                                   kind: 'media', referer: '', ua: 'UA' },
+       { tab: { id: 10 }, frameId: 0 }, (r) => { nresp = r; });
+  await sleep(80);
+  assert.ok(nresp && nresp.ok && !/队列/.test(nresp.message || '')
+            && /开始下载/.test(nresp.message || ''), '未排队时沿用原提示');
+
+  // 旧版服务：响应里根本没有 queue_position，也沿用原提示
+  let oresp = null;
+  w = loadWorker(storage, calls, sniffFetch({ ok: true, busy: false, url: 'x' }));
+  fire(w.listeners, 'onMessage', { type: 'submit', url: 'https://cdn.example.com/s.mp4',
+                                   kind: 'media', referer: '', ua: 'UA' },
+       { tab: { id: 11 }, frameId: 0 }, (r) => { oresp = r; });
+  await sleep(80);
+  assert.ok(oresp && oresp.ok && !/队列/.test(oresp.message || '')
+            && /开始下载/.test(oresp.message || ''), '旧版服务（无 queue_position）沿用原提示');
+  log('8) 排队提示 / 未排队回退:', qresp.message, '|', nresp.message, '|', oresp.message);
+
+  console.log('\nOK  扩展冒烟全部通过（8 项）');
   process.exit(0);
 })().catch((e) => { console.error('FAIL', e && e.message); process.exit(1); });
