@@ -184,6 +184,16 @@ def _queue_busy():
     return QUEUE.any_active()
 
 
+def _queue_position(tid):
+    """tid 在排队任务中的位置（1 起）；运行中/已结束/快照不可查时返回 0。"""
+    try:
+        queued = [t.get("id") for t in _queue_snapshot().get("tasks") or []
+                  if t.get("state") == "queued"]
+        return queued.index(tid) + 1 if tid in queued else 0
+    except Exception:
+        return 0
+
+
 def _mirror(task, obj):
     """把任务事件写进 SNIFF_STATE：只镜像最近一次扩展任务（token 隔离沿用）。"""
     try:
@@ -302,10 +312,11 @@ TASK_SINK = None
 STOP_HOOK = None
 
 
-def set_task_sink(sink, stop=None):
-    global TASK_SINK, STOP_HOOK
-    TASK_SINK = sink
-    STOP_HOOK = stop
+def set_task_sink(sink, stop=None, queue_status=None):
+    """桌面宿主登记钩子：sink 入 host 队列返回 task_id；stop 按任务作用域取消；
+    queue_status 注入 host 队列快照（/api/status、busy、排队位置都改读它）。"""
+    global TASK_SINK, STOP_HOOK, QUEUE_STATUS
+    TASK_SINK, STOP_HOOK, QUEUE_STATUS = sink, stop, queue_status
 
 
 def sniff_emit(obj, token=None):
@@ -959,7 +970,7 @@ class Handler(BaseHTTPRequestHandler):
                 for obj in pending:
                     sniff_emit(obj, tid)
                 return self._json({"ok": True, "busy": False, "url": url,
-                                   "task_id": tid, "queue_position": 0})
+                                   "task_id": tid, "queue_position": _queue_position(tid)})
             # 独立模式：入自建队列，FIFO 调度；队列满（≥200 未完成）才回 409
             try:
                 tid = QUEUE.submit(
@@ -971,7 +982,8 @@ class Handler(BaseHTTPRequestHandler):
                     _server_executor)
             except ytdlp_queue.QueueFull as e:
                 _drop_cookie(cfg)
-                return self._json({"ok": False, "busy": True, "error": str(e)}, 409)
+                return self._json({"ok": False, "busy": True, "running_kind": "download",
+                                   "error": str(e)}, 409)
             LAST_EXT_TASK["id"] = tid
             with SNIFF_LOCK:
                 SNIFF_STATE.update({"lines": [], "prog": None, "last_text": "已接收，正在排队…",
@@ -985,27 +997,33 @@ class Handler(BaseHTTPRequestHandler):
                     if SNIFF_STATE.get("token") == tid:
                         SNIFF_STATE["done"] = True
                         SNIFF_STATE["code"] = t.exit_code if t.exit_code is not None else -1
-            queued_ids = [t["id"] for t in QUEUE.snapshot()["tasks"]
-                          if t["state"] == "queued"]
-            pos = queued_ids.index(tid) + 1 if tid in queued_ids else 0
             return self._json({"ok": True, "busy": False, "url": url,
-                               "task_id": tid, "queue_position": pos})
+                               "task_id": tid, "queue_position": _queue_position(tid)})
 
         if p == "/api/sniff/log":
             return self._json(sniff_log_json())
 
         if p == "/api/stop":
             qs = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
-            tid = body.get("id") or (qs.get("id") or [None])[0]
-            try:
-                tid = int(tid) if tid not in (None, "") else None
-            except (TypeError, ValueError):
+            raw = body.get("id")
+            if raw in (None, ""):
+                raw = (qs.get("id") or [None])[0]
+            if raw in (None, ""):
                 tid = None
+            else:
+                try:
+                    tid = int(raw)
+                except (TypeError, ValueError):
+                    # 非法 id 直接拒绝：不能悄悄回退成「停最近一次任务」
+                    return self._json({"ok": False})
             if QUEUE_STATUS is not None and STOP_HOOK is not None:
-                # 桌面模式（T9 接线后）：按 id 精确停止，不传停最近扩展任务
+                # 桌面模式：按 id 精确停止；不传只停最近扩展任务。
+                # 没有最近任务时给钩子 None，由宿主拒绝（不得 stop_all 误杀 GUI 任务）。
+                if tid is None:
+                    tid = LAST_EXT_TASK.get("id")
                 ok = STOP_HOOK(tid)
             elif TASK_SINK is not None:
-                # T9 之前的桌面宿主：stop 钩子无参，沿用旧行为；带 id 的精确停止待 T9
+                # 旧桌面宿主（未注入 QUEUE_STATUS）：stop 钩子无参，沿用旧行为
                 ok = STOP_HOOK() if (STOP_HOOK is not None and tid is None) else False
             elif tid is not None:
                 ok = QUEUE.cancel(tid)

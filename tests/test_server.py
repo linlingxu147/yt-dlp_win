@@ -493,6 +493,151 @@ class TestTaskSink(unittest.TestCase):
                          "https://www.douyin.com/video/7679426956026187035")
 
 
+class TestDesktopSink(unittest.TestCase):
+    """桌面模式接线（T9）：QUEUE_STATUS 注入、queue_position、停止按任务作用域。"""
+
+    def setUp(self):
+        import urllib.error
+        import urllib.request
+        self.req = urllib.request
+        self.err = urllib.error
+        try:
+            self.svc = server.start_service(port=8897)
+        except OSError as e:
+            self.skipTest("端口 8897 被占用：%s" % e)
+        self.addCleanup(self.svc.shutdown)
+        self.addCleanup(server.set_task_sink, None, stop=None, queue_status=None)
+        server.set_task_sink(None, stop=None, queue_status=None)
+        server.LAST_EXT_TASK["id"] = None
+        with server.SNIFF_LOCK:
+            server.SNIFF_STATE.update({"lines": [], "prog": None, "done": True,
+                                       "code": None, "token": 0})
+
+    def _get(self, path):
+        with self.req.urlopen(self.svc.url + path, timeout=5) as r:
+            return r.status, json.loads(r.read())
+
+    def _post(self, path, body):
+        req = self.req.Request(self.svc.url + path, data=json.dumps(body).encode(),
+                               headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with self.req.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read())
+        except self.err.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_set_task_sink_sets_all_three_globals(self):
+        seen = {}
+
+        def sink(task):
+            seen["task"] = task
+            return 42
+
+        stop = lambda tid=None: True
+        snap = lambda: {"tasks": [], "running": 0, "queued": 0}
+        server.set_task_sink(sink, stop=stop, queue_status=snap)
+        self.assertEqual(server.TASK_SINK({"url": "http://e/a"}), 42)
+        self.assertEqual(seen["task"]["url"], "http://e/a")
+        self.assertIs(server.STOP_HOOK, stop)
+        self.assertIs(server.QUEUE_STATUS, snap)
+        server.set_task_sink(None, stop=None, queue_status=None)
+        self.assertIsNone(server.TASK_SINK)
+        self.assertIsNone(server.STOP_HOOK)
+        self.assertIsNone(server.QUEUE_STATUS)
+
+    def test_status_busy_reflects_host_queue(self):
+        """MUST-FIX：桌面模式 busy/tasks/running/queued 必须来自 host 队列快照。"""
+        snap = {"tasks": [{"id": 5, "state": "running", "source": "gui",
+                           "started_at": time.time()}],
+                "running": 1, "queued": 2}
+        server.set_task_sink(lambda t: 9, stop=lambda tid=None: True,
+                             queue_status=lambda: snap)
+        st, data = self._get("/api/status")
+        self.assertEqual(st, 200)
+        self.assertTrue(data["busy"])
+        self.assertEqual(data["kind"], "download")
+        self.assertEqual(data["running"], 1)
+        self.assertEqual(data["queued"], 2)
+        self.assertEqual(data["tasks"], snap["tasks"])
+        self.assertGreaterEqual(data["elapsed"], 0)
+        d = server.sniff_log_json()
+        self.assertTrue(d["busy"])
+        self.assertEqual(d["running_kind"], "download")
+
+    def test_status_idle_when_host_queue_empty(self):
+        server.set_task_sink(lambda t: 9, stop=lambda tid=None: True,
+                             queue_status=lambda: {"tasks": [], "running": 0, "queued": 0})
+        _, data = self._get("/api/status")
+        self.assertFalse(data["busy"])
+        self.assertIsNone(data["kind"])
+        self.assertEqual(data["running"], 0)
+        self.assertEqual(data["queued"], 0)
+
+    def test_sniff_queue_position_computed_from_host_snapshot(self):
+        snap = {"tasks": [{"id": 5, "state": "queued"}, {"id": 7, "state": "queued"}],
+                "running": 0, "queued": 2}
+        server.set_task_sink(lambda t: 7, stop=lambda tid=None: True,
+                             queue_status=lambda: snap)
+        st, j = self._post("/api/sniff", {"url": "https://example.com/v.mp4"})
+        self.assertEqual(st, 200)
+        self.assertTrue(j["ok"])
+        self.assertEqual(j["task_id"], 7)
+        self.assertEqual(j["queue_position"], 2)
+        self.assertEqual(server.LAST_EXT_TASK["id"], 7)
+        # 运行中（不在排队列表）→ 位置 0
+        snap["tasks"] = [{"id": 7, "state": "running", "started_at": time.time()}]
+        snap["running"], snap["queued"] = 1, 0
+        _, j2 = self._post("/api/sniff", {"url": "https://example.com/w.mp4"})
+        self.assertEqual(j2["queue_position"], 0)
+
+    def test_stop_without_id_uses_last_ext_task(self):
+        calls = []
+        server.set_task_sink(lambda t: 9,
+                             stop=lambda tid: calls.append(tid) or True,
+                             queue_status=lambda: {"tasks": [], "running": 0, "queued": 0})
+        self._post("/api/sniff", {"url": "https://example.com/v.mp4"})
+        self.assertEqual(server.LAST_EXT_TASK["id"], 9)
+        st, j = self._post("/api/stop", {})
+        self.assertEqual(st, 200)
+        self.assertTrue(j["ok"])
+        self.assertEqual(calls, [9])
+
+    def test_stop_with_id_passes_that_id(self):
+        calls = []
+        server.set_task_sink(lambda t: 9,
+                             stop=lambda tid: calls.append(tid) or True,
+                             queue_status=lambda: {"tasks": [], "running": 0, "queued": 0})
+        self._post("/api/sniff", {"url": "https://example.com/v.mp4"})
+        st, j = self._post("/api/stop", {"id": 3})
+        self.assertEqual(st, 200)
+        self.assertTrue(j["ok"])
+        self.assertEqual(calls, [3])
+
+    def test_stop_invalid_id_does_not_fall_back_to_latest(self):
+        calls = []
+        server.set_task_sink(lambda t: 9,
+                             stop=lambda tid: calls.append(tid) or True,
+                             queue_status=lambda: {"tasks": [], "running": 0, "queued": 0})
+        self._post("/api/sniff", {"url": "https://example.com/v.mp4"})
+        st, j = self._post("/api/stop", {"id": "abc"})
+        self.assertEqual(st, 200)
+        self.assertFalse(j["ok"])
+        self.assertEqual(calls, [])          # 非法 id 不许悄悄停掉最近任务
+        st, j = self._post("/api/stop?id=abc", {})
+        self.assertFalse(j["ok"])
+        self.assertEqual(calls, [])
+
+    def test_stop_without_id_and_no_ext_task_is_noop(self):
+        calls = []
+        server.set_task_sink(lambda t: 9,
+                             stop=lambda tid: calls.append(tid) or False,
+                             queue_status=lambda: {"tasks": [], "running": 0, "queued": 0})
+        st, j = self._post("/api/stop", {})
+        self.assertEqual(st, 200)
+        self.assertFalse(j["ok"])
+        self.assertEqual(calls, [None])      # 钩子收到 None，由宿主拒绝，不得 stop_all
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -618,6 +763,7 @@ class TestServerQueueFields(unittest.TestCase):
         self.assertEqual(st, 409)
         self.assertFalse(j["ok"])
         self.assertTrue(j["busy"])
+        self.assertEqual(j["running_kind"], "download")
         self.assertIn("队列已满", j["error"])
 
     def test_status_busy_follows_running_task(self):
@@ -673,6 +819,17 @@ class TestServerQueueFields(unittest.TestCase):
             self.assertEqual(st, 200)
             self.assertTrue(j["ok"])
             self._wait_state(j1["task_id"], ("canceled",))
+
+    def test_stop_invalid_id_does_not_cancel_latest(self):
+        with mock.patch.object(server, "_server_executor", self._block_executor):
+            _, j1 = self._submit()
+            self._wait_state(j1["task_id"], ("running",))
+            st, j = self._post("/api/stop", {"id": "abc"})
+            self.assertEqual(st, 200)
+            self.assertFalse(j["ok"])
+            t = server.QUEUE.get(j1["task_id"])
+            self.assertIsNotNone(t)
+            self.assertIn(t.state, ("queued", "running"))
 
     def test_fast_finished_task_still_reports_done(self):
         """任务在镜像回填前就结束（如启动即失败）时，轮询不能永远卡在「进行中」。"""

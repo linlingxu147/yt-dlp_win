@@ -351,6 +351,91 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual(self.host.history[-1]["source"], "ext")
         self.assertTrue(any(e.get("type") == "done" for e in emitted))
 
+    def test_stop_ext_task_cancels_only_that_task(self):
+        """扩展停止按任务作用域：只取消指定任务，不误杀 GUI 任务、不 stop_all。"""
+        started, release = threading.Event(), threading.Event()
+        entered = []
+
+        def blocking_iter(proc, abort=None, keepalive=None, **kw):
+            entered.append(1)
+            if len(entered) >= 2:
+                started.set()
+            release.wait(5)
+            yield "[download] Destination: v.mp4"
+
+        with mock.patch.object(self.mod.core, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod.core, "iter_lines_watch", blocking_iter):
+            r = self.host.start_download(["https://x/gui"], self.cfg)
+            self.assertTrue(r["ok"], r)
+            ext_tid = self.host.submit_server_task(
+                {"url": "https://x/ext", "cfg": dict(self.cfg)})
+            self.assertTrue(ext_tid)
+            self.assertTrue(started.wait(5))
+            ok = self.host.stop_ext_task(ext_tid)
+            release.set()
+            ext = self._wait_task(ext_tid)
+            gui = self._wait_task(r["task_ids"][0])
+        self.assertTrue(ok)
+        self.assertEqual(ext.state, "canceled")
+        self.assertEqual(gui.state, "done")          # GUI 任务不受影响
+        self.assertTrue(any(h.get("task_id") == ext_tid and h["status"] == "canceled"
+                            for h in self.host.history))
+
+    def test_stop_ext_task_rejects_unknown_and_invalid_ids(self):
+        self.assertFalse(self.host.stop_ext_task(None))
+        self.assertFalse(self.host.stop_ext_task(999))
+        self.assertFalse(self.host.stop_ext_task("abc"))
+
+    def test_stop_ext_task_emits_done_to_extension(self):
+        """运行中被扩展停止：镜像要收到 done，扩展面板不能永远卡在「进行中」。"""
+        emitted = []
+        started, release = threading.Event(), threading.Event()
+
+        def blocking_iter(proc, abort=None, keepalive=None, **kw):
+            started.set()
+            release.wait(5)
+            yield "[download] Destination: v.mp4"
+
+        with mock.patch.object(self.mod.core, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod.core, "iter_lines_watch", blocking_iter):
+            tid = self.host.submit_server_task(
+                {"url": "https://x/ext", "cfg": dict(self.cfg), "emit": emitted.append})
+            self.assertTrue(tid)
+            self.assertTrue(started.wait(5))
+            self.assertTrue(self.host.stop_ext_task(tid))
+            release.set()
+            t = self._wait_task(tid)
+        self.assertEqual(t.state, "canceled")
+        self.assertTrue(any(e.get("type") == "done" for e in emitted))
+
+    def test_cancel_queued_ext_task_emits_done(self):
+        """排队中被扩展停止：执行器不会跑，done 由取消路径补发。"""
+        self.host.queue.set_max(1)
+        gate = threading.Event()
+
+        def blocker(task):
+            gate.wait(5)
+            task.exit_code = 0
+
+        gui_tid = self.host.queue.submit(
+            {"urls": ["https://x/gui"], "cfg": dict(self.cfg),
+             "outdir": self.cfg["outdir"], "source": "gui"}, blocker)
+        emitted = []
+        try:
+            ext_tid = self.host.submit_server_task(
+                {"url": "https://x/ext", "cfg": dict(self.cfg), "emit": emitted.append})
+            self.assertTrue(ext_tid)
+            end = time.time() + 5
+            while time.time() < end and self.host.queue.get(gui_tid).state != "running":
+                time.sleep(0.02)
+            self.assertEqual(self.host.queue.get(ext_tid).state, "queued")
+            self.assertTrue(self.host.stop_ext_task(ext_tid))
+            self.assertEqual(self.host.queue.get(ext_tid).state, "canceled")
+            self.assertTrue(any(e.get("type") == "done" for e in emitted))
+        finally:
+            gate.set()
+            self._wait_task(gui_tid)
+
 
 class DetectTroubleTest(unittest.TestCase):
     def setUp(self):
@@ -575,27 +660,33 @@ class SniffServiceTest(unittest.TestCase):
         self.assertFalse(r["ok"])
 
     def test_set_ext_service_lifecycle_with_stub(self):
-        class StubRunner:
-            def reserve(self, kind): return True
-            def finish(self): pass
+        captured = {}
+
         class StubMod:
-            RUNNER = StubRunner()
             def set_config_file(self, p): pass
             def start_service(self):
                 class Svc:
                     url = "http://127.0.0.1:8799"
                     def shutdown(self): pass
                 return Svc()
-            def set_task_sink(self, sink, stop=None): pass
+            def set_task_sink(self, sink, stop=None, queue_status=None):
+                captured.update(sink=sink, stop=stop, queue_status=queue_status)
         self.host.load_web_server = lambda: StubMod()
         r = self.host.set_ext_service(True)
         self.assertTrue(r["ok"])
         self.assertIsNotNone(self.host.web_svc)
+        # T9 接线：sink 入 host 队列、stop 按任务作用域、状态快照来自 host 队列
+        self.assertEqual(captured["sink"], self.host.submit_server_task)
+        self.assertEqual(captured["stop"], self.host.stop_ext_task)
+        self.assertEqual(captured["queue_status"], self.host.queue.snapshot)
         self.host.pump_once()
         self.assertTrue(any(e["type"] == "svc" and e["ok"] for e in self.events))
         self.host.set_ext_service(False)
         self.assertIsNone(self.host.web_svc)
         self.assertFalse(self.host.cfg["ext_service"])
+        self.assertIsNone(captured["sink"])
+        self.assertIsNone(captured["stop"])
+        self.assertIsNone(captured["queue_status"])
 
 
 class UpdateMirrorFlowTest(unittest.TestCase):

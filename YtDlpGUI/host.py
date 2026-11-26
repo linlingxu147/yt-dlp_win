@@ -281,6 +281,9 @@ class Host:
             # 暂停/取消早退先于启动失败分支：取消已由控制方法记历史，不能再走 _task_done
             if task.pause_requested or task.cancel_requested:
                 task.exit_code = -1 if code is None else code
+                if task.cancel_requested and task.ext_emit:
+                    # 运行中被取消：给扩展镜像补发 done（排队中取消由 cancel_task 补发）
+                    task.ext_emit({"type": "done", "code": task.exit_code})
                 self._clean_ext_cookie(task)
                 return
             if code is None:
@@ -496,8 +499,26 @@ class Host:
         if task is not None:
             if ok:
                 self._record_task_history(task, "canceled")
+                # 排队/暂停中被取消：执行器不会再跑，done 在这里补发给扩展镜像；
+                # 运行中取消由执行器早退分支补发，避免面板永远卡在「进行中」。
+                if task.state == "canceled" and task.ext_emit:
+                    task.ext_emit({"type": "done",
+                                   "code": task.exit_code if task.exit_code is not None else -1})
             self._clean_ext_cookie(task)
         return ok
+
+    def stop_ext_task(self, tid):
+        """扩展 /api/stop 钩子（T9）：只取消指定队列任务，不误杀 GUI 任务、不 stop_all。
+
+        tid 缺失/非法返回 False；复用 cancel_task 的先取消后记历史与 Cookie 清理。
+        """
+        if tid is None:
+            return False
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            return False
+        return self.cancel_task(tid)
 
     def stop_all_downloads(self):
         """全部停止/退出：运行中记 stopped 并保留部分下载；排队直接丢弃（spec §4）。"""
@@ -940,7 +961,9 @@ class Host:
             mod.set_config_file(self.config_file)
             self._web_mod = mod
             self.web_svc = mod.start_service()
-            mod.set_task_sink(self.submit_server_task, stop=self.stop)
+            # T9：扩展任务入同一队列；停止按任务作用域；状态/排队位置读 host 队列快照
+            mod.set_task_sink(self.submit_server_task, stop=self.stop_ext_task,
+                              queue_status=self.queue.snapshot)
         except Exception as e:
             self.web_svc = None
             self._web_mod = None
@@ -955,7 +978,7 @@ class Host:
         if self.web_svc is None:
             return
         if self._web_mod:
-            self._web_mod.set_task_sink(None, stop=None)
+            self._web_mod.set_task_sink(None, stop=None, queue_status=None)
         try:
             self.web_svc.shutdown()
         except Exception:
