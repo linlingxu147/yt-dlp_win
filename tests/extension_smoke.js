@@ -15,6 +15,8 @@ const assert = require('assert');
 
 const SRC = fs.readFileSync(
   path.join(__dirname, '..', 'sniffer_extension', 'background.js'), 'utf8');
+const RULES_SRC = fs.readFileSync(
+  path.join(__dirname, '..', 'sniffer_extension', 'sniff_rules.js'), 'utf8');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function makeChrome(storage, calls) {
@@ -69,6 +71,7 @@ function loadWorker(storage, calls, fetchImpl) {
                     fetch: fetchImpl || (async () => { throw new Error('offline'); }) };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
+  vm.runInContext(RULES_SRC, sandbox, { filename: 'sniff_rules.js' });
   vm.runInContext(SRC, sandbox, { filename: 'background.js' });
   return { chrome, listeners: chrome.__listeners };
 }
@@ -146,6 +149,7 @@ function fire(listeners, name, ...args) {
     path.join(__dirname, '..', 'sniffer_extension', 'audio_stream.js'), 'utf8');
   const audioBox = {};
   vm.createContext(audioBox);
+  vm.runInContext(RULES_SRC, audioBox, { filename: 'sniff_rules.js' });
   vm.runInContext(audioSrc, audioBox, { filename: 'audio_stream.js' });
   assert.ok(audioBox.isAudioStream('https://x/a-1-30280.m4s'), 'B 站 30280 是音频');
   assert.ok(audioBox.isAudioStream('https://x/a.mp3?x=1'), 'mp3 后缀是音频');
@@ -154,6 +158,24 @@ function fire(listeners, name, ...args) {
             '只在查询参数里出现 .m4s 的日志地址不算');
   log('6) 音频流识别通过（302xx / 音频后缀）');
 
-  console.log('\nOK  扩展冒烟全部通过（6 项）');
+  // ---- 7) 共享规则（与桌面 sniff_rules.py 读同一份 JSON 表） ----
+  const rulesBox = {};
+  vm.createContext(rulesBox);
+  vm.runInContext(RULES_SRC, rulesBox, { filename: 'sniff_rules.js' });
+  const SR = rulesBox.SniffRules;
+  assert.ok(SR.accept('https://x/a.m3u8', 'application/vnd.apple.mpegurl', 0), 'm3u8 清单可收');
+  assert.ok(SR.accept('https://x/a.mp4', '', 0), 'mp4 后缀可收');
+  assert.ok(!SR.accept('https://x/page', 'text/html', 999999), 'html 不收');
+  assert.ok(!SR.accept('https://x/sound', 'audio/mpeg', 1000), '纯 MIME 小文件不收');
+  assert.ok(SR.accept('https://x/sound', 'audio/mpeg', 300000), '纯 MIME 大文件可收');
+  assert.ok(!SR.accept('ftp://x/a.mp4', 'video/mp4', 0), '非 http(s) 不收');
+  assert.strictEqual(SR.classify('https://x/a.m3u8', ''), 'stream');
+  assert.strictEqual(SR.classify('https://x/a-1-30280.m4s', ''), 'audio');
+  assert.strictEqual(SR.classify('https://x/a.mp4', 'video/mp4'), 'video');
+  assert.strictEqual(SR.normalizeUrl('  https://x/a.mp4?x=1&amp;y=2  '),
+                     'https://x/a.mp4?x=1&y=2');
+  log('7) 共享嗅探规则通过');
+
+  console.log('\nOK  扩展冒烟全部通过（7 项）');
   process.exit(0);
 })().catch((e) => { console.error('FAIL', e && e.message); process.exit(1); });

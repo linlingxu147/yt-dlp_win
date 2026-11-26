@@ -29,8 +29,10 @@ function render() {
     });
     tdSel.appendChild(cb);
     tr.appendChild(tdSel);
-    for (const v of [r.title || '', r.url || '', r.audio ? '音频' : (r.kind || ''),
-                     fmtSize(r.size), r.source || '', r.page_url || '',
+    const entry = r.entry === 'embedded' ? '内嵌'
+      : r.entry === 'extension' ? '扩展' : (r.entry || '');
+    for (const v of [r.title || '', r.url || '', r.audio ? '音频' : (r.mime || r.kind || ''),
+                     entry, fmtSize(r.size), r.source || '', r.page_url || '',
                      new Date((r.ts || 0) * 1000).toLocaleTimeString('zh-CN', { hour12: false })]) {
       const td = document.createElement('td');
       td.textContent = v;
@@ -58,7 +60,8 @@ async function refresh() {
   const fold = document.getElementById('sn-fold').checked;
   const showAudio = document.getElementById('sn-audio').checked;
   shown = items.filter(r => (r.audio ? showAudio : !(fold && r.seg)));
-  const s = JSON.stringify([fold, showAudio, shown.map(r => [r.url, r.ts, r.size])]);
+  const s = JSON.stringify([fold, showAudio,
+    shown.map(r => [r.url, r.ts, r.size, r.entry, r.cat, r.mime])]);
   if (s === sig) return;
   sig = s;
   render();

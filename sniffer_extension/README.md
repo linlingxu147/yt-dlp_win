@@ -18,6 +18,14 @@
 2. **页面请求钩子**（注入页面世界）：拦截 XHR / fetch 响应正文识别 `#EXTM3U`（HLS）与 `<MPD`（DASH），钩住 `JSON.parse` 挖接口返回里的媒体地址
 3. **页面元素**：扫描 `<video>/<audio>` 的 src 与 `<source>`（含 iframe 内的元素，转发到顶层汇总）
 
+## 共享嗅探规则
+
+`sniff_rules.js` 是扩展与桌面版内嵌浏览器的唯一规则源：MIME / 后缀、清单 / 分片、音频单轨、
+URL 清洗都在这里。`background.js` 用 `importScripts` 加载，`content.js` 由 manifest 先加载；
+桌面的 `sniff_rules.py` 读取同一份 `RULE-SOURCES` JSON 表，不复制第二份正则。
+
+改规则只改 `sniff_rules.js`，然后到扩展页点「重新加载」并刷新页面。
+
 ## 使用步骤
 
 1. **启动服务**：开着 **桌面版**（`YtDlpGUI\启动.bat`）即可——它默认内嵌本机服务，右上角会显示「扩展服务：127.0.0.1:8765」；也可以双击 `YtDlpWeb\启动.bat`（或 `python YtDlpWeb/server.py`）用独立模式。扩展会自动在 8765-8775 端口范围内发现服务
@@ -108,11 +116,14 @@ B 站等 DASH 站点会把音频单独做成一条 `.m4s`（流 ID `302xx`），
 
 - 面板标题旁的「显示音频 (N)」开关可展开/收起，状态会记住（`chrome.storage.local`）。
 - 展开后音频条目标蓝黄「音频」标签，仍可正常试播/下载。
-- 识别口径与桌面版一致：`[-_]302\d{2}\.m4s`（B 站音频）或 `.m4a/.mp3/.aac/.flac/.wav/.opus`；
-  逻辑在 `audio_stream.js`，由 content 脚本加载。
+- 识别口径与桌面版一致：`[-_]302\d{2}\.m4s`（B 站音频）或 `.m4a/.mp3/.aac/.flac/.wav/.ogg/.opus`；
+  逻辑在 `sniff_rules.js` 的 `isAudio`，`audio_stream.js` 只保留旧函数名给 content 脚本用。
 
 ## 版本
 
+- **v1.10.0**：嗅探判定抽到 `sniff_rules.js`（扩展后台/内容脚本与桌面版内嵌浏览器共用），
+  上报条目新增 `entry` / `cat` / `mime` 字段；MV3 后台改用 `importScripts` 加载规则。
+  桌面版内嵌浏览器开始按同一份规则登记网络响应，嗅探页显示「入口」列（扩展 / 内嵌）
 - **v1.9.1**：音频单轨识别 + 默认隐藏——B 站 DASH 音频 `302xx m4s` 与常见音频后缀会在浮条里
   标注「音频」，默认不进列表；标题旁「显示音频 (N)」开关可展开，偏好跨页保存（`audio_stream.js`）。
   桌面版「扩展嗅探」页签同步新增「显示音频流」开关

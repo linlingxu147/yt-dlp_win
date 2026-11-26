@@ -51,13 +51,11 @@
     }
 
     function guessKind(url) {
-        if (/\.m3u8(\?|#|$)/i.test(url)) return "m3u8";
-        if (/\.mpd(\?|#|$)/i.test(url)) return "mpd";
-        if (/\.(mp3|m4a|aac|flac|wav|ogg|opus)(\?|#|$)/i.test(url)) return "audio";
-        return "video";
+        return SniffRules.guessKind(url);
     }
 
     function addItem(url, kind, size, source) {
+        url = SniffRules.normalizeUrl(url);
         if (!isHttpUrl(url)) return;
         if (items[url]) {
             if (size && !items[url].size) items[url].size = size;
@@ -127,10 +125,11 @@
         const d = e.detail || {};
         if (!d || !d.url) return;
         if (!sniffToken || d.token !== sniffToken) return;   // 页面伪造的：没有 nonce
-        if (!isHttpUrl(d.url)) return;
-        if (netSeen.has(d.url)) { addItem(d.url, d.kind, d.size, "页面请求"); return; }
+        const url = SniffRules.normalizeUrl(d.url);
+        if (!isHttpUrl(url)) return;
+        if (netSeen.has(url)) { addItem(url, d.kind, d.size, "页面请求"); return; }
         // 钩子可能比后台的 webRequest 回传更早，给网络侧 4 秒追上来的机会
-        if (pendingMain.length < 200) pendingMain.push({ url: d.url, kind: d.kind, size: d.size, ts: Date.now() });
+        if (pendingMain.length < 200) pendingMain.push({ url: url, kind: d.kind, size: d.size, ts: Date.now() });
         if (pendingMain.length === 1) setTimeout(flushPendingMain, 600);
     });
 
@@ -139,9 +138,12 @@
         if (!msg || typeof msg !== "object") return;
         if (msg.type === "net_items" || msg.type === "frame_items") {
             for (const it of (msg.items || [])) {
-                if (isHttpUrl(it.url)) netSeen.add(it.url);
-                addItem(it.url, guessKind(it.url), it.size || 0,
-                        msg.type === "net_items" ? "网络响应" : "iframe");
+                const url = SniffRules.normalizeUrl(it.url);
+                if (isHttpUrl(url)) {
+                    netSeen.add(url);
+                    addItem(url, guessKind(url), it.size || 0,
+                            msg.type === "net_items" ? "网络响应" : "iframe");
+                }
             }
         } else if (msg.type === "net_items_gone") {
             let hit = 0;

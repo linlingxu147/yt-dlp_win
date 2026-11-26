@@ -30,6 +30,7 @@ body {
 .top { display: flex; gap: 14px; align-items: baseline; padding: 0 4px 8px; }
 .top h1 { font-size: 18px; margin: 0; }
 .top span { font-size: 12px; }
+#btn-browser { margin-inline-start: auto; align-self: center; }
 
 /* 页签：选中态从 aria-selected 取，下划线用伪元素 border（强制颜色模式可见） */
 [role="tablist"] { display: flex; gap: 4px; border-block-end: 1px solid var(--border); }

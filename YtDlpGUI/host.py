@@ -69,6 +69,7 @@ class Host:
         self._play_ok = False
         self._sniff_clip = ""
         self._worker = None
+        self.embedded = None
 
     # ---------------- 事件泵 ----------------
     def mark_ready(self):
@@ -899,6 +900,34 @@ class Host:
         self.save_config({"ext_service": bool(on)})
         return r
 
+    # ---------------- 内嵌浏览器 ----------------
+    def open_embedded_browser(self, window=None):
+        try:
+            from embedded import EmbeddedBrowser
+        except Exception as e:
+            return {"ok": False, "error": "内嵌浏览器模块不可用：%s" % e}
+        if self.embedded is None:
+            self.embedded = EmbeddedBrowser(self.register_embedded_sniff)
+        return self.embedded.open(window)
+
+    def register_embedded_sniff(self, items, page_url=""):
+        """内嵌浏览器合批后的条目 → 复用扩展服务的登记表（同址去重/300 条上限）。"""
+        if self._web_mod is None:
+            return False
+        try:
+            self._web_mod.register_sniff_items(items, page_url)
+            return True
+        except Exception:
+            return False
+
+    def close_embedded_browser(self):
+        b, self.embedded = self.embedded, None
+        if b is not None:
+            try:
+                b.close()
+            except Exception:
+                pass
+
     # ---------------- 扩展嗅探 ----------------
     def sniff_items(self):
         if self._web_mod is None:
@@ -975,6 +1004,7 @@ class Host:
             self.stop()
         except Exception:
             pass
+        self.close_embedded_browser()
         self.stop_ext_service()
         try:
             clear_preview_links(self.cfg.get("outdir") or os.path.join(core.BASE_DIR, "downloads"))

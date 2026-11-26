@@ -45,7 +45,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 PORT_RANGE = core.PORT_RANGE
 APP_ID = "yt-dlp-web"          # 扩展靠它确认「端口上跑的是本项目」，而不是别的服务
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 
 # 唯一被放行的扩展 ID——由 sniffer_extension\manifest.json 里的 "key" 决定（打包后固定不变）。
 # 以前这里是「任何 chrome-extension:// 都放行」，等于让本机的其它扩展也能改配置、
@@ -456,6 +456,31 @@ def sniff_log_json():
 SNIFF_ITEMS = {}
 SNIFF_ITEMS_LOCK = threading.Lock()
 SNIFF_MAX_ITEMS = 300
+SNIFF_CATS = ("video", "image", "audio", "stream", "other")
+
+
+def sniff_cat(url, mime, seg=False, manifest=False, audio=False):
+    """把条目归到 video/image/audio/stream/other（客户端没传 cat 时的兜底）。"""
+    m = str(mime or "").lower()
+    if audio or m.startswith("audio/"):
+        return "audio"
+    if manifest or seg or "mpegurl" in m or "dash" in m:
+        return "stream"
+    if m.startswith("video/"):
+        return "video"
+    if m.startswith("image/"):
+        return "image"
+    try:
+        ext = os.path.splitext(urlsplit(str(url or "")).path.lower())[1]
+    except Exception:
+        ext = ""
+    if ext in (".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".mpg", ".mpeg"):
+        return "video"
+    if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".avif"):
+        return "image"
+    if ext in (".m4a", ".mp3", ".aac", ".flac", ".wav", ".opus", ".ogg"):
+        return "audio"
+    return "other"
 
 PREVIEW_DIR = os.path.join(tempfile.gettempdir(), "ytdlp_preview")
 PREVIEW_TOKENS = {}
@@ -477,14 +502,34 @@ def register_sniff_items(items, page_url=""):
             if not core.is_http_url(url):
                 continue
             rec = SNIFF_ITEMS.get(url) or {"url": url, "first_ts": now}
+            seg = core.looks_like_segment(url)
+            manifest = core.looks_like_manifest(url)
+            audio = core.looks_like_audio(url)
+            mime = str(it.get("mime") or it.get("kind") or rec.get("mime") or "")[:200]
+            # entry 记录「第一次是谁抓到的」：老扩展不传，默认 extension；
+            # 同一 URL 被两边同时抓到时保留首个来源，列表里只有一条。
+            raw_entry = str(it.get("entry") or "").strip().lower()
+            if raw_entry not in ("extension", "embedded"):
+                raw_entry = ""
+            entry = rec.get("entry") or raw_entry or "extension"
+            cat = str(it.get("cat") or "").strip().lower()[:16]
+            if cat not in SNIFF_CATS:
+                cat = sniff_cat(url, mime, seg, manifest, audio)
+            try:
+                size = int(it.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
             rec.update({
-                # 分片/清单的判定只有一份定义（ytdlp_core），扩展也照同一套扩展名走；
-                # 桌面版「扩展嗅探」页据此默认把分片折叠起来。
-                "seg": core.looks_like_segment(url),
-                "manifest": core.looks_like_manifest(url),
-                "audio": core.looks_like_audio(url),
-                "kind": str(it.get("kind") or rec.get("kind") or "")[:16],
-                "size": int(it.get("size") or 0),
+                # 这里仍用 core 的扩展名集合给 UI 折叠/音频标记（兼容老扩展）；
+                # 网络过滤本身以 sniff_rules.js 为唯一真源，内嵌/新扩展上报的 cat 优先。
+                "seg": seg,
+                "manifest": manifest,
+                "audio": audio,
+                "kind": str(it.get("kind") or mime or rec.get("kind") or "")[:16],
+                "mime": mime,
+                "cat": cat,
+                "entry": entry,
+                "size": size,
                 "source": str(it.get("source") or "")[:80],
                 "page_url": str(it.get("page_url") or page_url or rec.get("page_url") or "")[:500],
                 "referer": str(it.get("referer") or rec.get("referer") or "")[:500],

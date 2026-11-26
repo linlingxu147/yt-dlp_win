@@ -14,7 +14,23 @@ class Api:
     def __init__(self, host, window=None):
         self.host = host
         self.window = window
+        # 不要把 Host 的整个对象图（队列、服务、内嵌浏览器……）递归暴露成 JS API：
+        # pywebview 会逐属性反射并调用 .NET getter，启动时既慢又会刷满跨线程 COM 异常。
+        try:
+            host._serializable = False
+        except Exception:
+            pass
+        if window is not None:
+            self.bind_window(window)
         host.emit = self.push
+
+    def bind_window(self, window):
+        """绑定主窗口；同时挡住 pywebview 对 Window/WinForms 对象图的递归反射。"""
+        self.window = window
+        try:
+            window._serializable = False
+        except Exception:
+            pass
 
     def push(self, ev):
         if self.window is None:
@@ -129,6 +145,9 @@ class Api:
 
     def set_ext_service(self, on):
         return self._guard(self.host.set_ext_service, bool(on))
+
+    def open_browser(self):
+        return self._guard(self.host.open_embedded_browser, self.window)
 
     def exit(self):
         self.host.shutdown()

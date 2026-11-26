@@ -16,12 +16,12 @@ if not defined PYC (
 )
 if not defined PYW if not defined PYC goto nopy
 
-rem 首次自动安装 pywebview
+rem 自动安装 / 升级 pywebview 6+（内嵌浏览器依赖 6.x 的公开事件与 WebView2 接口）
 if defined PYC (
-    %PYC% -c "import webview" >nul 2>nul
+    %PYC% -c "import importlib.metadata as m; raise SystemExit(0 if int(m.version('pywebview').split('.')[0]) >= 6 else 1)" >nul 2>nul
     if errorlevel 1 (
-        echo 首次运行：正在安装 pywebview…
-        %PYC% -m pip install pywebview
+        echo 正在安装 / 升级 pywebview 6+…
+        %PYC% -m pip install -U "pywebview>=6"
         if errorlevel 1 goto nopkg
     )
 )
@@ -51,7 +51,7 @@ exit /b 1
 
 :nopkg
 echo.
-echo [错误] pywebview 安装失败。请手动执行：py -3 -m pip install pywebview
+echo [错误] pywebview 安装失败。请手动执行：py -3 -m pip install -U "pywebview>=6"
 echo.
 pause
 exit /b 1

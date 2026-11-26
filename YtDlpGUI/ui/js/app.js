@@ -65,6 +65,11 @@ document.getElementById('btn-play').addEventListener('click', async () => {
 });
 
 // ---------------- 工具栏 ----------------
+document.getElementById('btn-browser').addEventListener('click', async () => {
+  const res = await call('open_browser');
+  if (!res.ok) dialogs.toast(res.error || '无法打开内嵌浏览器', 'err');
+});
+
 function urlsOrToast() {
   const urls = download.getUrls();
   if (!urls.length) { dialogs.toast('请先粘贴至少一个链接', 'err'); return null; }

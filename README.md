@@ -106,6 +106,32 @@ B 站这类 DASH 站点会把音频单独做成一条 `.m4s`（流 ID 302xx）�
 
 ---
 
+## 内嵌浏览器（阶段 P1，单窗口）
+
+主界面顶栏的「内嵌浏览器」**不另开窗口**：同一个窗口整体切到浏览器视图，带原生地址栏、
+后退 / 前进 / 刷新 / 停止，工具栏左侧的「返回下载器」切回主界面。下载器界面只是被隐藏，
+DOM、日志、任务状态都保留，返回即恢复；浏览器页面也保留，可再次切回继续用。
+
+- **实现形态**：主窗体的 WinForms 里有两个 WebView2——pywebview 的主界面与一个自建浏览器视图；
+  浏览器视图第一次打开时才创建，切回下载器时只隐藏、不销毁。
+- **安全边界**：自建浏览器不经过 pywebview，页面里不存在 `window.pywebview`（任何 Python 方法都拿不到）；
+  `http/https` 之外的顶层导航（`file:` / `javascript:` / `data:` 等）一律拦截并提示；
+  站点请求新窗口时交给系统浏览器；页面直接触发的下载会被取消（下载统一走嗅探列表）。
+- **会话**：浏览器使用独立的临时 profile（`%TEMP%\ytdlp_embedded_*`，私有模式），退出时清理。
+- **网络嗅探（P1）**：浏览器视图里的网络响应按 `sniffer_extension/sniff_rules.js` 的共享规则过滤
+  （MIME / 后缀 / 清单 / 分片），后台合批登记到「扩展嗅探」页；条目带 `entry=embedded`，
+  同一页出现 `.m3u8` / `.mpd` 清单后分片不再登记；与扩展抓到同一 URL 时列表只保留一条
+  （入口列显示首次抓到的来源）。条目可直接预览/下载，Referer/UA 取当前页面。
+- **当前进度**：P0′ + P1 已完成；P2（页面元素补扫、`<img>` 图片分类）尚未接入。
+- **卡死排查**：界面连续 8 秒不处理消息时，程序会把 Python 线程栈追加到
+  `%TEMP%\ytdlp_gui_hang.log`；正常使用不会生成这个文件。
+- **已知限制**：浏览器视图会暂时盖住下载器界面（不是页签）；切回下载器后网页继续运行，
+  但可能被 Chromium 对隐藏内容做节流，HLS 后续分片可能变慢；Google 等站点会拒绝 WebView2 登录
+  （请改用系统浏览器 + 扩展）；不做多标签页、书签与下载管理器；P2 之前页面里只有 `<video>` 元素、
+  没有网络请求的直链不会自动登记。
+
+---
+
 ## 目录结构
 
 ```
@@ -115,10 +141,12 @@ yt-dlp_win\
 ├─ ffmpeg.exe                  # 自编译裁剪版：合并 / 转码 / 截帧 / mp3 提取
 ├─ ffprobe.exe                 # 自编译裁剪版：yt-dlp 的元数据/音频探测（核心代码不调用）
 ├─ ytdlp_core.py               # ★ 共享核心：命令构建、配置读写、诊断规则、进度解析
+├─ sniff_rules.py              # Python 侧嗅探判定：读 sniffer_extension/sniff_rules.js 的同一份规则表
 ├─ YtDlpGUI\                   # 桌面版（pywebview + Web 前端）
 │   ├─ main.py                 # 薄入口：建窗、装配 host/api、内嵌扩展服务
 │   ├─ host.py                 # 宿主：任务流水线、配置、历史、事件泵（可单测）
 │   ├─ api.py                  # js_api 方法面（JS↔Python 桥）
+│   ├─ embedded.py             # 内嵌浏览器：主窗口内视图 + 原生工具栏 + 导航守卫
 │   ├─ ui\                     # 前端：原生 ES 模块，零构建（index.html / css / js）
 │   ├─ legacy\main_tk.py       # 已退役的 Tkinter 版（保留一个版本周期）
 │   ├─ config.json             # 桌面版配置（schema_version=3；内嵌服务也读写这份）
@@ -130,9 +158,10 @@ yt-dlp_win\
 │   └─ 启动.bat
 ├─ sniffer_extension\          # Chrome/Edge MV3 扩展
 │   ├─ manifest.json
+│   ├─ sniff_rules.js          # ★ 嗅探判定唯一真源（MIME/后缀/分片/清单/音频），桌面内嵌共用
 │   ├─ background.js           # webRequest 嗅探 + 与本地服务通信
 │   ├─ injected.js             # 页面主世界钩子（XHR / fetch / JSON.parse）
-│   ├─ audio_stream.js         # 音频单轨识别（302xx m4s / 音频后缀）
+│   ├─ audio_stream.js         # 音频单轨识别（调用 sniff_rules.isAudio）
 │   ├─ content.js              # 浮条 UI、轮询进度、上报元素里的媒体地址
 │   └─ README.md               # 扩展单独的说明与版本历史
 ├─ tests\                       # 回归测试
@@ -141,6 +170,7 @@ yt-dlp_win\
 │   ├─ test_server.py          # 服务端接口与并发闸门
 │   ├─ test_host.py            # 桌面宿主：事件泵/历史/流水线/预览播放/嗅探
 │   ├─ test_api.py             # js_api 方法面与输入校验
+│   ├─ test_embedded.py        # 内嵌浏览器：导航白名单/地址归一/生命周期
 │   ├─ fixtures\               # 探针测试用的 3 秒小样片（mkv/webm/ts/mp4）
 │   └─ extension_smoke.js      # 扩展后台冒烟（Node + 假 chrome API）
 └─ downloads\                  # 默认下载目录
@@ -223,12 +253,12 @@ yt-dlp_win\
 ## 自测
 
 ```powershell
-# 核心逻辑单元测试（215 个用例：命令构建、进度解析、诊断规则、
-# 重试阶梯、配置读写与类型校正、路径校验、Cookie 罐、看门狗、
-# 封面取图与公网校验、可播性探测、硬链接预览、边下边播不改命令、
-# 直链预览（ffmpeg 截帧/抓片段/时长）、嗅探条目登记/清空与预览 token、
-# 分片识别、配置迁移到 v3、aria2c 缺失降级、浏览器 Cookies 被锁时的降级、
-# 端口占用探测、任务委托与 409 闸门、网页 UI 路由退役回归）
+# 核心逻辑单元测试：命令构建、进度解析、诊断规则、重试阶梯、配置读写与类型校正、
+# 路径校验、Cookie 罐、看门狗、封面取图与公网校验、可播性探测、硬链接预览、
+# 直链预览（ffmpeg 截帧/抓片段/时长）、嗅探条目登记/清空与预览 token、分片识别、
+# 共享嗅探规则（JS/Python 同源）、内嵌浏览器响应过滤与合批、服务端 entry/cat/mime 字段、
+# 配置迁移到 v3、aria2c 缺失降级、浏览器 Cookies 被锁时的降级、端口占用探测、
+# 任务委托与 409 闸门、网页 UI 路由退役回归
 py -3 -m unittest discover -s tests
 
 # 桌面版命令构建自检（不打开窗口，打印将执行的命令）
@@ -238,6 +268,7 @@ py -3 YtDlpGUI\main.py --selftest
 py -3 YtDlpGUI\main.py --selftest-snifftab
 
 # 扩展脚本语法检查
+node --check sniffer_extension\sniff_rules.js
 node --check sniffer_extension\background.js
 node --check sniffer_extension\audio_stream.js
 node --check sniffer_extension\content.js

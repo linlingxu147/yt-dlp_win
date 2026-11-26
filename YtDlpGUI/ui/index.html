@@ -18,6 +18,8 @@ try {
   <h1>yt-dlp 下载器</h1>
   <span id="env" class="muted"></span>
   <span id="svc" class="muted">扩展服务：启动中…</span>
+  <button type="button" id="btn-browser"
+          title="在同一个窗口里打开网页视图；返回时下载器状态不丢">内嵌浏览器</button>
 </header>
 
 <div class="tabs">
@@ -207,7 +209,7 @@ try {
       <div class="table-wrapper" tabindex="0" role="region" aria-label="嗅探列表">
         <table>
           <thead>
-            <tr><th></th><th>标题</th><th>地址</th><th>类型</th><th>大小</th><th>来源</th><th>页面</th><th>时间</th></tr>
+            <tr><th></th><th>标题</th><th>地址</th><th>类型</th><th>入口</th><th>大小</th><th>来源</th><th>页面</th><th>时间</th></tr>
           </thead>
           <tbody id="sniff-body"></tbody>
         </table>

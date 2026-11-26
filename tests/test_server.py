@@ -141,6 +141,47 @@ class TestSniffItems(unittest.TestCase):
         self.assertFalse(got["https://x/a-1-100026.m4s"]["audio"])
         self.assertTrue(got["https://x/a.mp3"]["audio"])
 
+    def test_entry_defaults_to_extension_and_explicit_embedded_kept(self):
+        server.register_sniff_items([{"url": "https://cdn/old.mp4"}])
+        self.assertEqual(server.SNIFF_ITEMS["https://cdn/old.mp4"]["entry"], "extension")
+        server.register_sniff_items([{"url": "https://cdn/new.mp4", "entry": "embedded"}])
+        self.assertEqual(server.SNIFF_ITEMS["https://cdn/new.mp4"]["entry"], "embedded")
+
+    def test_entry_keeps_first_source_when_both_report_same_url(self):
+        server.register_sniff_items([{"url": "https://cdn/same.mp4", "entry": "embedded"}])
+        server.register_sniff_items([{"url": "https://cdn/same.mp4", "entry": "extension"}])
+        self.assertEqual(len(server.SNIFF_ITEMS), 1)
+        self.assertEqual(server.SNIFF_ITEMS["https://cdn/same.mp4"]["entry"], "embedded")
+
+    def test_cat_inference_and_client_override(self):
+        server.register_sniff_items([
+            {"url": "https://cdn/a.m3u8", "mime": "application/vnd.apple.mpegurl"},
+            {"url": "https://cdn/a-1.ts", "mime": "video/mp2t"},
+            {"url": "https://cdn/a.mp4", "mime": "video/mp4"},
+            {"url": "https://cdn/a.mp3", "mime": "audio/mpeg"},
+            {"url": "https://cdn/a.png", "mime": "image/png"},
+            {"url": "https://cdn/page", "mime": "text/html"},
+            {"url": "https://cdn/x.bin", "cat": "weird", "mime": "video/mp4"},
+            {"url": "https://cdn/y.bin", "cat": "audio", "mime": "text/plain"},
+        ])
+        got = {it["url"]: it for it in server.sniff_items_json()["items"]}
+        self.assertEqual(got["https://cdn/a.m3u8"]["cat"], "stream")
+        self.assertEqual(got["https://cdn/a-1.ts"]["cat"], "stream")
+        self.assertEqual(got["https://cdn/a.mp4"]["cat"], "video")
+        self.assertEqual(got["https://cdn/a.mp3"]["cat"], "audio")
+        self.assertEqual(got["https://cdn/a.png"]["cat"], "image")
+        self.assertEqual(got["https://cdn/page"]["cat"], "other")
+        # 非法 cat 回退推断；合法 cat 原样保留（供新客户端/图片补扫使用）
+        self.assertEqual(got["https://cdn/x.bin"]["cat"], "video")
+        self.assertEqual(got["https://cdn/y.bin"]["cat"], "audio")
+
+    def test_mime_is_preserved_and_kind_stays_truncated(self):
+        mime = "video/mp4; codecs=\"avc1.640028, mp4a.40.2\"; profile=high"
+        server.register_sniff_items([{"url": "https://cdn/long.mp4", "kind": mime, "mime": mime}])
+        rec = server.SNIFF_ITEMS["https://cdn/long.mp4"]
+        self.assertEqual(rec["mime"], mime)
+        self.assertEqual(rec["kind"], mime[:16])
+
 
 class TestPreviewTokens(unittest.TestCase):
     def setUp(self):

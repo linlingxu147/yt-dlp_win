@@ -72,6 +72,19 @@ class ApiTest(unittest.TestCase):
     def test_push_without_window_silent(self):
         self.api.push({"type": "status", "text": "x"})  # 不抛异常即通过
 
+    def test_host_is_not_reflected_into_js_api(self):
+        """pywebview 会递归遍历 js_api 的公开属性；Host 整棵对象图不能暴露。"""
+        self.assertIs(self.host._serializable, False)
+
+    def test_bind_window_marks_window_non_serializable(self):
+        class FakeWindow:
+            pass
+
+        w = FakeWindow()
+        self.api.bind_window(w)
+        self.assertIs(self.api.window, w)
+        self.assertIs(w._serializable, False)
+
     def test_internal_error_wrapped(self):
         def boom(*a, **kw):
             raise RuntimeError("炸了")

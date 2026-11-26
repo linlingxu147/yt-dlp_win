@@ -8,13 +8,15 @@
 
 ## 不可改动
 
-`ytdlp_core.py`、`YtDlpWeb/server.py`、`sniffer_extension/` 的行为不在 UI 重写范围内改动；
+`ytdlp_core.py` 的行为不在 UI 重写范围内改动；`sniffer_extension/` 与 `YtDlpWeb/server.py`
+只在「内嵌浏览器 / 共享嗅探规则」范围内改动：嗅探判定以 `sniffer_extension/sniff_rules.js`
+为唯一真源（桌面 `sniff_rules.py` 读同一份规则表），服务端只加字段并保持向后兼容。
 扩展集成经 `TASK_SINK`/`RUNNER` 单任务闸门，桌面与扩展共用一个任务槽。
 
 ## 测试
 
 - `py -3 -m unittest discover -s tests -v`（标准库 unittest，无第三方测试依赖）
-- `node tests/extension_smoke.js`（扩展冒烟 6/6）
+- `node tests/extension_smoke.js`（扩展冒烟 7/7）
 - 测试端口避开 8765–8775（如 `--port 8799`），避免抢占正在使用的实例。
 
 ## 提交

@@ -6,19 +6,22 @@
 //      POST 到本机 yt-dlp Web 服务（127.0.0.1:8765-8775 端口自动发现）
 "use strict";
 
+// 嗅探判定只有一份：sniffer_extension/sniff_rules.js（桌面内嵌浏览器共用）。
+// MV3 的经典 Service Worker 用 importScripts 同步加载；Node 冒烟测试会先把它预载进沙箱。
+if (typeof importScripts === "function") {
+    try { importScripts("sniff_rules.js"); } catch (e) { /* 测试沙箱 / 旧缓存 */ }
+}
+
 const PORT_RANGE = [8765, 8766, 8767, 8768, 8769, 8770, 8771, 8772, 8773, 8774, 8775];
 const ITEM_TTL_MS = 30 * 60 * 1000;   // 条目保留 30 分钟
 const MAX_ITEMS_PER_TAB = 80;
 const APP_ID = "yt-dlp-web";          // 服务端 /api/status 的 app 标识
 
-const MIME_RE = /^(video\/|audio\/|application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml|ogg))/i;
-const NON_MEDIA_RE = /^(image\/|text\/html|text\/css|application\/javascript|text\/javascript|font\/|text\/plain)/i;
-const MEDIA_EXT = /\.(m3u8|mpd|mp4|flv|ts|m4s|f4v|m2ts|webm|mkv|mov|avi|wmv|mpg|mpeg|mp3|m4a|aac|flac|wav|ogg|opus)(\?|#|$)/i;
 // HLS/DASH 把整片切成几秒一个的分片（.ts/.m4s…），播放器逐个请求，webRequest 全看得见。
 // 分片单独下载没有意义（多数还要 key 解密），真正的入口是 .m3u8/.mpd 清单——
 // 所以「同一标签里已经有清单」时，后续分片直接不收，列表只留能下整片的那条。
-const MANIFEST_RE = /\.(m3u8|mpd)(\?|#|$)/i;
-const SEGMENT_RE = /\.(ts|m4s|f4v|m2ts)(\?|#|$)/i;
+function isManifest(url) { return SniffRules.isManifest(url); }
+function isSegment(url) { return SniffRules.isSegment(url); }
 
 // MV3 的 Service Worker 空闲约 30 秒就会被回收，模块级变量随之清零。
 // 所以嗅探结果以 chrome.storage.session 为准，TAB_ITEMS 只是读缓存：
@@ -29,9 +32,6 @@ const DIRTY_TABS = new Set();         // 有改动待落盘的标签页
 const STORE_PREFIX = "sniff_tab_";
 
 function storeKey(tabId) { return STORE_PREFIX + tabId; }
-
-function isManifest(url) { return MANIFEST_RE.test(String(url).split("#")[0]); }
-function isSegment(url) { return SEGMENT_RE.test(String(url).split("#")[0]); }
 
 /** 这个标签页里是否已经嗅到能下整片的清单。 */
 function hasManifest(items) {
@@ -128,6 +128,7 @@ async function dropTab(tabId) {
 }
 
 async function addItem(tabId, url, mime, size) {
+    url = SniffRules.normalizeUrl(url);
     if (!/^https?:\/\//i.test(url)) return;
     const items = await ensureTab(tabId);
     const seg = isSegment(url);
@@ -157,13 +158,7 @@ chrome.webRequest.onHeadersReceived.addListener((details) => {
         if (n === "content-type") mime = h.value || "";
         else if (n === "content-length") size = parseInt(h.value, 10) || 0;
     }
-    const mimeHit = MIME_RE.test(mime);
-    const extHit = MEDIA_EXT.test(url.split("#")[0]);
-    if (!mimeHit && !extHit) return;
-    // text/html 之类即便后缀命中也多为伪装路由，宁可放过也不刷屏
-    if (NON_MEDIA_RE.test(mime) && !/mpegurl|dash\+xml/.test(mime) && !extHit) return;
-    // 纯靠 MIME 命中且体积太小的（音频封面、提示音）忽略
-    if (mimeHit && !extHit && size > 0 && size < 200 * 1024) return;
+    if (!SniffRules.accept(url, mime, size)) return;
     addItem(details.tabId, url, mime, size).catch(() => void chrome.runtime.lastError);
 }, { urls: ["<all_urls>"] });
 
@@ -302,6 +297,9 @@ async function reportItems(tabId, pageUrl, title) {
     const list = Object.values(items).slice(0, 200).map((it) => ({
         url: it.url,
         kind: it.mime || "",
+        mime: it.mime || "",
+        cat: SniffRules.classify(it.url, it.mime),
+        entry: "extension",
         size: it.size || 0,
         source: "webRequest",
         page_url: pageUrl || "",
