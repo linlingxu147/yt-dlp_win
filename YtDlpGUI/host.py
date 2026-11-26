@@ -423,16 +423,11 @@ class Host:
                 "emit": task.get("emit"),
                 "ext_cookie_file": cfg.get("_sniff_cookie_file")}
 
-    def _bump_ext_token(self):
-        # 独立服务的 SNIFF_STATE.token 按 RUNNER.task_id+1 预分配；队列不再占
-        # RUNNER 槽位，这里只推进任务号保持镜像 token 对齐（T9 改为对齐 task_id）。
-        if self._web_mod is not None:
-            runner = self._web_mod.RUNNER
-            with runner.lock:
-                runner.task_id += 1
-
     def submit_server_task(self, task):
-        """扩展提交入队，返回 task_id（truthy 兼容旧 bool 调用）；拒绝返回 None。"""
+        """扩展提交入队，返回 task_id（truthy 兼容旧 bool 调用）；拒绝返回 None。
+
+        镜像 token 由 server 侧直接对齐返回的 task_id（T8），这里不再预分配任务号。
+        """
         if self.updating:
             return None
         spec = self._ext_spec(task)
@@ -442,7 +437,6 @@ class Host:
             tid = self.queue.submit(spec, self._exec_download)
         except ytdlp_queue.QueueFull:
             return None
-        self._bump_ext_token()
         return tid
 
     def start_external(self, task):

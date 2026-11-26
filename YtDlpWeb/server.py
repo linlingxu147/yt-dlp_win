@@ -12,7 +12,8 @@ yt-dlp 下载器 · 浏览器扩展服务（无网页界面）
   POST /api/stop         停止当前任务
 
 默认假设（业务信息未指定时的合理兜底，界面设置区同样标注）：
-  1. 单任务队列：同一时间只运行一个探测/下载任务，避免日志与进度混淆。
+  1. 下载队列：独立模式自建 ytdlp_queue.QueueManager（并发数读 queue_n，默认 2），
+     扩展连提多个任务按 FIFO 排队执行；SNIFF_STATE 只镜像最近一次扩展任务。
   2. 仅本机使用：只监听 127.0.0.1，并校验 Host / Origin / Content-Type，
      阻断网页跨站提交与 DNS rebinding。
   3. 输出目录默认为 runtime/downloads，首次运行时自动创建。
@@ -37,6 +38,7 @@ from urllib.parse import parse_qs, urlsplit
 # 放在项目根目录，本服务与桌面版都是它的前端。
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ytdlp_core as core  # noqa: E402
+import ytdlp_queue  # noqa: E402  共享下载队列内核（独立模式自建 QueueManager）
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = core.BASE_DIR
@@ -69,11 +71,11 @@ def extension_origin_ok(origin):
 from ytdlp_core import (  # noqa: E402
     NET_PLAN_LABEL, PROBE_VARIANTS, build_probe_cmd, classify_line, clean_media_url,
     command_text, diagnose, find_tool,
-    info_from_json, is_net_failure, iter_lines_watch, json_ok as _json_ok, kill_tree,
-    COOKIE_PLAN_LABEL, new_progress_state, next_cookie_plan,
+    info_from_json, is_net_failure, json_ok as _json_ok,
+    COOKIE_PLAN_LABEL, next_cookie_plan,
     next_net_plan, parse_format_line, path_inside,
     progress_event, progress_text, sanitize_urls,
-    scrub_header_value, spawn, unsafe_arg_in,
+    scrub_header_value, unsafe_arg_in,
 )
 
 
@@ -91,6 +93,10 @@ def set_config_file(path):
     p = os.path.abspath(str(path))
     os.makedirs(os.path.dirname(p), exist_ok=True)
     CONFIG_FILE = p
+    try:
+        QUEUE.set_max(_queue_n())
+    except Exception:
+        pass
     return CONFIG_FILE
 
 
@@ -102,161 +108,177 @@ def build_download_cmd(cfg, urls, no_playlist=False, warn=None):
     return core.build_download_cmd(cfg, urls, no_playlist=no_playlist, warn=warn)
 
 
-class Runner:
-    """单任务执行器：同一时间只允许一个任务，保证状态清晰。
+# ---------------- 独立模式下载队列 ----------------
+# 桌面版内嵌时下载走 TASK_SINK（host 自己的队列），这里的 QUEUE 只在独立模式用。
+# SNIFF_STATE 仍只镜像「最近一次扩展任务」，token 与队列 task_id 对齐。
+LAST_EXT_TASK = {"id": None}
+QUEUE_STATUS = None      # 桌面模式由 host 注入快照回调（T9）；独立模式为 None
 
-    占位（reserve）与启动（launch）分开，是为了堵住「先 busy() 再起线程」的竞态：
-    两个请求可以在检查通过之后同时启动，最后两个任务都写同一份进度状态。
-    reserve 在同一把锁里把槽位占住，后来的请求直接拿到 409。
+
+def _queue_emit(ev):
+    """队列调度线程的事件回调：绝不能向外抛异常。
+
+    执行器自己镜像进度/日志；这里兜底两件事——
+    1. 最近扩展任务到达终态（含排队中被取消、执行器崩溃）时把镜像标记为 done；
+    2. 任务结束时清掉扩展送来的临时 cookie 文件（排队中被取消不会进执行器）。
     """
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.proc = None
-        self.kind = None
-        self.task_id = 0
-        self.started_at = None
-
-    def busy(self):
-        return self.kind is not None
-
-    def reserve(self, kind):
-        """原子占位：成功返回 True，已被占用返回 False。"""
-        with self.lock:
-            if self.kind is not None:
-                return False
-            self.kind = kind
-            self.task_id += 1
-            self.started_at = time.time()
-            return True
-
-    def launch(self, cmd, cwd, kind, emit, adopt=False):
-        with self.lock:
-            # adopt=True：本次启动就是来兑现 reserve() 占下的槽位
-            if self.kind is not None and not (adopt and self.proc is None and self.kind == kind):
-                emit({"type": "error", "text": "已有任务正在运行，请先停止或等待结束。"})
-                return False
-            try:
-                proc = spawn(cmd, cwd)
-            except FileNotFoundError:
-                self.kind = None
-                self.started_at = None
-                emit({"type": "log", "level": "err", "text": f"找不到可执行文件：{cmd[0]}"})
-                emit({"type": "done", "code": -1, "elapsed": 0})
-                return False
-            except Exception as e:
-                self.kind = None
-                self.started_at = None
-                emit({"type": "log", "level": "err", "text": f"启动失败：{e}"})
-                emit({"type": "done", "code": -1, "elapsed": 0})
-                return False
-            self.proc = proc
-            self.kind = kind
-            return True
-
-    def finish(self):
-        with self.lock:
-            self.proc = None
-            self.kind = None
-            self.started_at = None
-
-    def stop(self):
-        with self.lock:
-            proc, kind = self.proc, self.kind
-        if not proc or proc.poll() is not None:
-            return False
-        kill_tree(proc)
-        return kind is not None
+    try:
+        if ev.get("type") != "queue" or ev.get("action") != "state":
+            return
+        t = ev.get("task") or {}
+        if t.get("state") not in ("done", "failed", "canceled"):
+            return
+        task = QUEUE.get(t.get("id"))
+        if task is not None and task.ext_cookie_file:
+            path, task.ext_cookie_file = task.ext_cookie_file, None
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        if t.get("id") != LAST_EXT_TASK.get("id"):
+            return
+        with SNIFF_LOCK:
+            if SNIFF_STATE.get("token") == t.get("id"):
+                SNIFF_STATE["done"] = True
+                if SNIFF_STATE.get("code") is None:
+                    code = t.get("exit_code")
+                    SNIFF_STATE["code"] = code if code is not None else -1
+    except Exception:
+        pass
 
 
-RUNNER = Runner()
+def _queue_n():
+    try:
+        return int(str(load_config().get("queue_n") or "2"))
+    except Exception:
+        return 2
 
 
-# 读子进程输出：统一走 ytdlp_core.iter_lines_watch（带心跳与停滞超时）
+QUEUE = ytdlp_queue.QueueManager(max_concurrent=_queue_n(), emit=_queue_emit)
+
+
+# 读子进程输出：统一走 ytdlp_queue.run_process（内部用 iter_lines_watch，带停滞超时）
 def watch_note(why):
     """把 iter_lines_watch 的结束原因翻译成日志文案。"""
     return {"client": "[客户端已断开，任务终止]",
             "stall": "[长时间没有输出，已终止本次任务]"}.get((why or {}).get("reason"), "")
 
 
-def run_download(cfg, urls, emit, no_playlist=False, abort=None, keepalive=None):
-    outdir = cfg.get("outdir") or core.DOWNLOAD_DIR
+def _queue_snapshot():
+    """桌面模式优先用 host 注入的快照；回调异常时退回本地队列，接口不能因此挂掉。"""
+    if QUEUE_STATUS is not None:
+        try:
+            s = QUEUE_STATUS()
+            if isinstance(s, dict):
+                return s
+        except Exception:
+            pass
+    return QUEUE.snapshot()
+
+
+def _queue_busy():
+    if QUEUE_STATUS is not None:
+        s = _queue_snapshot()
+        return bool(s.get("running") or s.get("queued"))
+    return QUEUE.any_active()
+
+
+def _mirror(task, obj):
+    """把任务事件写进 SNIFF_STATE：只镜像最近一次扩展任务（token 隔离沿用）。"""
     try:
-        os.makedirs(outdir, exist_ok=True)
-    except Exception as e:
-        emit({"type": "log", "level": "err", "text": f"无法创建输出目录：{e}"})
-        emit({"type": "done", "code": -1, "elapsed": 0})
+        if task.id == LAST_EXT_TASK.get("id"):
+            sniff_emit(obj, task.id)
+    except Exception:
+        pass
+
+
+def _server_line(task, line):
+    """逐行回调：进度并入 task.pstate，日志/进度镜像给扩展轮询。"""
+    task.log_ring.append(line)
+    ev = progress_event(task.pstate, line)
+    if ev:
+        st = task.pstate
+        if ev["kind"] == "file":
+            _mirror(task, {"type": "log", "level": "ok", "text": line})
+        _mirror(task, {"type": "progress",
+                       "pct": st["pct"], "speed": st["speed"], "eta": st["eta"],
+                       "size": st["size"], "file": st["file"],
+                       "item_i": st["item_i"], "item_total": st["item_total"],
+                       "done_count": len(st["done"]),
+                       "text": line if ev["kind"] == "file" else progress_text(st)})
         return
+    _mirror(task, {"type": "log", "level": classify_line(line), "text": line})
+
+
+def _server_executor(task):
+    """独立模式执行器：复用「直连 → 换浏览器指纹 → 换传输方式」自愈阶梯，按任务跑。
+
+    暂停/取消由队列内核置位并杀进程树，这里只负责识别信号后收尾；
+    续传交给 yt-dlp（.part/.aria2 保留），继续时内核会从 normal 重新起跑。
+    """
+    cfg = task.cfg
     t0 = time.time()
-    # 失败后按「直连 → 换浏览器指纹 → 换传输方式」阶梯自愈，专治 ConnectionReset(10054)
+
+    def done(code, tail=""):
+        task.exit_code = code
+        _mirror(task, {"type": "done", "code": code,
+                       "elapsed": round(time.time() - t0, 1),
+                       "done_count": len(task.pstate["done"]),
+                       "diag": diagnose(tail) if code not in (0, None) else []})
+
+    try:
+        os.makedirs(task.outdir, exist_ok=True)
+    except Exception as e:
+        _mirror(task, {"type": "log", "level": "err", "text": "无法创建输出目录：%s" % e})
+        done(-1)
+        return
     tried = set()
     name, extra = "normal", {}
-    while True:
-        c = cfg if not extra else dict(cfg, **extra)
-        if name != "normal":
-            emit({"type": "log", "level": "warn",
-                  "text": "[自动重试] 换用%s重试（已下载部分会续传）"
-                          % (NET_PLAN_LABEL.get(name) or COOKIE_PLAN_LABEL)})
-        code, tail, stopped, done_count = _download_attempt(
-            c, urls, emit, no_playlist, abort, outdir, keepalive)
-        if code is None:          # 启动失败，launch 已自行上报
-            return
-        if code == 0 or stopped:
-            emit({"type": "done", "code": code, "elapsed": round(time.time() - t0, 1),
-                  "done_count": done_count,
-                  "diag": diagnose(tail) if code != 0 else []})
-            return
-        tried.add(name)
-        # 浏览器 Cookies 数据库被独占锁住：先脱掉登录态重试一次，
-        # 公开内容不需要它，读不出来不该让整个下载直接失败。
-        nxt = next_cookie_plan(tail, tried, cfg)
-        if not nxt and cfg.get("net_hard", True) and is_net_failure(tail):
-            # 用原始 cfg 推导 Origin：no-referer 那招已经把 referer 清空了
-            nxt = next_net_plan(tail, tried, cfg, url=urls[0])
-        if not nxt:
-            emit({"type": "done", "code": code, "elapsed": round(time.time() - t0, 1),
-                  "done_count": done_count, "diag": diagnose(tail)})
-            return
-        name, extra = nxt
-
-
-def _download_attempt(cfg, urls, emit, no_playlist, abort, outdir, keepalive=None):
-    """跑一次 yt-dlp，返回 (退出码, 末尾输出, 是否被客户端断开中断, 已完成文件数)。"""
-    warns = []
-    cmd = build_download_cmd(cfg, urls, no_playlist=no_playlist, warn=warns)
-    for w in warns:
-        emit({"type": "log", "level": "warn", "text": w})
-    emit({"type": "cmd", "text": command_text(cmd)})
-    if not RUNNER.launch(cmd, outdir, "download", emit, adopt=True):
-        return None, "", False, 0
-    proc = RUNNER.proc
-    state = new_progress_state()
-    buf = []
-    why = {}
     try:
-        for line in iter_lines_watch(proc, abort, keepalive, why=why):
-            ev = progress_event(state, line)
-            if ev:
-                if ev["kind"] == "file":
-                    emit({"type": "log", "level": "ok", "text": line})
-                emit({"type": "progress",
-                      "pct": state["pct"], "speed": state["speed"], "eta": state["eta"],
-                      "size": state["size"], "file": state["file"],
-                      "item_i": state["item_i"], "item_total": state["item_total"],
-                      "done_count": len(state["done"]),
-                      "text": line if ev["kind"] == "file" else progress_text(state)})
-                continue
-            buf.append(line)
-            emit({"type": "log", "level": classify_line(line), "text": line})
+        while True:
+            c = cfg if not extra else dict(cfg, **extra)
+            if name != "normal":
+                _mirror(task, {"type": "log", "level": "warn",
+                               "text": "[自动重试] 换用%s重试（已下载部分会续传）"
+                                       % (NET_PLAN_LABEL.get(name) or COOKIE_PLAN_LABEL)})
+            warns = []
+            cmd = build_download_cmd(c, task.urls, no_playlist=task.no_playlist, warn=warns)
+            for w in warns:
+                _mirror(task, {"type": "log", "level": "warn", "text": w})
+            _mirror(task, {"type": "cmd", "text": command_text(cmd)})
+            code, tail, why = ytdlp_queue.run_process(
+                task, cmd, task.outdir, lambda ln: _server_line(task, ln))
+            note = watch_note(why)
+            if note:
+                _mirror(task, {"type": "log", "level": "warn", "text": note})
+            if code is None:          # 启动失败（找不到可执行文件等）
+                _mirror(task, {"type": "log", "level": "err",
+                               "text": "启动失败：找不到 yt-dlp 或无法创建进程"})
+                done(-1)
+                return
+            if task.pause_requested or task.cancel_requested:
+                done(code, tail)
+                return
+            if code == 0:
+                done(0)
+                return
+            tried.add(name)
+            # 浏览器 Cookies 数据库被独占锁住：先脱掉登录态重试一次，
+            # 公开内容不需要它，读不出来不该让整个下载直接失败。
+            nxt = next_cookie_plan(tail, tried, cfg)
+            if not nxt and cfg.get("net_hard", True) and is_net_failure(tail):
+                # 用原始 cfg 推导 Origin：no-referer 那招已经把 referer 清空了
+                nxt = next_net_plan(tail, tried, cfg, url=task.urls[0] if task.urls else "")
+            if not nxt:
+                done(code, tail)
+                return
+            name, extra = nxt
+    except Exception as e:
+        _mirror(task, {"type": "log", "level": "err", "text": "内部错误：%s" % e})
+        done(-1)
     finally:
-        stopped = why.get("reason") == "client"
-        note = watch_note(why)
-        if note:
-            emit({"type": "log", "level": "warn", "text": note})
-        # 看门狗已经杀过进程树，这里只负责收尸，避免僵尸进程占用句柄
-        code = proc.wait() if proc else -1
-        RUNNER.finish()
-    return code, "\n".join(buf[-300:]), stopped, len(state["done"])
+        _drop_cookie(cfg)
 
 
 # ---------- 浏览器扩展嗅探提交（借鉴 FileCentipede：扩展嗅探 → 本机服务 → 下载核心） ----------
@@ -267,7 +289,7 @@ SNIFF_STATE = {
     "last_text": "",    # 最近一条日志/进度原文
     "done": True, "code": None,
     "url": "", "title": "", "kind": "",
-    "token": 0,          # 当前这轮的任务号（与 RUNNER.task_id 对齐）
+    "token": 0,          # 当前这轮的任务号（与队列 task_id 对齐）
 }
 SNIFF_LOCK = threading.Lock()
 SNIFF_MAX_LINES = 200
@@ -360,9 +382,11 @@ def sniff_hint(code, last_text, lines, kind):
 
 def sniff_log_json():
     """扩展轮询 /api/sniff/log 的统一响应。"""
+    busy = _queue_busy()
     with SNIFF_LOCK:
         d = {
-            "busy": RUNNER.busy(), "running_kind": RUNNER.kind,
+            "busy": busy, "running_kind": "download" if busy else None,
+            "task_id": SNIFF_STATE.get("token"),
             "done": SNIFF_STATE["done"], "code": SNIFF_STATE["code"],
             "prog": SNIFF_STATE["prog"], "last_text": SNIFF_STATE["last_text"],
             "url": SNIFF_STATE["url"], "title": SNIFF_STATE["title"], "kind": SNIFF_STATE["kind"],
@@ -477,7 +501,7 @@ def sniff_items_json():
     with SNIFF_ITEMS_LOCK:
         items = list(SNIFF_ITEMS.values())
     items.sort(key=lambda r: r.get("ts") or 0, reverse=True)
-    return {"ok": True, "items": items[:SNIFF_MAX_ITEMS], "busy": RUNNER.busy()}
+    return {"ok": True, "items": items[:SNIFF_MAX_ITEMS], "busy": _queue_busy()}
 
 
 def clear_sniff_items():
@@ -644,29 +668,6 @@ def _drop_cookie(cfg):
             os.remove(path)
         except OSError:
             pass
-
-
-def run_sniff_task(cfg, url, kind, token=None):
-    """嗅探下载线程：直接媒体地址走通用提取器 + 网页嗅探带的访问凭据。"""
-    cookie_file = None
-    emit = (lambda obj: sniff_emit(obj, token)) if token is not None else sniff_emit
-    if kind == "media":
-        # 直链媒体（m3u8/mp4）本身没有封面和元数据，强行 embed 只会让 ffmpeg 报错、
-        # 把一次成功的下载判成失败。这里只做「下回来」这一件事。
-        cfg.update({"thumb": False, "meta": False, "sub": False, "embedsub": False})
-        # 直链只有一路格式，这里写死 b，避免全局的 bv*+ba/b 选到分离流。
-        cfg.update({"fmt": "b"})
-    try:
-        run_download(cfg, [url], emit, no_playlist=True)
-    except Exception as e:
-        emit({"type": "log", "level": "err", "text": "内部错误：%s" % e})
-        emit({"type": "done", "code": -1, "elapsed": 0, "diag": []})
-    finally:
-        RUNNER.finish()          # 没走到 launch（如建目录失败）也要放行槽位
-        with SNIFF_LOCK:
-            if token is None or SNIFF_STATE.get("token") == token:
-                SNIFF_STATE["done"] = True
-        _drop_cookie(cfg)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -838,21 +839,22 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             return
 
-    def _busy_json(self):
-        """忙碌时统一回 409：前端 stream() 会读 error 字段并 toast，不会卡在「探测中」。"""
-        return self._json({"ok": False, "busy": True, "running_kind": RUNNER.kind,
-                           "error": "已有任务正在运行（%s），请先停止或等待结束"
-                                    % (RUNNER.kind or "未知")}, 409)
-
     def do_GET(self):
         if not self._guard():
             return
         p = self.path.split("?")[0]
         if p == "/api/status":
+            snap = _queue_snapshot()
+            tasks = snap.get("tasks") or []
+            first = next((t for t in tasks if t.get("state") == "running"), None)
             return self._json({
                 "app": APP_ID, "version": APP_VERSION,
-                "busy": RUNNER.busy(), "kind": RUNNER.kind,
-                "elapsed": round(time.time() - RUNNER.started_at, 1) if RUNNER.started_at else 0,
+                # 旧字段保留：busy/kind/elapsed 取首个运行中任务（老扩展靠它判忙）
+                "busy": bool(first), "kind": "download" if first else None,
+                "elapsed": round(time.time() - first["started_at"], 1)
+                           if first and first.get("started_at") else 0,
+                "tasks": tasks,
+                "running": snap.get("running", 0), "queued": snap.get("queued", 0),
             })
         if p == "/api/sniff/log":
             return self._json(sniff_log_json())
@@ -925,43 +927,93 @@ class Handler(BaseHTTPRequestHandler):
                 cfg.update({"thumb": False, "meta": False, "sub": False, "embedsub": False,
                             "fmt": "b"})
             if TASK_SINK is not None:
-                # 桌面版是宿主：任务交给桌面版流水线，本服务只镜像状态
-                token = RUNNER.task_id + 1
+                # 桌面版是宿主：任务交给桌面版队列，本服务只镜像状态。
+                # sink 返回 task_id（T5），token 直接对齐 task_id；入队到回填
+                # token 之间的事件先缓冲，避免丢掉执行器抢跑的第一批日志。
+                tok = {"id": None, "pending": [], "lock": threading.Lock()}
+
+                def _emit(obj):
+                    with tok["lock"]:
+                        if tok["id"] is None:
+                            tok["pending"].append(obj)
+                        else:
+                            sniff_emit(obj, tok["id"])
+
+                task = {"url": url, "kind": kind, "cfg": cfg, "emit": _emit}
+                tid = TASK_SINK(task)
+                if not tid:
+                    _drop_cookie(cfg)
+                    return self._json({"ok": False, "busy": True, "running_kind": "download",
+                                       "error": "桌面版暂时无法接收任务（队列已满或正在更新），请稍后再试"}, 409)
+                tid = int(tid)
+                LAST_EXT_TASK["id"] = tid
                 with SNIFF_LOCK:
                     SNIFF_STATE.update({"lines": [], "prog": None,
                                         "last_text": "已接收，桌面版准备下载…",
-                                        "done": False, "code": None, "token": token,
+                                        "done": False, "code": None, "token": tid,
                                         "url": url, "title": str(body.get("title") or "")[:200],
                                         "kind": kind})
-                task = {"url": url, "kind": kind, "cfg": cfg,
-                        "emit": lambda obj: sniff_emit(obj, token)}
-                if not TASK_SINK(task):
-                    _drop_cookie(cfg)
-                    with SNIFF_LOCK:
-                        if SNIFF_STATE.get("token") == token:
-                            SNIFF_STATE["done"] = True
-                    return self._json({"ok": False, "busy": True, "running_kind": RUNNER.kind,
-                                       "error": "桌面版已有任务正在进行，请先停止或等待结束"}, 409)
-                return self._json({"ok": True, "busy": False, "url": url})
-            if not RUNNER.reserve("download"):
+                with tok["lock"]:
+                    tok["id"] = tid
+                    pending, tok["pending"] = tok["pending"], []
+                for obj in pending:
+                    sniff_emit(obj, tid)
+                return self._json({"ok": True, "busy": False, "url": url,
+                                   "task_id": tid, "queue_position": 0})
+            # 独立模式：入自建队列，FIFO 调度；队列满（≥200 未完成）才回 409
+            try:
+                tid = QUEUE.submit(
+                    {"urls": [url], "cfg": cfg,
+                     "outdir": cfg.get("outdir") or core.DOWNLOAD_DIR,
+                     "no_playlist": True, "source": "ext",
+                     "title": str(body.get("title") or "")[:200],
+                     "ext_cookie_file": cfg.get("_sniff_cookie_file")},
+                    _server_executor)
+            except ytdlp_queue.QueueFull as e:
                 _drop_cookie(cfg)
-                return self._json({"ok": False, "busy": True, "running_kind": RUNNER.kind,
-                                   "error": "已有任务正在运行（%s），请先停止或等待结束" % (RUNNER.kind or "")}, 409)
-            token = RUNNER.task_id
+                return self._json({"ok": False, "busy": True, "error": str(e)}, 409)
+            LAST_EXT_TASK["id"] = tid
             with SNIFF_LOCK:
-                SNIFF_STATE.update({"lines": [], "prog": None, "last_text": "已接收，正在启动 yt-dlp…",
-                                    "done": False, "code": None, "token": token,
-                                    "url": url, "title": str(body.get("title") or "")[:200], "kind": kind})
-            threading.Thread(target=run_sniff_task, args=(cfg, url, kind, token),
-                             daemon=True).start()
-            return self._json({"ok": True, "busy": False, "url": url})
+                SNIFF_STATE.update({"lines": [], "prog": None, "last_text": "已接收，正在排队…",
+                                    "done": False, "code": None, "token": tid,
+                                    "url": url, "title": str(body.get("title") or "")[:200],
+                                    "kind": kind})
+            # 任务可能在回填镜像前就已结束（如启动即失败）：补一次终态，避免永远「进行中」
+            t = QUEUE.get(tid)
+            if t is not None and t.state not in ytdlp_queue.ACTIVE:
+                with SNIFF_LOCK:
+                    if SNIFF_STATE.get("token") == tid:
+                        SNIFF_STATE["done"] = True
+                        SNIFF_STATE["code"] = t.exit_code if t.exit_code is not None else -1
+            queued_ids = [t["id"] for t in QUEUE.snapshot()["tasks"]
+                          if t["state"] == "queued"]
+            pos = queued_ids.index(tid) + 1 if tid in queued_ids else 0
+            return self._json({"ok": True, "busy": False, "url": url,
+                               "task_id": tid, "queue_position": pos})
 
         if p == "/api/sniff/log":
             return self._json(sniff_log_json())
 
         if p == "/api/stop":
-            ok = STOP_HOOK() if STOP_HOOK is not None else RUNNER.stop()
-            return self._json({"ok": ok})
+            qs = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            tid = body.get("id") or (qs.get("id") or [None])[0]
+            try:
+                tid = int(tid) if tid not in (None, "") else None
+            except (TypeError, ValueError):
+                tid = None
+            if QUEUE_STATUS is not None and STOP_HOOK is not None:
+                # 桌面模式（T9 接线后）：按 id 精确停止，不传停最近扩展任务
+                ok = STOP_HOOK(tid)
+            elif TASK_SINK is not None:
+                # T9 之前的桌面宿主：stop 钩子无参，沿用旧行为；带 id 的精确停止待 T9
+                ok = STOP_HOOK() if (STOP_HOOK is not None and tid is None) else False
+            elif tid is not None:
+                ok = QUEUE.cancel(tid)
+            else:
+                # 不传 id：只停最近一次扩展任务，不误杀队列里的其它任务
+                last = LAST_EXT_TASK.get("id")
+                ok = QUEUE.cancel(last) if last else False
+            return self._json({"ok": bool(ok)})
 
         self._json({"error": "not found"}, 404)
 

@@ -6,7 +6,6 @@ import importlib.util
 import json
 import os
 import sys
-import threading
 import time
 import unittest
 import uuid
@@ -17,47 +16,6 @@ _PATH = os.path.join(os.path.dirname(_HERE), "YtDlpWeb", "server.py")
 _spec = importlib.util.spec_from_file_location("ytdlp_web_server", _PATH)
 server = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(server)
-
-
-class TestRunnerReserve(unittest.TestCase):
-    def test_only_one_of_many_concurrent_requests_wins(self):
-        runner = server.Runner()
-        wins = []
-
-        def grab():
-            if runner.reserve("download"):
-                wins.append(1)
-
-        threads = [threading.Thread(target=grab) for _ in range(16)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        self.assertEqual(len(wins), 1)
-        self.assertEqual(runner.kind, "download")
-        runner.finish()
-        self.assertIsNone(runner.kind)
-
-    def test_launch_adopts_own_placeholder_and_rejects_foreign_one(self):
-        runner = server.Runner()
-        self.assertTrue(runner.reserve("detect"))
-        self.assertFalse(runner.launch(["x"], None, "download", lambda e: None, adopt=True))
-        # 自己占的位可以被兑现（用假 proc，只为验证闸门逻辑）
-        class _P:
-            pid = 1
-        with mock.patch.object(server, "spawn", return_value=_P()):
-            self.assertTrue(runner.launch(["x"], None, "detect", lambda e: None, adopt=True))
-        runner.finish()
-
-    def test_failed_spawn_releases_slot(self):
-        runner = server.Runner()
-        self.assertTrue(runner.reserve("download"))
-        with mock.patch.object(server, "spawn", side_effect=OSError("boom")):
-            try:
-                runner.launch(["x"], None, "download", None, adopt=True)
-            except Exception:
-                pass
-        self.assertIsNone(runner.kind)
 
 
 class TestSniffTokenIsolation(unittest.TestCase):
@@ -322,9 +280,9 @@ class TestServiceLifecycle(unittest.TestCase):
         import urllib.request
 
         try:
-            svc = server.start_service()
+            svc = server.start_service(port=8799)
         except OSError as e:
-            self.skipTest("端口都被占用：%s" % e)
+            self.skipTest("端口 8799 被占用：%s" % e)
         try:
             body = json.loads(urllib.request.urlopen(svc.url + "/api/status", timeout=5).read())
             self.assertEqual(body["app"], "yt-dlp-web")
@@ -339,9 +297,9 @@ class TestServiceLifecycle(unittest.TestCase):
 
     def test_shutdown_is_idempotent(self):
         try:
-            svc = server.start_service()
+            svc = server.start_service(port=8799)
         except OSError as e:
-            self.skipTest("端口都被占用：%s" % e)
+            self.skipTest("端口 8799 被占用：%s" % e)
         svc.shutdown()
         svc.shutdown()
 
@@ -370,9 +328,9 @@ class TestServiceLifecycle(unittest.TestCase):
         try:
             sys.stderr = None
             try:
-                svc = server.start_service()
+                svc = server.start_service(port=8799)
             except OSError as e:
-                self.skipTest("端口都被占用：%s" % e)
+                self.skipTest("端口 8799 被占用：%s" % e)
             try:
                 body = json.loads(urllib.request.urlopen(svc.url + "/api/status", timeout=5).read())
                 self.assertEqual(body["app"], "yt-dlp-web")
@@ -424,7 +382,10 @@ class TestTaskSink(unittest.TestCase):
             self.skipTest("端口 8899 被占用：%s" % e)
         self.addCleanup(self.svc.shutdown)
         self.addCleanup(server.set_task_sink, None, None)
-        self.addCleanup(server.RUNNER.finish)
+        server.LAST_EXT_TASK["id"] = None
+        with server.SNIFF_LOCK:
+            server.SNIFF_STATE.update({"lines": [], "prog": None, "done": True,
+                                       "code": None, "token": 0})
 
     def _post(self, path, body):
         req = self.req.Request(self.svc.url + path, data=self.json.dumps(body).encode(),
@@ -440,32 +401,34 @@ class TestTaskSink(unittest.TestCase):
 
         def sink(task):
             got.update(task)
-            return server.RUNNER.reserve("download")
+            return 101          # 桌面宿主返回 task_id（truthy 兼容旧 bool）
 
         server.set_task_sink(sink)
         st, j = self._post("/api/sniff", {"url": "https://example.com/v.mp4",
                                           "kind": "media", "title": "T"})
         self.assertEqual(st, 200)
         self.assertTrue(j["ok"])
+        self.assertEqual(j["task_id"], 101)
+        self.assertIn("queue_position", j)
         self.assertEqual(got["url"], "https://example.com/v.mp4")
         self.assertEqual(got["cfg"]["fmt"], "b")
         self.assertFalse(got["cfg"]["thumb"])
-        # 桌面版占住槽位，服务端 busy 跟着一致
-        self.assertTrue(server.RUNNER.busy())
+        # 镜像 token 对齐 sink 返回的 task_id
+        self.assertEqual(server.SNIFF_STATE["token"], 101)
+        self.assertEqual(server.LAST_EXT_TASK["id"], 101)
         got["emit"]({"type": "log", "text": "桌面版日志"})
         got["emit"]({"type": "progress", "pct": 42.0, "speed": "1MiB/s"})
         got["emit"]({"type": "done", "code": 0})
-        server.RUNNER.finish()
         d = server.sniff_log_json()
         self.assertTrue(d["done"])
         self.assertEqual(d["code"], 0)
+        self.assertEqual(d["task_id"], 101)
         self.assertIn("桌面版日志", d["lines"])
         self.assertEqual(d["prog"]["pct"], 42.0)
         self.assertEqual(d["title"], "T")
 
     def test_sink_busy_gives_409_and_restores_done(self):
-        server.RUNNER.reserve("download")
-        server.set_task_sink(lambda task: False)
+        server.set_task_sink(lambda task: None)
         st, j = self._post("/api/sniff", {"url": "https://example.com/v.mp4"})
         self.assertEqual(st, 409)
         self.assertTrue(j["busy"])
@@ -476,7 +439,7 @@ class TestTaskSink(unittest.TestCase):
 
         def sink(task):
             got.update(task)
-            return server.RUNNER.reserve("download")
+            return 102
 
         server.set_task_sink(sink)
         base_cfg = {"fmt": "", "thumb": True, "meta": True,
@@ -503,7 +466,6 @@ class TestTaskSink(unittest.TestCase):
         self.assertNotEqual(got["cfg"].get("fmt"), "b")
         self.assertTrue(got["cfg"].get("thumb"))
         w.assert_called_once_with(jar, "https://www.douyin.com/video/1")
-        server.RUNNER.finish()
 
     def test_stop_goes_through_hook(self):
         calls = []
@@ -541,6 +503,247 @@ class TestSniffClear(unittest.TestCase):
         self.assertEqual(len(server.sniff_items_json()["items"]), 1)
         server.clear_sniff_items()
         self.assertEqual(server.sniff_items_json()["items"], [])
+
+
+class TestServerQueueFields(unittest.TestCase):
+    """独立模式队列语义：接口字段只增不删、第二个任务被接收、停止只作用于指定任务。
+
+    端口用 8799，避开 8765-8775（可能有正在使用的实例）。
+    """
+
+    def setUp(self):
+        import urllib.error
+        import urllib.request
+        self.req = urllib.request
+        self.err = urllib.error
+        try:
+            self.svc = server.start_service(port=8799)
+        except OSError as e:
+            self.skipTest("端口 8799 被占用：%s" % e)
+        self.addCleanup(self.svc.shutdown)
+        self.addCleanup(self._reset_queue)
+        server.TASK_SINK = None
+        server.STOP_HOOK = None
+        server.QUEUE_STATUS = None
+        server.QUEUE.set_max(2)
+        self._reset_queue()
+
+    def _reset_queue(self):
+        server.QUEUE.stop_all()
+        end = time.time() + 5
+        while server.QUEUE.any_active() and time.time() < end:
+            time.sleep(0.02)
+        server.LAST_EXT_TASK["id"] = None
+        with server.SNIFF_LOCK:
+            server.SNIFF_STATE.update({"lines": [], "prog": None, "done": True,
+                                       "code": None, "token": 0})
+
+    def _get(self, path):
+        with self.req.urlopen(self.svc.url + path, timeout=5) as r:
+            return r.status, json.loads(r.read())
+
+    def _post(self, path, body):
+        req = self.req.Request(self.svc.url + path, data=json.dumps(body).encode(),
+                               headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with self.req.urlopen(req, timeout=5) as r:
+                return r.status, json.loads(r.read())
+        except self.err.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    @staticmethod
+    def _block_executor(task):
+        """不起子进程的占位执行器：一直跑到被暂停/取消。"""
+        while not (task.cancel_requested or task.pause_requested):
+            time.sleep(0.02)
+        task.exit_code = -1
+
+    def _submit(self, url="https://example.com/v.mp4"):
+        return self._post("/api/sniff", {"url": url, "kind": "media"})
+
+    def _wait_state(self, tid, states, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end:
+            t = server.QUEUE.get(tid)
+            if t is None or t.state in states:
+                return t
+            time.sleep(0.02)
+        self.fail("任务 %s 未在 %ss 内到达 %s" % (tid, timeout, states))
+
+    def test_status_has_queue_fields(self):
+        st, data = self._get("/api/status")
+        self.assertEqual(st, 200)
+        self.assertEqual(data["app"], "yt-dlp-web")
+        for key in ("tasks", "running", "queued"):
+            self.assertIn(key, data)
+        for key in ("busy", "kind", "elapsed"):   # 旧字段保留
+            self.assertIn(key, data)
+        self.assertFalse(data["busy"])
+        self.assertEqual(data["running"], 0)
+        self.assertEqual(data["queued"], 0)
+
+    def test_sniff_log_has_task_id_and_keeps_legacy_fields(self):
+        st, d = self._get("/api/sniff/log")
+        self.assertEqual(st, 200)
+        self.assertIn("task_id", d)
+        for key in ("busy", "running_kind", "done", "code", "prog", "last_text",
+                    "url", "title", "kind", "lines", "hint", "last_error"):
+            self.assertIn(key, d)
+
+    def test_sniff_response_adds_task_id_and_queue_position(self):
+        with mock.patch.object(server, "_server_executor", self._block_executor):
+            st, j = self._submit()
+        self.assertEqual(st, 200)
+        self.assertTrue(j["ok"])
+        self.assertFalse(j["busy"])
+        self.assertEqual(j["url"], "https://example.com/v.mp4")
+        self.assertIsInstance(j["task_id"], int)
+        self.assertIn("queue_position", j)
+        self.assertEqual(server.LAST_EXT_TASK["id"], j["task_id"])
+        self.assertEqual(server.SNIFF_STATE["token"], j["task_id"])
+
+    def test_second_task_accepted_not_409(self):
+        with mock.patch.object(server, "_server_executor", self._block_executor):
+            st1, j1 = self._submit("https://example.com/a.mp4")
+            st2, j2 = self._submit("https://example.com/b.mp4")
+        self.assertEqual(st1, 200)
+        self.assertEqual(st2, 200)          # 旧单任务语义是 409，队列语义必须接收
+        self.assertTrue(j2["ok"])
+        self.assertNotEqual(j1["task_id"], j2["task_id"])
+
+    def test_queue_full_gives_409(self):
+        with mock.patch.object(server.QUEUE, "submit",
+                               side_effect=server.ytdlp_queue.QueueFull("队列已满")):
+            st, j = self._submit()
+        self.assertEqual(st, 409)
+        self.assertFalse(j["ok"])
+        self.assertTrue(j["busy"])
+        self.assertIn("队列已满", j["error"])
+
+    def test_status_busy_follows_running_task(self):
+        with mock.patch.object(server, "_server_executor", self._block_executor):
+            _, j = self._submit()
+            tid = j["task_id"]
+            end = time.time() + 5
+            data = None
+            while time.time() < end:
+                _, data = self._get("/api/status")
+                if data["busy"]:
+                    break
+                time.sleep(0.02)
+        self.assertTrue(data["busy"])
+        self.assertEqual(data["kind"], "download")
+        self.assertGreaterEqual(data["running"], 1)
+        self.assertTrue(any(t["id"] == tid and t["state"] == "running"
+                            for t in data["tasks"]))
+        self.assertGreaterEqual(data["elapsed"], 0)
+
+    def test_stop_with_id_only_cancels_that_task(self):
+        with mock.patch.object(server, "_server_executor", self._block_executor):
+            _, j1 = self._submit("https://example.com/a.mp4")
+            _, j2 = self._submit("https://example.com/b.mp4")
+            self._wait_state(j1["task_id"], ("running",))
+            self._wait_state(j2["task_id"], ("running",))
+            st, j = self._post("/api/stop", {"id": j1["task_id"]})
+            self.assertEqual(st, 200)
+            self.assertTrue(j["ok"])
+            self._wait_state(j1["task_id"], ("canceled",))
+            t2 = server.QUEUE.get(j2["task_id"])
+            self.assertIsNotNone(t2)
+            self.assertIn(t2.state, ("queued", "running"))   # 不误杀其它任务
+
+    def test_stop_without_id_cancels_latest_ext_task(self):
+        with mock.patch.object(server, "_server_executor", self._block_executor):
+            _, j1 = self._submit("https://example.com/a.mp4")
+            _, j2 = self._submit("https://example.com/b.mp4")
+            self._wait_state(j2["task_id"], ("running",))
+            st, j = self._post("/api/stop", {})
+            self.assertEqual(st, 200)
+            self.assertTrue(j["ok"])
+            self._wait_state(j2["task_id"], ("canceled",))
+            t1 = server.QUEUE.get(j1["task_id"])
+            self.assertIsNotNone(t1)
+            self.assertIn(t1.state, ("queued", "running"))
+
+    def test_stop_accepts_query_id(self):
+        with mock.patch.object(server, "_server_executor", self._block_executor):
+            _, j1 = self._submit()
+            self._wait_state(j1["task_id"], ("running",))
+            st, j = self._post("/api/stop?id=%d" % j1["task_id"], {})
+            self.assertEqual(st, 200)
+            self.assertTrue(j["ok"])
+            self._wait_state(j1["task_id"], ("canceled",))
+
+    def test_fast_finished_task_still_reports_done(self):
+        """任务在镜像回填前就结束（如启动即失败）时，轮询不能永远卡在「进行中」。"""
+        def quick(task):
+            task.exit_code = 0
+        with mock.patch.object(server, "_server_executor", quick):
+            _, j = self._submit()
+        tid = j["task_id"]
+        self._wait_state(tid, ("done",))
+        end = time.time() + 2
+        d = None
+        while time.time() < end:
+            d = server.sniff_log_json()
+            if d["done"]:
+                break
+            time.sleep(0.02)
+        self.assertTrue(d["done"])
+        self.assertEqual(d["code"], 0)
+        self.assertEqual(d["task_id"], tid)
+
+    def test_executor_retries_with_net_plan_then_succeeds(self):
+        """执行器复用自愈阶梯：10054 连接重置 → 换姿势重试 → 成功。"""
+        import tempfile
+        calls = []
+
+        def fake_run(task, cmd, cwd, on_line, stall_seconds=300):
+            calls.append(list(cmd))
+            if len(calls) == 1:
+                return 1, ("ERROR: unable to download video data: "
+                           "('Connection aborted.', ConnectionResetError(10054, 'reset'))"), {}
+            return 0, "[download] 100% of 1.00MiB", {}
+
+        with tempfile.TemporaryDirectory() as d:
+            task = server.ytdlp_queue.Task(999, {
+                "urls": ["https://example.com/v.mp4"], "cfg": {"net_hard": True},
+                "outdir": d, "no_playlist": True, "source": "ext"})
+            with mock.patch.object(server.ytdlp_queue, "run_process", fake_run):
+                server._server_executor(task)
+        self.assertEqual(task.exit_code, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertNotEqual(calls[0], calls[1])   # 重试换了命令（自愈姿势）
+
+    def test_executor_stops_on_cancel_without_retry(self):
+        import tempfile
+
+        def fake_run(task, cmd, cwd, on_line, stall_seconds=300):
+            task.cancel_requested = True      # 模拟取消杀进程后的收尾
+            return -15, "", {}
+
+        with tempfile.TemporaryDirectory() as d:
+            task = server.ytdlp_queue.Task(998, {
+                "urls": ["https://example.com/v.mp4"], "cfg": {"net_hard": True},
+                "outdir": d, "no_playlist": True, "source": "ext"})
+            with mock.patch.object(server.ytdlp_queue, "run_process", fake_run):
+                server._server_executor(task)
+        self.assertEqual(task.exit_code, -15)  # 取消不再自愈重试
+
+    def test_sniff_log_busy_and_task_id_track_queue(self):
+        with mock.patch.object(server, "_server_executor", self._block_executor):
+            _, j = self._submit()
+            tid = j["task_id"]
+            self._wait_state(tid, ("running",))
+            d = server.sniff_log_json()
+            self.assertTrue(d["busy"])
+            self.assertEqual(d["task_id"], tid)
+            self.assertFalse(d["done"])
+        server.QUEUE.stop_all()
+        self._wait_state(tid, ("canceled",))
+        d = server.sniff_log_json()
+        self.assertFalse(d["busy"])
+        self.assertTrue(d["done"])
 
 
 class TestUiRoutesRetired(unittest.TestCase):
