@@ -164,17 +164,25 @@ yt-dlp_win\
 │   ├─ audio_stream.js         # 音频单轨识别（调用 sniff_rules.isAudio）
 │   ├─ content.js              # 浮条 UI、轮询进度、上报元素里的媒体地址
 │   └─ README.md               # 扩展单独的说明与版本历史
+├─ docs\                       # 设计、计划与需求提示词（入库）
+│   ├─ README.md               # 文档索引
+│   ├─ prompts\                # 功能需求提示词
+│   └─ superpowers\            # 设计稿与实施计划
 ├─ tests\                       # 回归测试
 │   ├─ test_core.py            # 核心逻辑单元测试（unittest）
 │   ├─ test_hardening.py       # 安全/健壮性回归
-│   ├─ test_server.py          # 服务端接口与并发闸门
+│   ├─ test_server.py          # 服务端接口、条目字段与并发闸门
 │   ├─ test_host.py            # 桌面宿主：事件泵/历史/流水线/预览播放/嗅探
 │   ├─ test_api.py             # js_api 方法面与输入校验
-│   ├─ test_embedded.py        # 内嵌浏览器：导航白名单/地址归一/生命周期
+│   ├─ test_embedded.py        # 内嵌浏览器/共享嗅探规则/合批与生命周期
 │   ├─ fixtures\               # 探针测试用的 3 秒小样片（mkv/webm/ts/mp4）
 │   └─ extension_smoke.js      # 扩展后台冒烟（Node + 假 chrome API）
+├─ _local\                     # 本机杂物（不入库：vc140.pdb、待完成.txt 等）
 └─ downloads\                  # 默认下载目录
 ```
+
+> `_local/`、`.workbuddy/`、`downloads/`、`config.json`、`history.json`、`__pycache__/`
+> 都是本机文件，已在 `.gitignore` 中排除，不随仓库发布。
 
 ---
 

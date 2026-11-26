@@ -22,3 +22,11 @@ node_modules/
 # 日志与临时文件
 *.log
 *.tmp
+
+# 本机杂物：保留在本机但不入库（vc140.pdb、待完成.txt 等）
+_local/
+*.pdb
+待完成.txt
+
+# WorkBuddy 本地记忆/缓存
+.workbuddy/
