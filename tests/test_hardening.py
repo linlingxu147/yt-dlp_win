@@ -835,6 +835,37 @@ class TestTaskControls(unittest.TestCase):
             self.assertEqual(recs[0]["urls"], ["http://e/a"])
             h.queue.close()
 
+    def test_cancel_finished_task_returns_false_no_history(self):
+        import importlib
+        api_mod = importlib.import_module("api")
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            a = api_mod.Api(h)
+
+            def finish(task):
+                task.exit_code = 0
+            tid = self._submit(h, tmp, exe=finish)
+            self._wait_state(h, tid, ("done",))
+            before = len(h.history)
+            self.assertFalse(a.cancel_task(tid)["ok"])      # 已结束 → 取消失败
+            self.assertEqual(len(h.history), before)        # 不得多记假 canceled
+            self.assertFalse(any(r.get("task_id") == tid for r in h.history))
+            self.assertFalse(a.cancel_task(9999)["ok"])
+            h.queue.close()
+
+    def test_spawn_failure_on_canceled_task_records_no_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            t = mod.ytdlp_queue.Task(1, {
+                "urls": ["http://e/a"], "outdir": tmp,
+                "cfg": dict(core.DEFAULT_CONFIG, outdir=tmp)})
+            t.cancel_requested = True   # 取消已记历史，启动失败分支不得再走 _task_done
+            with mock.patch.object(mod.ytdlp_queue, "run_process",
+                                   return_value=(None, "", {})):
+                h._exec_download(t)
+            self.assertFalse(any(r.get("task_id") == t.id for r in h.history))
+            h.queue.close()
+
     def test_ext_cookie_cleaned_on_pause_early_return(self):
         with tempfile.TemporaryDirectory() as tmp:
             mod, h = self.make_host(tmp)

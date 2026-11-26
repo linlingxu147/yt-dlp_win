@@ -278,6 +278,11 @@ class Host:
                 task, cmd, task.outdir, lambda ln: self._task_line(task, ln),
                 stall_seconds=GUI_STALL_SECONDS)
             task.diag_buf = tail
+            # 暂停/取消早退先于启动失败分支：取消已由控制方法记历史，不能再走 _task_done
+            if task.pause_requested or task.cancel_requested:
+                task.exit_code = -1 if code is None else code
+                self._clean_ext_cookie(task)
+                return
             if code is None:
                 self._task_log(task, "启动失败\n", "err")
                 task.exit_code = -1
@@ -285,10 +290,6 @@ class Host:
                 return
             if why.get("reason") == "stall":
                 self._task_log(task, "[长时间没有输出，已自动终止本次任务]\n", "warn")
-            if task.pause_requested or task.cancel_requested:
-                task.exit_code = code
-                self._clean_ext_cookie(task)
-                return
             if code == 0:
                 task.exit_code = 0
                 self._task_done(task, 0)
@@ -493,14 +494,15 @@ class Host:
 
     # ---------------- 任务控制（T7） ----------------
     def cancel_task(self, tid):
-        """API 取消：记 canceled 历史，再取消并清理部分下载（purge 默认 True）。"""
+        """API 取消：先取消、成功才记 canceled 历史（任务恰好跑完时不留假记录），
+        并清理部分下载（purge 默认 True）。"""
         tid = int(tid)
-        task = self.queue.get(tid)
-        if task is None or task.state not in ytdlp_queue.ACTIVE:
-            return False
-        self._record_task_history(task, "canceled")
         ok = self.queue.cancel(tid)
-        self._clean_ext_cookie(task)
+        task = self.queue.get(tid)
+        if task is not None:
+            if ok:
+                self._record_task_history(task, "canceled")
+            self._clean_ext_cookie(task)
         return ok
 
     def stop_all_downloads(self):

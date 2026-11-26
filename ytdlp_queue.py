@@ -202,6 +202,7 @@ class QueueManager:
                 return False
             t.pause_requested = False
             t.cancel_requested = False
+            t._no_purge = False
             t.net_tried = set()
             t.net_name = "normal"
             t.exit_code = None
