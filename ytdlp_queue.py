@@ -115,6 +115,7 @@ class QueueManager:
     # ---- 调度 ----
     def _loop(self):
         while True:
+            started = None
             with self._cv:
                 while not self._closed:
                     nxt = self._next_queued()
@@ -125,10 +126,15 @@ class QueueManager:
                         threading.Thread(target=self._run_worker,
                                          args=(nxt,), daemon=True).start()
                         self._cv.notify_all()
+                        started = nxt
                         break
                     self._cv.wait(0.2)
                 if self._closed:
                     return
+            if started is not None:
+                self._emit({"type": "queue", "action": "state",
+                            "task": started.snapshot()})
+                self._emit_changed()
 
     def _next_queued(self):
         for i in self._order:
