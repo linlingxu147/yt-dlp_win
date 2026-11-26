@@ -50,8 +50,8 @@ class Host:
         self.history_file = os.path.join(os.path.dirname(config_file), "history.json")
         self.history = self._load_history()
         self._history_lock = threading.Lock()
-        # 辅助操作（探测/排障/格式表/更新）仍走单闸；下载全部进队列。
-        self.task_kind = None
+        # 辅助操作（探测/排障/格式表）共用 aux_kind 单闸，与下载并行；
+        # 更新 yt-dlp 用 updating 独占；下载全部进队列。
         self.proc = None
         self.user_stopped = False
         self.pstate = core.new_progress_state()
@@ -126,10 +126,10 @@ class Host:
                 if t == "exttask":
                     self.start_external(ev["task"])
                     continue
-                if t == "detdone" and self.task_kind == "detect":
+                if t == "detdone" and self.aux_kind == "detect":
                     self.on_detect_done(ev["code"])
                     continue
-                if t == "trodone" and self.task_kind in ("trouble", "update"):
+                if t == "trodone" and (self.aux_kind == "trouble" or self.updating):
                     self.on_trodone(ev["ok"], ev.get("task", "trouble"))
                     continue
                 if t == "queue_changed":
@@ -199,43 +199,29 @@ class Host:
                 pass
 
     def history_list(self):
-        return list(reversed(self.history))
+        with self._history_lock:
+            return list(reversed(self.history))
 
     def history_clear(self):
-        self.history = []
-        try:
-            core.atomic_write_text(self.history_file, "[]")
-        except Exception:
-            pass
+        with self._history_lock:
+            self.history = []
+            try:
+                core.atomic_write_text(self.history_file, "[]")
+            except Exception:
+                pass
 
-    # ---------------- 闸门（辅助操作单闸；下载走队列） ----------------
-    def _reserve(self, kind):
-        if self.task_kind:
+    # ---------------- 闸门（辅助操作单闸；下载走队列；更新独占） ----------------
+    def _reserve_aux(self, kind):
+        if self.aux_kind or self.updating:
             return False
-        if self._web_mod and not self._web_mod.RUNNER.reserve(kind):
-            return False
-        self.task_kind = kind
-        # 镜像到 aux_kind/updating，_task_ev 据此上报（T6 再正式拆闸）
-        if kind == "update":
-            self.updating = True
-        else:
-            self.aux_kind = kind
+        self.aux_kind = kind
         return True
 
-    def _release_runner(self):
-        if self._web_mod:
-            self._web_mod.RUNNER.finish()
-
-    def _release_aux(self):
-        self.task_kind = None
-        self.aux_kind = None
-        self.updating = False
-        self._release_runner()
-
     def _busy(self):
+        kind = self.aux_kind or ("update" if self.updating else None)
         return {"ok": False, "busy": True,
                 "error": "「%s」正在进行，请先停止或等待结束"
-                         % TASK_LABELS.get(self.task_kind, "任务")}
+                         % TASK_LABELS.get(kind, "任务")}
 
     # ---------------- 下载（逐链接入队，per-task executor） ----------------
     def start_download(self, urls, cfg, no_playlist=False):
@@ -476,20 +462,20 @@ class Host:
         self._log(line + "\n", tag)
 
     def stop(self):
+        """只停辅助操作/更新；下载经队列的暂停/取消控制（T7）。"""
+        kind = self.aux_kind or ("update" if self.updating else None)
         proc = self.proc
-        if not proc or proc.poll() is not None:
-            if self.task_kind == "update":
-                # 镜像下载没有子进程，stop 也要能把更新线程叫停
-                self.user_stopped = True
-                self._status("已停止", "err")
-                self._log("[已手动停止：更新]\n", "warn")
-                return True
+        if proc is not None and proc.poll() is None:
+            self.user_stopped = True
+            kill_tree(proc)
+        elif kind:
+            # 镜像下载没有子进程，stop 也要能把更新线程叫停
+            self.user_stopped = True
+        else:
             self._status("当前没有进行中的任务", "idle")
             return False
-        self.user_stopped = True
-        kill_tree(proc)
         self._status("已停止", "err")
-        self._log("[已手动停止：%s]\n" % TASK_LABELS.get(self.task_kind, "任务"), "warn")
+        self._log("[已手动停止：%s]\n" % TASK_LABELS.get(kind, "任务"), "warn")
         return True
 
     def _log_diag(self):
@@ -532,13 +518,11 @@ class Host:
 
     # ---------------- 探测 ----------------
     def detect(self, urls, cfg):
-        if self.task_kind:
-            return self._busy()
         good, _ = sanitize_urls(urls or [])
         if not good:
             return {"ok": False, "error": "没有可用的链接"}
         self.save_config(cfg)
-        if not self._reserve("detect"):
+        if not self._reserve_aux("detect"):
             return self._busy()
         self.results = []
         self.cookie_warned = False
@@ -601,7 +585,7 @@ class Host:
         self._put({"type": "detdone", "code": code})
 
     def on_detect_done(self, code):
-        self._release_aux()
+        self.aux_kind = None
         self._task_ev()
         n = len(self.results)
         if n:
@@ -615,13 +599,11 @@ class Host:
 
     # ---------------- 排障 ----------------
     def troubleshoot(self, urls, cfg):
-        if self.task_kind:
-            return self._busy()
         good, _ = sanitize_urls(urls or [])
         if not good:
             return {"ok": False, "error": "没有可用的链接"}
         self.save_config(cfg)
-        if not self._reserve("trouble"):
+        if not self._reserve_aux("trouble"):
             return self._busy()
         self.user_stopped = False
         self._task_ev()
@@ -703,7 +685,10 @@ class Host:
         return got_json, msg, "\n".join(lines[-25:])
 
     def on_trodone(self, ok, task):
-        self._release_aux()
+        if task == "update":
+            self.updating = False
+        else:
+            self.aux_kind = None
         self._task_ev()
         if task == "update":
             self._status("更新完成" if ok else "更新失败", "ok" if ok else "err")
@@ -714,11 +699,9 @@ class Host:
 
     # ---------------- 更新 ----------------
     def update_ytdlp(self, proxy, mirror=""):
-        if self.task_kind:
-            return self._busy()
-        if self.queue.any_active():
+        if self.aux_kind or self.updating or self.queue.any_active():
             return {"ok": False, "busy": True,
-                    "error": "有下载任务正在进行，请先停止或等待结束"}
+                    "error": "有任务正在进行，请等待结束后再更新"}
         proxy = str(proxy or "").strip()
         mirror = str(mirror or "").strip()
         self.save_config({"proxy": proxy, "update_mirror": mirror})
@@ -726,8 +709,7 @@ class Host:
         cmd = [yt, "-U"]
         if proxy:
             cmd += ["--proxy", proxy]
-        if not self._reserve("update"):
-            return self._busy()
+        self.updating = True
         self.user_stopped = False
         self._task_ev()
         self._status("更新 yt-dlp…", "run")
@@ -847,12 +829,10 @@ class Host:
 
     # ---------------- 格式表 ----------------
     def fetch_formats(self, url, cfg):
-        if self.task_kind:
-            return self._busy()
         good, _ = sanitize_urls([url])
         if not good:
             return {"ok": False, "error": "请先填写一个有效链接"}
-        if not self._reserve("formats"):
+        if not self._reserve_aux("formats"):
             return self._busy()
         self.user_stopped = False
         self._task_ev()
@@ -884,8 +864,8 @@ class Host:
                     retried = True
                     continue
             break
-        if self.task_kind == "formats":
-            self._release_aux()
+        if self.aux_kind == "formats":
+            self.aux_kind = None
             self._task_ev()
         self._put({"type": "formats", "lines": out, "code": code})
 
@@ -981,7 +961,8 @@ class Host:
     # ---------------- 扩展嗅探 ----------------
     def sniff_items(self):
         if self._web_mod is None:
-            return {"ok": True, "items": [], "busy": bool(self.task_kind), "svc": False}
+            return {"ok": True, "items": [],
+                    "busy": bool(self.aux_kind or self.updating), "svc": False}
         d = self._web_mod.sniff_items_json()
         d["svc"] = True
         return d

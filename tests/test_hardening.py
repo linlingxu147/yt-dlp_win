@@ -5,10 +5,12 @@
 import contextlib
 import io
 import ipaddress
+import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.request
@@ -509,6 +511,198 @@ class TestHostQueue(unittest.TestCase):
             self.assertEqual(calls[0]["urls"], ["http://e/a"])
             self.assertEqual(calls[1]["urls"], ["http://e/b"])
             self.assertEqual(calls[0]["source"], "gui")
+            h.queue.close()
+
+
+class TestAuxGate(unittest.TestCase):
+    """T6：探测/排障/格式表共用 aux 单闸、与下载并行；更新 yt-dlp 独占。"""
+
+    def make_host(self, tmp):
+        import importlib
+        host_mod = importlib.import_module("host")
+        cfg = os.path.join(tmp, "config.json")
+        core.save_config(cfg, {"outdir": tmp, "open_after": False})
+        h = host_mod.Host(cfg)
+        h.mark_ready()
+        return host_mod, h
+
+    def _active_download(self, h, tmp):
+        """挂一个阻塞 executor 的下载任务，保证 any_active() 稳定为 True。"""
+        gate = threading.Event()
+
+        def exe(task):
+            gate.wait(5)
+            task.exit_code = 0
+
+        tid = h.queue.submit({"urls": ["http://e/a"], "cfg": {"outdir": tmp},
+                              "outdir": tmp, "source": "gui"}, exe)
+        return gate, tid
+
+    def _wait_done(self, h, tid, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end:
+            t = h.queue.get(tid)
+            if t is not None and t.state not in ("queued", "running", "paused"):
+                return t
+            time.sleep(0.02)
+        self.fail("任务 %s 未在超时内结束" % tid)
+
+    def test_update_blocked_while_downloading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            gate, tid = self._active_download(h, tmp)
+            try:
+                r = h.update_ytdlp("", "")
+                self.assertFalse(r["ok"])
+            finally:
+                gate.set()
+                self._wait_done(h, tid)
+                h.queue.close()
+
+    def test_update_blocked_while_aux_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            h.aux_kind = "detect"
+            with mock.patch.object(mod, "spawn",
+                                   side_effect=RuntimeError("测试禁止起进程")):
+                r = h.update_ytdlp("", "")
+            self.assertFalse(r["ok"])
+            if h._worker is not None:
+                h._worker.join(5)
+            h.queue.close()
+
+    def test_updating_blocks_aux_ops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            h.updating = True
+            cfg = dict(h.cfg, outdir=tmp)
+            with mock.patch.object(mod, "spawn",
+                                   side_effect=RuntimeError("测试禁止起进程")):
+                for call in (lambda: h.detect(["https://x/v"], cfg),
+                             lambda: h.troubleshoot(["https://x/v"], cfg),
+                             lambda: h.fetch_formats("https://x/v", cfg)):
+                    r = call()
+                    self.assertFalse(r["ok"])
+                    self.assertTrue(r.get("busy"))
+                    if h._worker is not None:
+                        h._worker.join(5)
+                        h._worker = None
+            h.queue.close()
+
+    def test_aux_single_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            h.aux_kind = "detect"
+            with mock.patch.object(mod, "spawn",
+                                   side_effect=RuntimeError("测试禁止起进程")):
+                r = h.fetch_formats("https://x/v", dict(h.cfg, outdir=tmp))
+            self.assertFalse(r["ok"])
+            self.assertTrue(r.get("busy"))
+            if h._worker is not None:
+                h._worker.join(5)
+            h.queue.close()
+
+    def test_detect_runs_parallel_with_download(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            gate, tid = self._active_download(h, tmp)
+
+            class Proc:
+                def poll(self): return 0
+                def wait(self): return 0
+
+            row = json.dumps({"id": "x", "title": "T", "webpage_url": "https://x/v"})
+
+            def it(proc, abort=None, **kw):
+                yield row
+
+            try:
+                with mock.patch.object(mod, "spawn", return_value=Proc()), \
+                     mock.patch.object(mod, "iter_lines_watch", it):
+                    r = h.detect(["https://x/v"], dict(h.cfg, outdir=tmp))
+                    self.assertTrue(r["ok"], r)
+                    h._worker.join(5)
+                h.pump_once()
+                self.assertEqual(len(h.results), 1)
+                self.assertIsNone(h.aux_kind)      # 收尾只清 aux 闸
+                self.assertTrue(h.queue.any_active())  # 下载不受影响
+            finally:
+                gate.set()
+                self._wait_done(h, tid)
+                h.queue.close()
+
+    def test_done_callbacks_clear_own_gate_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            h.aux_kind = "detect"
+            h.updating = True
+            h.on_detect_done(0)
+            self.assertIsNone(h.aux_kind)
+            self.assertTrue(h.updating)            # 不许顺手清掉更新闸
+            h.updating = True
+            h.on_trodone(1, "update")
+            self.assertFalse(h.updating)
+            h.aux_kind = "trouble"
+            h.on_trodone(0, "trouble")
+            self.assertIsNone(h.aux_kind)
+            h.queue.close()
+
+    def test_stop_handles_aux_update_and_idle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            self.assertFalse(h.stop())             # 空闲：无可停
+            h.aux_kind = "detect"
+            self.assertTrue(h.stop())              # 辅助无子进程也要能叫停
+            self.assertTrue(h.user_stopped)
+            h.user_stopped = False
+            h.aux_kind = None
+            h.updating = True
+            self.assertTrue(h.stop())              # 镜像更新无子进程
+            self.assertTrue(h.user_stopped)
+            h.queue.close()
+
+    def test_task_payload_truthful(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            h.aux_kind = "formats"
+            p = h._task_payload()
+            self.assertEqual(p["kind"], "formats")
+            self.assertTrue(p["busy"])
+            self.assertFalse(p["downloading"])
+            h.aux_kind = None
+            h.updating = True
+            p = h._task_payload()
+            self.assertEqual(p["kind"], "update")
+            self.assertTrue(p["busy"])
+            h.queue.close()
+
+
+class TestHistoryLock(unittest.TestCase):
+    """history_clear/history_list 与 record_history 共用一把锁，避免并发丢记录。"""
+
+    def test_clear_waits_for_history_lock(self):
+        import importlib
+        host_mod = importlib.import_module("host")
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "config.json")
+            core.save_config(cfg, {"outdir": tmp, "open_after": False})
+            h = host_mod.Host(cfg)
+            done = threading.Event()
+
+            def clear():
+                h.history_clear()
+                done.set()
+
+            h._history_lock.acquire()
+            t = threading.Thread(target=clear, daemon=True)
+            t.start()
+            try:
+                self.assertFalse(done.wait(0.2))   # 锁未放行前不得清完
+            finally:
+                h._history_lock.release()
+            t.join(5)
+            self.assertTrue(done.is_set())
+            self.assertEqual(h.history, [])
             h.queue.close()
 
 

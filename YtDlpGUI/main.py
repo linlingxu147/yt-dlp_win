@@ -128,7 +128,7 @@ def main():
         host.start_pump()
 
     def on_closing():
-        if host.task_kind or host.queue.any_active():
+        if host.aux_kind or host.updating or host.queue.any_active():
             host._put({"type": "exit_confirm"})
             return False
         host.shutdown()

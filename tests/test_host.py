@@ -201,7 +201,7 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual(self.host.history[0]["status"], "ok")
         self.assertEqual(self.host.history[0]["task_id"], t.id)
         self.assertEqual(t.state, "done")
-        self.assertIsNone(self.host.task_kind)
+        self.assertIsNone(self.host.aux_kind)
 
     def test_unsafe_extra_arg_blocked(self):
         cfg = dict(self.cfg, extra="--exec rm")
@@ -215,7 +215,6 @@ class DownloadTest(unittest.TestCase):
         self.assertFalse(r["ok"])
 
     def test_aux_kind_does_not_block_download(self):
-        self.host.task_kind = "detect"
         self.host.aux_kind = "detect"
         t = self._run_download([], 0)
         self.assertEqual(t.state, "done")
