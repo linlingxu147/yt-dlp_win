@@ -198,6 +198,14 @@ class Host:
             except Exception:
                 pass
 
+    def _record_task_history(self, task, status):
+        """按任务上下文记一条历史（取消/退出停止共用；正常结束走 _task_done）。"""
+        self.record_history({"urls": task.urls, "outdir": task.outdir, "status": status,
+                             "elapsed": round(time.time() - (task.started_at or task.created_at), 1),
+                             "done_count": len(task.pstate.get("done") or []),
+                             "mode": task.cfg.get("mode", ""), "source": task.source,
+                             "task_id": task.id})
+
     def history_list(self):
         with self._history_lock:
             return list(reversed(self.history))
@@ -279,6 +287,7 @@ class Host:
                 self._task_log(task, "[长时间没有输出，已自动终止本次任务]\n", "warn")
             if task.pause_requested or task.cancel_requested:
                 task.exit_code = code
+                self._clean_ext_cookie(task)
                 return
             if code == 0:
                 task.exit_code = 0
@@ -352,11 +361,7 @@ class Host:
                              "task_id": task.id})
         if task.ext_emit:
             task.ext_emit({"type": "done", "code": code})
-        if task.ext_cookie_file and os.path.isfile(task.ext_cookie_file):
-            try:
-                os.remove(task.ext_cookie_file)
-            except OSError:
-                pass
+        self._clean_ext_cookie(task)
         if code == 0:
             self._task_log(task, "=== 完成 · 耗时 %d 秒 ===\n" % int(elapsed), "ok")
             self._maybe_open_after(task)
@@ -365,6 +370,14 @@ class Host:
             self._task_diag(task)
         self._put({"type": "done", "code": code, "task_id": task.id,
                    "elapsed": round(elapsed, 1)})
+
+    def _clean_ext_cookie(self, task):
+        """临时嗅探 Cookie 文件按任务清理（done/暂停/取消早退都走这里）。"""
+        if task.ext_cookie_file and os.path.isfile(task.ext_cookie_file):
+            try:
+                os.remove(task.ext_cookie_file)
+            except OSError:
+                pass
 
     def _task_diag(self, task):
         diag = diagnose_pairs(task.diag_buf or "")
@@ -477,6 +490,30 @@ class Host:
         self._status("已停止", "err")
         self._log("[已手动停止：%s]\n" % TASK_LABELS.get(kind, "任务"), "warn")
         return True
+
+    # ---------------- 任务控制（T7） ----------------
+    def cancel_task(self, tid):
+        """API 取消：记 canceled 历史，再取消并清理部分下载（purge 默认 True）。"""
+        tid = int(tid)
+        task = self.queue.get(tid)
+        if task is None or task.state not in ytdlp_queue.ACTIVE:
+            return False
+        self._record_task_history(task, "canceled")
+        ok = self.queue.cancel(tid)
+        self._clean_ext_cookie(task)
+        return ok
+
+    def stop_all_downloads(self):
+        """全部停止/退出：运行中记 stopped 并保留部分下载；排队直接丢弃（spec §4）。"""
+        for row in self.queue.snapshot()["tasks"]:
+            if row["state"] != "running":
+                continue
+            task = self.queue.get(row["id"])
+            if task is None or task.state != "running":
+                continue
+            self._record_task_history(task, "stopped")
+        n = self.queue.stop_all(purge=False)
+        return {"ok": True, "stopped": n}
 
     def _log_diag(self):
         diag = diagnose_pairs(self.diag_buf or "")
@@ -702,62 +739,72 @@ class Host:
         if self.aux_kind or self.updating or self.queue.any_active():
             return {"ok": False, "busy": True,
                     "error": "有任务正在进行，请等待结束后再更新"}
-        proxy = str(proxy or "").strip()
-        mirror = str(mirror or "").strip()
-        self.save_config({"proxy": proxy, "update_mirror": mirror})
-        yt = self.cfg.get("yt_dlp_path") or find_tool("yt-dlp.exe")
-        cmd = [yt, "-U"]
-        if proxy:
-            cmd += ["--proxy", proxy]
+        # 守卫一过立即占独占闸，缩小 save_config/find_tool 期间的 TOCTOU 窗口
         self.updating = True
-        self.user_stopped = False
-        self._task_ev()
-        self._status("更新 yt-dlp…", "run")
-        self._log("> " + command_text(cmd) + "\n", "cmd")
-        self._worker = threading.Thread(
-            target=self._update_run, args=(cmd, proxy, mirror), daemon=True)
-        self._worker.start()
+        try:
+            proxy = str(proxy or "").strip()
+            mirror = str(mirror or "").strip()
+            self.save_config({"proxy": proxy, "update_mirror": mirror})
+            yt = self.cfg.get("yt_dlp_path") or find_tool("yt-dlp.exe")
+            cmd = [yt, "-U"]
+            if proxy:
+                cmd += ["--proxy", proxy]
+            self.user_stopped = False
+            self._task_ev()
+            self._status("更新 yt-dlp…", "run")
+            self._log("> " + command_text(cmd) + "\n", "cmd")
+            self._worker = threading.Thread(
+                target=self._update_run, args=(cmd, proxy, mirror), daemon=True)
+            self._worker.start()
+        except Exception:
+            self.updating = False
+            raise
         return {"ok": True}
 
     def _update_run(self, cmd, proxy="", mirror=""):
         ok = False
         try:
-            proc = spawn(cmd, core.BASE_DIR)
-        except Exception as e:
-            self._log("启动失败：%s\n" % e, "err")
-            proc = None
-        if proc is not None:
-            self.proc = proc
-            code = -1
             try:
-                for line in iter_lines_watch(proc, abort=lambda: self.user_stopped,
-                                             keep_blank=True):
-                    self._log(line + "\n", None)
-                code = proc.wait()
+                proc = spawn(cmd, core.BASE_DIR)
             except Exception as e:
-                self._log("更新出错：%s\n" % e, "err")
-            finally:
-                self.proc = None
+                self._log("启动失败：%s\n" % e, "err")
+                proc = None
+            if proc is not None:
+                self.proc = proc
+                code = -1
                 try:
-                    if proc.stdout:
-                        proc.stdout.close()
-                except Exception:
-                    pass
-            ok = code == 0
-        if not ok and not mirror and not self.user_stopped:
-            self._log("[更新] 官方源失败；可在「设置 → 网络与加速 → 更新镜像」"
-                      "填写 https://gh-proxy.com 后重试\n", "warn")
-        if not ok and mirror and not self.user_stopped:
-            self._log("[更新] 官方源失败，尝试镜像：%s\n" % mirror, "warn")
-            self._status("更新：尝试镜像…", "run")
-            ok = self._update_via_mirror(mirror, proxy)
-        if ok:
-            self._log("=== 更新完成，请重新探测 ===\n", "ok")
-        elif self.user_stopped:
-            self._log("=== 更新已停止 ===\n", "warn")
-        else:
-            self._log("=== 更新失败，通常是网络/代理不通 ===\n", "err")
-        self._put({"type": "trodone", "ok": 1 if ok else 0, "task": "update"})
+                    for line in iter_lines_watch(proc, abort=lambda: self.user_stopped,
+                                                 keep_blank=True):
+                        self._log(line + "\n", None)
+                    code = proc.wait()
+                except Exception as e:
+                    self._log("更新出错：%s\n" % e, "err")
+                finally:
+                    self.proc = None
+                    try:
+                        if proc.stdout:
+                            proc.stdout.close()
+                    except Exception:
+                        pass
+                ok = code == 0
+            if not ok and not mirror and not self.user_stopped:
+                self._log("[更新] 官方源失败；可在「设置 → 网络与加速 → 更新镜像」"
+                          "填写 https://gh-proxy.com 后重试\n", "warn")
+            if not ok and mirror and not self.user_stopped:
+                self._log("[更新] 官方源失败，尝试镜像：%s\n" % mirror, "warn")
+                self._status("更新：尝试镜像…", "run")
+                ok = self._update_via_mirror(mirror, proxy)
+            if ok:
+                self._log("=== 更新完成，请重新探测 ===\n", "ok")
+            elif self.user_stopped:
+                self._log("=== 更新已停止 ===\n", "warn")
+            else:
+                self._log("=== 更新失败，通常是网络/代理不通 ===\n", "err")
+        except Exception as e:
+            self._log("更新出错：%s\n" % e, "err")
+        finally:
+            # 无论哪里抛异常（含镜像初始化），都要发 trodone 收回独占闸
+            self._put({"type": "trodone", "ok": 1 if ok else 0, "task": "update"})
 
     def _update_via_mirror(self, mirror, proxy=""):
         """官方 -U 失败后的回退：镜像下载 onedir zip → 校验 → 替换 runtime。"""
@@ -1044,7 +1091,8 @@ class Host:
     def shutdown(self):
         self.save_config({})
         try:
-            self.queue.stop_all()
+            # 退出停止：保留 .part/.aria2 供历史「继续下载」，运行中记 stopped
+            self.stop_all_downloads()
         except Exception:
             pass
         try:

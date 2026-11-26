@@ -128,8 +128,11 @@ def main():
         host.start_pump()
 
     def on_closing():
-        if host.aux_kind or host.updating or host.queue.any_active():
-            host._put({"type": "exit_confirm"})
+        snap = host.queue.snapshot()
+        if host.aux_kind or host.updating or snap["running"] or snap["queued"]:
+            host._put({"type": "exit_confirm",
+                       "text": "%d 个下载中 / %d 个排队，退出将停止全部任务。"
+                               % (snap["running"], snap["queued"])})
             return False
         host.shutdown()
         return True

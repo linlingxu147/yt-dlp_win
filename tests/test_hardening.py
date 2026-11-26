@@ -706,5 +706,169 @@ class TestHistoryLock(unittest.TestCase):
             h.queue.close()
 
 
+class TestTaskControls(unittest.TestCase):
+    """T7：暂停/继续/取消 API；退出停止保留部分下载记 stopped，取消清理记 canceled。"""
+
+    def make_host(self, tmp, queue_n="1"):
+        import importlib
+        host_mod = importlib.import_module("host")
+        cfg = os.path.join(tmp, "config.json")
+        core.save_config(cfg, {"outdir": tmp, "open_after": False, "queue_n": queue_n})
+        h = host_mod.Host(cfg)
+        h.mark_ready()
+        return host_mod, h
+
+    def _blocking_exec(self, name="v.mp4", started=None):
+        """模拟 run_process：轮询 pause/cancel 请求提前返回，不起真实子进程。"""
+        def exe(task):
+            task.pstate["file"] = name
+            if started is not None:
+                started.set()
+            end = time.time() + 5
+            while time.time() < end:
+                if task.pause_requested or task.cancel_requested:
+                    task.exit_code = -1
+                    return
+                time.sleep(0.02)
+            task.exit_code = 0
+        return exe
+
+    def _wait_state(self, h, tid, states, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end:
+            t = h.queue.get(tid)
+            if t is not None and t.state in states:
+                return t
+            time.sleep(0.02)
+        self.fail("任务 %s 未在超时内到达 %s" % (tid, states))
+
+    def _submit(self, h, tmp, url="http://e/a", exe=None):
+        return h.queue.submit({"urls": [url], "cfg": {"outdir": tmp},
+                               "outdir": tmp, "source": "gui"},
+                              exe or self._blocking_exec())
+
+    def test_pause_resume_cancel_api(self):
+        import importlib
+        api_mod = importlib.import_module("api")
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp, queue_n="2")
+            a = api_mod.Api(h)
+            tid = self._submit(h, tmp)
+            try:
+                self._wait_state(h, tid, ("running",))
+                self.assertTrue(a.pause_task(tid)["ok"])
+                self._wait_state(h, tid, ("paused",))
+                self.assertTrue(a.resume_task(tid)["ok"])
+                self._wait_state(h, tid, ("running",))
+                self.assertTrue(a.cancel_task(tid)["ok"])
+                self._wait_state(h, tid, ("canceled",))
+                self.assertFalse(a.pause_task(9999)["ok"])
+                self.assertFalse(a.resume_task(tid)["ok"])
+            finally:
+                h.queue.stop_all()
+                h.queue.close()
+
+    def test_stop_all_api_counts_and_keeps_partials(self):
+        import importlib
+        api_mod = importlib.import_module("api")
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            a = api_mod.Api(h)
+            part = os.path.join(tmp, "v.mp4.part")
+            _write(part, b"x")
+            started = threading.Event()
+            tid = self._submit(h, tmp, exe=self._blocking_exec(started=started))
+            self.assertTrue(started.wait(5))
+            tid2 = self._submit(h, tmp, url="http://e/b")
+            try:
+                r = a.stop_all()
+                self.assertTrue(r["ok"])
+                self.assertEqual(r["stopped"], 2)
+                self._wait_state(h, tid, ("canceled",))
+                self.assertTrue(os.path.isfile(part))      # 全部停止＝可续传，不清残留
+                recs = [r for r in h.history if r.get("task_id") == tid]
+                self.assertEqual(len(recs), 1)
+                self.assertEqual(recs[0]["status"], "stopped")
+                self.assertFalse(any(r.get("task_id") == tid2 for r in h.history))
+            finally:
+                h.queue.close()
+
+    def test_shutdown_keeps_partials_and_records_stopped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            part = os.path.join(tmp, "v.mp4.part")
+            _write(part, b"x")
+            started = threading.Event()
+            tid = self._submit(h, tmp, exe=self._blocking_exec(started=started))
+            self.assertTrue(started.wait(5))
+            tid2 = self._submit(h, tmp, url="http://e/b")   # queue_n=1 → 排队
+            h.shutdown()
+            self._wait_state(h, tid, ("canceled",))
+            self.assertTrue(os.path.isfile(part))           # 退出保留 .part 供继续下载
+            recs = [r for r in h.history if r.get("task_id") == tid]
+            self.assertEqual(len(recs), 1)
+            self.assertEqual(recs[0]["status"], "stopped")
+            self.assertEqual(recs[0]["urls"], ["http://e/a"])
+            self.assertEqual(recs[0]["outdir"], tmp)
+            self.assertEqual(recs[0]["source"], "gui")
+            # 排队任务直接丢弃：不记历史
+            self.assertEqual(h.queue.get(tid2).state, "canceled")
+            self.assertFalse(any(r.get("task_id") == tid2 for r in h.history))
+
+    def test_api_cancel_purges_partials_and_records_canceled(self):
+        import importlib
+        api_mod = importlib.import_module("api")
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            a = api_mod.Api(h)
+            part = os.path.join(tmp, "v.mp4.part")
+            _write(part, b"x")
+            started = threading.Event()
+            tid = self._submit(h, tmp, exe=self._blocking_exec(started=started))
+            self.assertTrue(started.wait(5))
+            self.assertTrue(a.cancel_task(tid)["ok"])
+            self._wait_state(h, tid, ("canceled",))
+            self.assertFalse(os.path.exists(part))          # 取消必须清残留
+            recs = [r for r in h.history if r.get("task_id") == tid]
+            self.assertEqual(len(recs), 1)
+            self.assertEqual(recs[0]["status"], "canceled")
+            self.assertEqual(recs[0]["urls"], ["http://e/a"])
+            h.queue.close()
+
+    def test_ext_cookie_cleaned_on_pause_early_return(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            jar = os.path.join(tmp, "sniff_cookies.txt")
+            _write(jar, b"# Netscape HTTP Cookie File\n")
+            for flag in ("pause_requested", "cancel_requested"):
+                _write(jar, b"# Netscape HTTP Cookie File\n")
+                t = mod.ytdlp_queue.Task(1, {
+                    "urls": ["http://e/a"], "outdir": tmp,
+                    "cfg": dict(core.DEFAULT_CONFIG, outdir=tmp),
+                    "ext_cookie_file": jar})
+                setattr(t, flag, True)
+                with mock.patch.object(mod.ytdlp_queue, "run_process",
+                                       return_value=(1, "", {})):
+                    h._exec_download(t)
+                self.assertFalse(os.path.exists(jar), flag)
+            h.queue.close()
+
+    def test_update_run_always_emits_trodone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            h.updating = True
+            with mock.patch.object(mod, "spawn",
+                                   side_effect=RuntimeError("测试禁止起进程")), \
+                 mock.patch.object(h, "_update_via_mirror",
+                                   side_effect=RuntimeError("镜像初始化炸了")):
+                h._update_run(["yt-dlp", "-U"], "", "https://mirror.example")
+            evs = []
+            while not h.q.empty():
+                evs.append(h.q.get_nowait())
+            self.assertTrue(any(e.get("type") == "trodone" and e.get("task") == "update"
+                                for e in evs), evs)
+            h.queue.close()
+
+
 if __name__ == "__main__":
     unittest.main()

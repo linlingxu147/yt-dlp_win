@@ -73,6 +73,18 @@ class Api:
     def queue_snapshot(self):
         return {"ok": True, **self.host.queue.snapshot()}
 
+    def pause_task(self, tid):
+        return self._guard(lambda: {"ok": self.host.queue.pause(int(tid))})
+
+    def resume_task(self, tid):
+        return self._guard(lambda: {"ok": self.host.queue.resume(int(tid))})
+
+    def cancel_task(self, tid):
+        return self._guard(lambda: {"ok": self.host.cancel_task(tid)})
+
+    def stop_all(self):
+        return self._guard(self.host.stop_all_downloads)
+
     def troubleshoot(self, urls, cfg):
         return self._guard(self.host.troubleshoot, urls, cfg)
 

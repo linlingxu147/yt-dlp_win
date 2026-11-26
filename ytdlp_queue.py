@@ -40,6 +40,7 @@ class Task:
         self.ended_at = None
         self.pause_requested = False
         self.cancel_requested = False
+        self._no_purge = False
         self.net_tried = set()
         self.net_name = "normal"
         self.diag_buf = ""
@@ -167,7 +168,7 @@ class QueueManager:
             canceled = task.state == "canceled"
             self._trim_finished()
             self._cv.notify_all()
-        if canceled:
+        if canceled and not task._no_purge:
             purge_partials(task)
         self._emit({"type": "queue", "action": "state", "task": task.snapshot()})
         self._emit_changed()
@@ -213,12 +214,15 @@ class QueueManager:
         self._emit_changed()
         return True
 
-    def cancel(self, tid):
+    def cancel(self, tid, purge=True):
+        """取消任务；purge=False 保留 .part/.aria2（退出停止，供历史继续下载）。"""
         with self._cv:
             t = self._tasks.get(tid)
             if not t or t.state not in ACTIVE:
                 return False
             t.cancel_requested = True
+            if not purge:
+                t._no_purge = True
             direct = t.state in ("queued", "paused")
             if direct:
                 t.state = "canceled"
@@ -229,17 +233,18 @@ class QueueManager:
         if proc is not None:
             core.kill_tree(proc)
         if direct:
-            purge_partials(t)
+            if not t._no_purge:
+                purge_partials(t)
             self._emit({"type": "queue", "action": "state", "task": t.snapshot()})
             self._emit_changed()
         return True
 
-    def stop_all(self):
+    def stop_all(self, purge=True):
         with self._cv:
             ids = [i for i, t in self._tasks.items() if t.state in ACTIVE]
         n = 0
         for i in ids:
-            if self.cancel(i):
+            if self.cancel(i, purge=purge):
                 n += 1
         return n
 

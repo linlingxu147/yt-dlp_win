@@ -329,6 +329,73 @@ class TestRunProcess(unittest.TestCase):
             mgr.close()
 
 
+class TestNoPurgeCancel(unittest.TestCase):
+    """退出语义（spec §4）：purge=False 的取消/全部停止保留 .part/.aria2 供续传。"""
+
+    def _running_task(self, mgr, tmp, started):
+        def exe(task):
+            task.pstate["file"] = "v.mp4"
+            started.set()
+            end = time.time() + 5
+            while time.time() < end:
+                if task.pause_requested or task.cancel_requested:
+                    task.exit_code = -1
+                    return
+                time.sleep(0.02)
+            task.exit_code = 0
+        return mgr.submit(spec(outdir=tmp), exe)
+
+    def _wait_canceled(self, mgr, tid, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end:
+            t = mgr.get(tid)
+            if t is not None and t.state == "canceled":
+                return
+            time.sleep(0.02)
+        self.fail("任务 %s 未在超时内取消" % tid)
+
+    def test_stop_all_no_purge_keeps_running_partials(self):
+        mgr = q.QueueManager(max_concurrent=1)
+        started = threading.Event()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                part = os.path.join(tmp, "v.mp4.part")
+                with open(part, "wb") as f:
+                    f.write(b"x")
+                tid = self._running_task(mgr, tmp, started)
+                self.assertTrue(started.wait(5))
+                self.assertEqual(mgr.stop_all(purge=False), 1)
+                self._wait_canceled(mgr, tid)
+                self.assertTrue(os.path.isfile(part))
+        finally:
+            mgr.close()
+
+    def test_cancel_no_purge_keeps_partials_default_still_purges(self):
+        mgr = q.QueueManager(max_concurrent=1)
+        exe = FakeExec()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                a = mgr.submit(spec(outdir=tmp), exe)
+                b = mgr.submit(spec(outdir=tmp), exe)
+                c = mgr.submit(spec(outdir=tmp), exe)
+                end = time.time() + 3
+                while time.time() < end and mgr.get(a).state != "running":
+                    time.sleep(0.02)
+                for t, name in ((mgr.get(b), "b.mp4"), (mgr.get(c), "c.mp4")):
+                    t.pstate["file"] = name
+                    with open(os.path.join(tmp, name + ".part"), "wb") as f:
+                        f.write(b"x")
+                mgr.cancel(b, purge=False)      # 直落路径（queued/paused）
+                mgr.cancel(c)                   # 默认仍清理
+                self.assertEqual(mgr.get(b).state, "canceled")
+                self.assertEqual(mgr.get(c).state, "canceled")
+                self.assertTrue(os.path.isfile(os.path.join(tmp, "b.mp4.part")))
+                self.assertFalse(os.path.exists(os.path.join(tmp, "c.mp4.part")))
+        finally:
+            exe.release()
+            mgr.close()
+
+
 class TestPurgePartials(unittest.TestCase):
     def test_removes_only_task_partials(self):
         with tempfile.TemporaryDirectory() as tmp:
