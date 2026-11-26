@@ -43,10 +43,6 @@ class ApiTest(unittest.TestCase):
         self.assertFalse(self.api.open_url("file:///C:/x")["ok"])
         self.assertFalse(self.api.open_url("javascript:alert(1)")["ok"])
 
-    def test_play_now_no_path_param(self):
-        with self.assertRaises(TypeError):
-            self.api.play_now(path="C:/x")
-
     def test_sniff_play_clip_no_path_param(self):
         with self.assertRaises(TypeError):
             self.api.sniff_play_clip(path="C:/x")

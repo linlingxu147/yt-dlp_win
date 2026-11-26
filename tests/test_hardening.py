@@ -301,26 +301,6 @@ class TestStreamPreviewHelpers(unittest.TestCase):
         with mock.patch.object(core, "spawn", return_value=_FakeProc(rc=1)):
             self.assertIsNone(core.stream_duration("https://cdn/a.m3u8"))
 
-    def _dummy_media(self, name):
-        d = tempfile.mkdtemp()
-        p = os.path.join(d, name)
-        with open(p, "wb") as f:
-            f.write(b"x")
-        return p
-
-    def test_probe_playable_accepts_ffmpeg_duration(self):
-        out = b"  Duration: 00:00:03.00, start: 0.000000, bitrate: 1 kb/s\n"
-        with mock.patch.object(core, "spawn", return_value=_FakeProc(err=out)) as sp:
-            self.assertTrue(core.probe_playable(self._dummy_media("a.mkv"))["ok"])
-        self.assertIn("ffmpeg.exe", sp.call_args[0][0][0])
-
-    def test_probe_playable_reports_ffmpeg_error(self):
-        err = b"[mov,mp4,m4a,3gp,3g2,mj2 @ 0] moov atom not found\n"
-        with mock.patch.object(core, "spawn", return_value=_FakeProc(err=err, rc=1)):
-            v = core.probe_playable(self._dummy_media("a.mp4"))
-        self.assertFalse(v["ok"])
-        self.assertIn("moov", v["reason"])
-
     def test_frame_requires_a_non_empty_file(self):
         d = tempfile.mkdtemp()
         out = os.path.join(d, "t.png")

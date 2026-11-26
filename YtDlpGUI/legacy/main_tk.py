@@ -371,12 +371,6 @@ class App:
         ttk.Label(lf, text="连接被掐断（10054）时会自动换一套请求方式重来；关掉后只按当前设置试一次",
                   foreground="#8c959f", font=FONT_S, wraplength=470, justify="left").grid(
             row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
-        self.var_playwhile = tk.BooleanVar()
-        ttk.Checkbutton(lf, text="边下边播（不影响下载速度）", variable=self.var_playwhile).grid(
-            row=6, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 2))
-        ttk.Label(lf, text="只对能流式播放的源有效（HLS / mkv / webm）；音视频分离的源与 aria2c 会置灰并说明原因",
-                  foreground="#8c959f", font=FONT_S, wraplength=470, justify="left").grid(
-            row=7, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
 
     def _build_extras(self, parent, row):
         lf = ttk.LabelFrame(parent, text=" ⑥ 附加内容 ")
@@ -489,14 +483,6 @@ class App:
         self.lbl_pct.grid(row=1, column=1, padx=(0, 8), pady=2)
         self.lbl_detail = ttk.Label(lf, text="—", font=FONT_S, foreground="#57606a")
         self.lbl_detail.grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
-        pf = ttk.Frame(lf)
-        pf.grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
-        self.btn_play = ttk.Button(pf, text="边下边播", state="disabled", command=self._play_now)
-        self.btn_play.pack(side="left")
-        self.lbl_play = ttk.Label(pf, text="还没有开始下载", font=FONT_S, foreground="#8c959f")
-        self.lbl_play.pack(side="left", padx=8)
-        self._play_raw = ""
-        self._play_ok = False
 
     def _build_results(self, row):
         lf = ttk.LabelFrame(self.dl_inner, text=" 探测结果（点 ✓ 列勾选要下载的条目） ")
@@ -598,7 +584,6 @@ class App:
             "aria": self.var_aria.get(), "aria_args": self.var_aria_args.get().strip(),
             "flat": self.var_flat.get(),
             "net_hard": self.var_nethard.get(),
-            "play_while": self.var_playwhile.get(),
             "ext_service": self.var_extsvc.get(),
             "browser": self.var_browser.get(), "browser_profile": self.var_browser_profile.get().strip(),
             "ua": self.var_ua.get().strip(), "referer": self.var_referer.get().strip(),
@@ -638,7 +623,6 @@ class App:
         self.var_aria.set(self.cfg["aria"]); self.var_flat.set(self.cfg["flat"])
         self.var_generic.set(self.cfg["generic"])
         self.var_nethard.set(self.cfg.get("net_hard", True))
-        self.var_playwhile.set(self.cfg.get("play_while", False))
         self.var_extsvc.set(bool(self.cfg.get("ext_service", True)))
         self._sync_mode(keep_fmt=True)
 
@@ -940,10 +924,6 @@ class App:
         self._release_runner()
         emit, cookie = self.ext_emit, self.ext_cookie_file
         self.ext_emit = self.ext_cfg = self.ext_cookie_file = None
-        if self._web_mod:
-            with self._web_mod.PLAY_LOCK:
-                self._web_mod.PLAY_STATE.update({"raw_path": "", "ok": False,
-                                                 "reason": "还没有开始下载"})
         if emit:
             emit({"type": "done", "code": code})
         if cookie and os.path.isfile(cookie):
@@ -1011,8 +991,6 @@ class App:
                 elif kind == "preview":
                     self._on_preview(rest[0], rest[1] if len(rest) > 1 else "",
                                      rest[2] if len(rest) > 2 else None)
-                elif kind == "playable":
-                    self._set_playable(rest[0], rest[1] if len(rest) > 1 else "")
                 elif kind == "exttask":
                     self._start_external(rest[0])
                 elif kind == "sniffpv":
@@ -1042,7 +1020,6 @@ class App:
                 self._refresh_progress()
                 # 「Destination:」那行照旧显示原文；PROG| 机器行换成人类可读文本
                 self.log_line((progress_text(st) if core.PROG_MARK in line else line) + "\n", "ok")
-                self._maybe_start_play_probe()
             elif ev["kind"] == "item":
                 self._refresh_progress()
                 self.log_line(line + "\n", None)
@@ -1070,9 +1047,6 @@ class App:
     def _on_done(self, code):
         base = self._task_cfg()
         was_ext = self.ext_cfg is not None
-        core.clear_preview_links(base.get("outdir") or os.path.join(BASE_DIR, "downloads"))
-        self._play_raw = ""
-        self._set_playable(False, "还没有开始下载")
         self.running = False
         self.proc = None
         self.task_kind = None    # 自愈重试会由 _net_heal 重新占住闸门
@@ -1470,78 +1444,6 @@ class App:
         if self._preview_url:
             webbrowser.open(self._preview_url)
 
-    def _maybe_start_play_probe(self):
-        cfg = self._task_cfg()
-        raw = self.pstate.get("raw_path") or ""
-        if not raw or not cfg.get("play_while") or raw == self._play_raw:
-            return
-        self._play_raw = raw
-        if self._web_mod:
-            with self._web_mod.PLAY_LOCK:
-                self._web_mod.PLAY_STATE.update({"raw_path": raw, "outdir": self.dl_outdir,
-                                                 "cfg": dict(cfg), "ok": False,
-                                                 "reason": "正在判断能否边下边播…"})
-        self._set_playable(False, "正在判断能否边下边播…")
-
-        def work():
-            if core.fmt_is_separated(cfg):
-                self.q.put(("playable", False, "此源音视频分离，边下边播不适用"))
-                return
-            if cfg.get("aria"):
-                self.q.put(("playable", False, "aria2c 外部下载器不支持边下边播"))
-                return
-            reason = "文件还没写出来"
-            deadline = time.time() + 3
-            for _ in range(3):
-                while time.time() < deadline:
-                    p = core.real_download_path(raw)
-                    try:
-                        if p and os.path.getsize(p) >= 256 * 1024:
-                            break
-                    except OSError:
-                        pass
-                    time.sleep(0.5)
-                p = core.real_download_path(raw)
-                if p:
-                    v = core.probe_playable(p)
-                    if v["ok"]:
-                        self.q.put(("playable", True, ""))
-                        return
-                    reason = v["reason"]
-                deadline = time.time() + 5
-            self.q.put(("playable", False, "此源要下完才能播：%s" % reason))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _set_playable(self, ok, reason):
-        self._play_ok = bool(ok)
-        self.btn_play.config(state="normal" if ok else "disabled")
-        self.lbl_play.config(text=reason or ("可以边下边播" if ok else "此源不支持边下边播"))
-        if self.ext_emit:
-            self.ext_emit({"type": "playable", "ok": bool(ok), "reason": reason})
-        if self._web_mod:
-            with self._web_mod.PLAY_LOCK:
-                self._web_mod.PLAY_STATE["ok"] = bool(ok)
-                self._web_mod.PLAY_STATE["reason"] = reason
-
-    def _play_now(self):
-        if not self._play_ok:
-            return
-        cfg = self._task_cfg()
-        outdir = cfg.get("outdir") or os.path.join(BASE_DIR, "downloads")
-        real = core.real_download_path(self._play_raw)
-        if not real:
-            messagebox.showwarning("提示", "文件还没写出来，稍等再试。")
-            return
-        link, err = core.make_preview_link(real, outdir)
-        if err:
-            messagebox.showwarning("无法边下边播", err)
-            return
-        try:
-            os.startfile(link)
-        except Exception as e:
-            messagebox.showerror("打开播放器失败", "%s\n建议安装 VLC 或 PotPlayer。" % e)
-
     def _add_result(self, info):
         i = len(self.results)
         self.results.append(info)
@@ -1826,7 +1728,7 @@ class App:
             return
         cfg = dict(self.cfg)
         # 直链媒体没有封面/元数据：强行 embed 只会让 ffmpeg 报错、把成功判成失败
-        cfg.update({"fmt": "b", "play_while": True, "thumb": False, "meta": False,
+        cfg.update({"fmt": "b", "thumb": False, "meta": False,
                     "sub": False, "embedsub": False})
         if len(items) == 1:
             it = items[0]
@@ -1951,12 +1853,6 @@ class App:
         except Exception:
             pass
         self._stop_ext_service()
-        # 强退时 _on_done 不会跑，这里补一次清理：否则下载目录里会一直留着
-        # .preview 下的硬链接（文件已删、链接还指向不存在的 .part）。
-        try:
-            core.clear_preview_links(self.cfg.get("outdir") or os.path.join(BASE_DIR, "downloads"))
-        except Exception:
-            pass
         self.root.destroy()
 
 

@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
 """host 单测：注入事件回调，不依赖 pywebview。"""
+import hashlib
 import importlib.util
 import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "YtDlpGUI"))
 
 
 def load_host():
@@ -413,24 +418,6 @@ class PreviewPlayTest(unittest.TestCase):
         self.assertFalse(r["ok"])
         self.assertEqual(r["err"], "403")
 
-    def test_play_disabled_when_not_playable(self):
-        r = self.host.play_now()
-        self.assertFalse(r["ok"])
-
-    def test_separated_source_verdict(self):
-        self.host._play_probe_loop("raw", {"fmt": "bv*+ba/b"})
-        self.host.pump_once()
-        ev = [e for e in self.events if e["type"] == "playable"][-1]
-        self.assertFalse(ev["ok"])
-        self.assertIn("分离", ev["reason"])
-
-    def test_aria_verdict(self):
-        self.host._play_probe_loop("raw", {"fmt": "b", "aria": True})
-        self.host.pump_once()
-        ev = [e for e in self.events if e["type"] == "playable"][-1]
-        self.assertFalse(ev["ok"])
-        self.assertIn("aria2c", ev["reason"])
-
 
 class SniffServiceTest(unittest.TestCase):
     def setUp(self):
@@ -454,7 +441,6 @@ class SniffServiceTest(unittest.TestCase):
         r = self.host.sniff_download(items)
         self.assertTrue(r["ok"])
         self.assertEqual(captured["cfg"]["fmt"], "b")
-        self.assertTrue(captured["cfg"]["play_while"])
         self.assertFalse(captured["cfg"]["thumb"])
         self.assertEqual(captured["cfg"]["referer"], "https://p/")
         self.assertTrue(captured["no_playlist"])
@@ -479,14 +465,11 @@ class SniffServiceTest(unittest.TestCase):
         self.assertFalse(r["ok"])
 
     def test_set_ext_service_lifecycle_with_stub(self):
-        import threading as _th
         class StubRunner:
             def reserve(self, kind): return True
             def finish(self): pass
         class StubMod:
             RUNNER = StubRunner()
-            PLAY_LOCK = _th.Lock()
-            PLAY_STATE = {}
             def set_config_file(self, p): pass
             def start_service(self):
                 class Svc:
@@ -503,6 +486,86 @@ class SniffServiceTest(unittest.TestCase):
         self.host.set_ext_service(False)
         self.assertIsNone(self.host.web_svc)
         self.assertFalse(self.host.cfg["ext_service"])
+
+
+class UpdateMirrorFlowTest(unittest.TestCase):
+    def test_official_failure_without_mirror_logs_hint(self):
+        mod = load_host()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        host = mod.Host(os.path.join(tmp.name, "config.json"))
+        cmd = [sys.executable, "-c", "raise SystemExit(1)"]
+        host._update_run(cmd, proxy="", mirror="")
+        events = []
+        while not host.q.empty():
+            events.append(host.q.get())
+        logs = "".join(e.get("text", "") for e in events if e.get("type") == "log")
+        self.assertIn("更新镜像", logs)
+
+    def test_official_failure_falls_back_to_mirror(self):
+        mod = load_host()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rt = os.path.join(tmp.name, "runtime")
+        os.makedirs(os.path.join(rt, "_internal"))
+        with open(os.path.join(rt, "yt-dlp.exe"), "wb") as f:
+            f.write(b"old-exe")
+        with open(os.path.join(rt, "_internal", "old.txt"), "wb") as f:
+            f.write(b"old-internal")
+
+        mirror = os.path.join(tmp.name, "mirror")
+        os.makedirs(mirror)
+        zpath = os.path.join(mirror, "yt-dlp_win.zip")
+        with zipfile.ZipFile(zpath, "w") as zf:
+            zf.writestr("yt-dlp.exe", b"new-exe")
+            zf.writestr("_internal/new.txt", b"new-internal")
+        with open(zpath, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        with open(os.path.join(mirror, "SHA2-256SUMS"), "w", encoding="utf-8") as f:
+            f.write("%s  yt-dlp_win.zip\n" % digest)
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                p = os.path.join(mirror, os.path.basename(self.path))
+                if not os.path.isfile(p):
+                    self.send_error(404)
+                    return
+                with open(p, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+
+        host = mod.Host(os.path.join(tmp.name, "config.json"))
+        cmd = [sys.executable, "-c", "raise SystemExit(1)"]
+        with mock.patch.object(mod.core, "RUNTIME_DIR", rt), \
+                mock.patch.object(mod.updater, "verify_version",
+                                  return_value=(True, "test-2026", "")):
+            host._update_run(cmd, proxy="",
+                             mirror="http://127.0.0.1:%d" % srv.server_port)
+
+        events = []
+        while not host.q.empty():
+            events.append(host.q.get())
+        self.assertTrue(any(e.get("type") == "trodone" and e.get("ok") == 1
+                            for e in events), events)
+        with open(os.path.join(rt, "yt-dlp.exe"), "rb") as f:
+            self.assertEqual(f.read(), b"new-exe")
+        self.assertTrue(os.path.isfile(os.path.join(rt, "_internal", "new.txt")))
+        self.assertFalse(os.path.exists(os.path.join(rt, "_internal", "old.txt")))
+        backups = [n for n in os.listdir(rt) if n.startswith(".update_backup_")]
+        self.assertEqual(len(backups), 1)
+        with open(os.path.join(rt, backups[0], "yt-dlp.exe"), "rb") as f:
+            self.assertEqual(f.read(), b"old-exe")
 
 
 if __name__ == "__main__":

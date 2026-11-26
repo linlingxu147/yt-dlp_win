@@ -358,14 +358,13 @@ async function submit(msg) {
         url: url,
         kind: kind,
         title: String(msg.title || "").slice(0, 200),
-        referer: msg.referer || "",
-        ua: msg.ua || "",
+        referer: msg.referer || (kind === "page" ? url : ""),
+        ua: msg.ua || navigator.userAgent,
         cookie_jar: [],
     };
-    if (kind === "media") {
-        body.cookie_jar = await cookieJarFor(url);
-        if (!body.referer && msg.page_url) body.referer = msg.page_url;
-    }
+    // 直链和「下载本页」都带当前页 cookies：抖音这类站点 page 提取也需要 ttwid/msToken。
+    body.cookie_jar = await cookieJarFor(url);
+    if (kind === "media" && !body.referer && msg.page_url) body.referer = msg.page_url;
     return serverPost("/api/sniff", body);
 }
 
@@ -393,10 +392,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     if (msg.type === "preview") {
         previewFor(String(msg.url || "")).then(sendResponse);
-        return true;
-    }
-    if (msg.type === "play_task") {
-        serverPost("/api/play", {}).then(sendResponse);
         return true;
     }
     if (msg.type === "query_items") {

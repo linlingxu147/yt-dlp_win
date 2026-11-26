@@ -45,9 +45,19 @@ URL 清洗都在这里。`background.js` 用 `importScripts` 加载，`content.j
 
 ## 提交时自动携带的凭据（绕过防盗链）
 
-- **Cookie**：用 `chrome.cookies` 读取该媒体域名下的全部 cookie（含 httpOnly），服务端写成 Netscape 临时 cookies.txt 交给 yt-dlp，任务结束自动删除
-- **Referer**：当前页面地址
+- **Cookie**：用 `chrome.cookies` 读取当前页/媒体域名的全部 cookie（含 httpOnly）。
+  **直链和「下载本页」都会带**；服务端写成 Netscape 临时 cookies.txt 交给 yt-dlp，
+  任务结束或提交被 409 拒绝时自动删除
+- **Referer**：当前页面地址（下载本页没填时默认用页面 URL）
 - **User-Agent**：当前浏览器的 UA
+
+## 抖音链接
+
+- 分享链接 `v.douyin.com/...`、视频页 `www.douyin.com/video/<id>`、精选/推荐页
+  `www.douyin.com/jingxuan?modal_id=<id>` 都可以作为入口；`modal_id` 会被服务端自动
+  归一成 `/video/<id>`。
+- feed 首页 `www.douyin.com/?recommend=1` 没有视频 ID，不能作为单条视频下载。
+- 抖音的页面提取需要 fresh cookies；用浮条「下载本页（yt-dlp）」会带当前页 cookies。
 
 ## 右键菜单
 
@@ -121,6 +131,10 @@ B 站等 DASH 站点会把音频单独做成一条 `.m4s`（流 ID `302xx`），
 
 ## 版本
 
+- **v1.10.2**：移除「边下边播」（浮动条按钮、扩展后台调用与服务端 `/api/play` 一并删除）；
+  预浏览仍保留封面、时长与试播片段
+- **v1.10.1**：「下载本页」也携带当前页 cookies（抖音等需要 fresh cookies 的站点）；
+  服务端 page 任务复用临时 cookie 罐并按任务清理；桌面端 Referer 按站点自动选择，跨站不再串用
 - **v1.10.0**：嗅探判定抽到 `sniff_rules.js`（扩展后台/内容脚本与桌面版内嵌浏览器共用），
   上报条目新增 `entry` / `cat` / `mime` 字段；MV3 后台改用 `importScripts` 加载规则。
   桌面版内嵌浏览器开始按同一份规则登记网络响应，嗅探页显示「入口」列（扩展 / 内嵌）

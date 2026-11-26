@@ -9,8 +9,9 @@
 ## 不可改动
 
 `ytdlp_core.py` 的行为不在 UI 重写范围内改动；`sniffer_extension/` 与 `YtDlpWeb/server.py`
-只在「内嵌浏览器 / 共享嗅探规则」范围内改动：嗅探判定以 `sniffer_extension/sniff_rules.js`
-为唯一真源（桌面 `sniff_rules.py` 读同一份规则表），服务端只加字段并保持向后兼容。
+只在「内嵌浏览器 / 共享嗅探规则 / 扩展提交凭据」范围内改动：嗅探判定以
+`sniffer_extension/sniff_rules.js` 为唯一真源（桌面 `sniff_rules.py` 读同一份规则表），
+服务端只加字段并保持向后兼容；扩展的直链与「下载本页」都携带当前页 cookies。
 扩展集成经 `TASK_SINK`/`RUNNER` 单任务闸门，桌面与扩展共用一个任务槽。
 
 ## 运行目录

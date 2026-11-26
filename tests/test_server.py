@@ -449,7 +449,6 @@ class TestTaskSink(unittest.TestCase):
         self.assertTrue(j["ok"])
         self.assertEqual(got["url"], "https://example.com/v.mp4")
         self.assertEqual(got["cfg"]["fmt"], "b")
-        self.assertTrue(got["cfg"]["play_while"])
         self.assertFalse(got["cfg"]["thumb"])
         # 桌面版占住槽位，服务端 busy 跟着一致
         self.assertTrue(server.RUNNER.busy())
@@ -472,6 +471,40 @@ class TestTaskSink(unittest.TestCase):
         self.assertTrue(j["busy"])
         self.assertTrue(server.SNIFF_STATE["done"])
 
+    def test_page_submit_carries_cookies_and_keeps_site_settings(self):
+        got = {}
+
+        def sink(task):
+            got.update(task)
+            return server.RUNNER.reserve("download")
+
+        server.set_task_sink(sink)
+        base_cfg = {"fmt": "", "thumb": True, "meta": True,
+                    "mode": "best"}
+        jar = [{"domain": ".douyin.com", "name": "ttwid", "value": "x",
+                "path": "/", "secure": True}]
+        with mock.patch.object(server, "load_config", return_value=dict(base_cfg)), \
+             mock.patch.object(server, "write_cookie_jar",
+                               return_value="C:/tmp/douyin_cookies.txt") as w:
+            st, j = self._post("/api/sniff", {
+                "url": "https://www.douyin.com/video/1", "kind": "page",
+                "referer": "https://www.douyin.com/video/1", "ua": "UA",
+                "cookie_jar": jar,
+            })
+        self.assertEqual(st, 200)
+        self.assertTrue(j["ok"])
+        self.assertEqual(got["kind"], "page")
+        self.assertEqual(got["cfg"]["cookie"], "C:/tmp/douyin_cookies.txt")
+        self.assertEqual(got["cfg"]["browser"], "（不使用）")
+        self.assertEqual(got["cfg"]["referer"], "https://www.douyin.com/video/1")
+        self.assertTrue(got["cfg"]["_referer_explicit"])
+        self.assertEqual(got["cfg"]["ua"], "UA")
+        # 下载本页走站点提取器：不能强制 fmt=b，也不能关掉封面元数据
+        self.assertNotEqual(got["cfg"].get("fmt"), "b")
+        self.assertTrue(got["cfg"].get("thumb"))
+        w.assert_called_once_with(jar, "https://www.douyin.com/video/1")
+        server.RUNNER.finish()
+
     def test_stop_goes_through_hook(self):
         calls = []
         server.set_task_sink(lambda task: True, stop=lambda: calls.append(1) or True)
@@ -479,6 +512,23 @@ class TestTaskSink(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertTrue(j["ok"])
         self.assertEqual(calls, [1])
+
+    def test_douyin_modal_url_is_normalized_for_page_task(self):
+        got = {}
+
+        def sink(task):
+            got.update(task)
+            return True
+
+        server.set_task_sink(sink)
+        st, j = self._post("/api/sniff", {
+            "url": "https://www.douyin.com/jingxuan?modal_id=7679426956026187035",
+            "kind": "page",
+        })
+        self.assertEqual(st, 200)
+        self.assertTrue(j["ok"])
+        self.assertEqual(got["url"],
+                         "https://www.douyin.com/video/7679426956026187035")
 
 
 if __name__ == "__main__":

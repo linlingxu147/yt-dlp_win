@@ -23,7 +23,7 @@
     const HOST_ID = "ytdlp-sniff-host";
     let host = null, root = null, panel = null, listEl = null, statusEl = null, badge = null, polling = null;
     let showAudio = false, audioCb = null, audioText = null;
-    let playerEl = null, playerTitle = null, playWhileBtn = null;
+    let playerEl = null, playerTitle = null;
     const previewCache = {};     // url -> {done, ok, native, duration, thumb, clip, error}
     const thumbQueue = [];
     let thumbBusy = false, reportTimer = null;
@@ -223,8 +223,6 @@
         .pv { flex: none; border: 1px solid #d0d7de; background: #f6f8fa; color: #0969da;
               border-radius: 6px; padding: 2px 7px; cursor: pointer; font-size: 11px; }
         .pv[disabled] { opacity: .6; cursor: default; }
-        #playWhile { display: none; border: 1px solid #0969da; background: #ddf4ff; color: #0969da;
-                     border-radius: 6px; padding: 3px 10px; cursor: pointer; font-size: 12px; }
         #player { display: none; margin: 4px; padding: 6px; background: #0d1117; border-radius: 8px; }
         #playerHead { display: flex; justify-content: space-between; align-items: center;
                       gap: 6px; margin-bottom: 4px; }
@@ -313,26 +311,6 @@
             });
         });
         head.appendChild(stopBtn);
-        playWhileBtn = document.createElement("button");
-        playWhileBtn.id = "playWhile";
-        playWhileBtn.textContent = "边下边播";
-        playWhileBtn.title = "用系统播放器打开正在下载的文件";
-        playWhileBtn.addEventListener("click", () => {
-            playWhileBtn.disabled = true;
-            chrome.runtime.sendMessage({ type: "play_task" }, (r) => {
-                playWhileBtn.disabled = false;
-                if (chrome.runtime.lastError || !r) {
-                    setStatus("发送失败：扩展后台无响应", "#cf222e");
-                    return;
-                }
-                if (!r.ok) {
-                    setStatus(r.error || "打不开播放器", "#cf222e");
-                    return;
-                }
-                setStatus("已交给系统播放器（装 VLC / PotPlayer 更稳）", "#1a7f37");
-            });
-        });
-        head.appendChild(playWhileBtn);
         panel.appendChild(head);
 
         playerEl = document.createElement("div");
@@ -676,9 +654,6 @@
         polling = setInterval(() => {
             chrome.runtime.sendMessage({ type: "sniff_log" }, (data) => {
                 if (chrome.runtime.lastError || !data) return;
-                if (data.playable && playWhileBtn) {
-                    playWhileBtn.style.display = data.playable.ok ? "inline-block" : "none";
-                }
                 const prog = data.prog;
                 if (prog && prog.pct != null && !data.done) {
                     showStop(true);

@@ -345,6 +345,57 @@ class TestMisc(unittest.TestCase):
         self.assertEqual(core.origin_of("https://a.com/v"), "https://a.com")
         self.assertEqual(core.referer_of(""), "")
 
+    def test_auto_referer_replaces_cross_site_global(self):
+        cfg = {"referer": "https://www.bilibili.com/"}
+        self.assertEqual(core.effective_referer(cfg, ["https://v.douyin.com/x/"]),
+                         "https://www.douyin.com/")
+        self.assertEqual(core.effective_referer(cfg, ["https://www.douyin.com/video/1"]),
+                         "https://www.douyin.com/")
+
+    def test_auto_referer_keeps_same_site_global(self):
+        cfg = {"referer": "https://www.bilibili.com/video/BV1"}
+        self.assertEqual(core.effective_referer(cfg, ["https://www.bilibili.com/video/BV2"]),
+                         cfg["referer"])
+
+    def test_auto_referer_aliases_and_multi_site(self):
+        self.assertEqual(core.effective_referer({}, ["https://b23.tv/x"]),
+                         "https://www.bilibili.com/")
+        self.assertEqual(core.effective_referer({}, ["https://youtu.be/x"]),
+                         "https://www.youtube.com/")
+        cfg = {"referer": "https://www.bilibili.com/"}
+        self.assertEqual(core.effective_referer(
+            cfg, ["https://www.bilibili.com/v/1", "https://www.douyin.com/video/1"]), "")
+
+    def test_auto_referer_unknown_and_explicit_item(self):
+        self.assertEqual(core.effective_referer({}, ["https://example.com/v"]), "")
+        cfg = {"referer": "https://example.com/page"}
+        self.assertEqual(core.effective_referer(cfg, ["https://example.com/v"]),
+                         cfg["referer"])
+        item_cfg = {"referer": "https://www.douyin.com/video/1", "_referer_explicit": True}
+        self.assertEqual(core.effective_referer(item_cfg, ["https://cdn.douyinvod.com/a"]),
+                         item_cfg["referer"])
+
+    def test_download_cmd_uses_auto_referer(self):
+        cfg = dict(core.DEFAULT_CONFIG, referer="https://www.bilibili.com/",
+                   yt_dlp_path="yt-dlp.exe")
+        cmd = core.build_download_cmd(cfg, ["https://v.douyin.com/x/"])
+        self.assertIn("--referer", cmd)
+        self.assertEqual(cmd[cmd.index("--referer") + 1], "https://www.douyin.com/")
+
+    def test_douyin_modal_url_is_normalized(self):
+        url = "https://www.douyin.com/jingxuan?modal_id=7679426956026187035"
+        self.assertEqual(core.normalize_site_url(url),
+                         "https://www.douyin.com/video/7679426956026187035")
+        good, bad = core.sanitize_urls([url])
+        self.assertEqual(good, ["https://www.douyin.com/video/7679426956026187035"])
+        self.assertEqual(bad, [])
+        # 已经是对应视频页 / 其他站点不动
+        self.assertEqual(core.normalize_site_url(
+            "https://www.douyin.com/video/1"), "https://www.douyin.com/video/1")
+        self.assertEqual(core.normalize_site_url(
+            "https://example.com/jingxuan?modal_id=1"),
+            "https://example.com/jingxuan?modal_id=1")
+
     def test_context_menu_labels_present(self):
         # 诊断规则的文案是给用户看的，别被误删
         for pat, code, title, advice, fix in core.DIAG_RULES:
@@ -490,6 +541,10 @@ class TestTypeCoercion(unittest.TestCase):
         cfg, w = core.coerce_config({"net_hard": "maybe"})
         self.assertIs(cfg["net_hard"], core.DEFAULT_CONFIG["net_hard"])
         self.assertTrue(any("net_hard" in x for x in w))
+
+    def test_removed_play_while_key_is_dropped(self):
+        cfg, _ = core.coerce_config({"play_while": True})
+        self.assertNotIn("play_while", cfg)
 
     def test_silent_when_no_sink(self):
         merged = core.default_config()
@@ -908,11 +963,6 @@ class TestPreviewFields(unittest.TestCase):
         self.assertEqual(p["raw"], "")
 
 
-FFMPEG = core.which_tool("ffmpeg.exe")
-FIXTURES = os.path.join(ROOT, "tests", "fixtures")
-HAS_FFMPEG = bool(FFMPEG)
-
-
 class TestRuntimeLayout(unittest.TestCase):
     def test_default_outdir_is_runtime_downloads(self):
         self.assertEqual(os.path.normcase(core.DEFAULT_CONFIG["outdir"]),
@@ -937,183 +987,6 @@ class TestRuntimeLayout(unittest.TestCase):
                 cmd = core.build_download_cmd(cfg, ["https://example.com/v"])
             self.assertIn("--ffmpeg-location", cmd)
             self.assertEqual(cmd[cmd.index("--ffmpeg-location") + 1], d)
-
-
-class TestPlayHelpers(unittest.TestCase):
-    def test_separated_fmt(self):
-        self.assertTrue(core.fmt_is_separated({"mode": "best"}))
-        self.assertTrue(core.fmt_is_separated({"mode": "single", "fmt": "137+140"}))
-        self.assertFalse(core.fmt_is_separated({"mode": "single"}))
-        self.assertFalse(core.fmt_is_separated({"mode": "best", "fmt": "b"}))
-        self.assertFalse(core.fmt_is_separated({"mode": "audio_mp3"}))
-
-    def test_real_path_prefers_part_file(self):
-        with tempfile.TemporaryDirectory() as d:
-            final = os.path.join(d, "a.mp4")
-            self.assertEqual(core.real_download_path(final), "")
-            with open(final + ".part", "wb") as f:
-                f.write(b"x")
-            self.assertEqual(core.real_download_path(final), final + ".part")
-            os.remove(final + ".part")
-            with open(final, "wb") as f:
-                f.write(b"x")
-            self.assertEqual(core.real_download_path(final), final)
-
-    def test_real_path_empty_input(self):
-        self.assertEqual(core.real_download_path(""), "")
-        self.assertEqual(core.real_download_path(None), "")
-
-    def test_probe_missing_file(self):
-        v = core.probe_playable("Z:/definitely/not/here.mkv")
-        self.assertFalse(v["ok"])
-        self.assertTrue(v["reason"])
-
-    def test_link_keeps_format_marker_and_clears_safely(self):
-        with tempfile.TemporaryDirectory() as d:
-            src = os.path.join(d, "Title.f137.mp4.part")
-            with open(src, "wb") as f:
-                f.write(b"abcdef")
-            link, err = core.make_preview_link(src, d)
-            self.assertIsNone(err)
-            self.assertEqual(os.path.basename(link), "Title.f137.mp4")
-            self.assertEqual(os.path.dirname(link), os.path.join(d, ".preview"))
-            with open(link, "rb") as f:
-                self.assertEqual(f.read(), b"abcdef")
-            # 硬链接：写源文件，链接看得到增长
-            with open(src, "ab") as f:
-                f.write(b"growing")
-            with open(link, "rb") as f:
-                self.assertEqual(f.read(), b"abcdefgrowing")
-            core.clear_preview_links(d)
-            self.assertFalse(os.path.exists(link))
-            self.assertTrue(os.path.isfile(src))
-            with open(src, "rb") as f:
-                self.assertEqual(f.read(), b"abcdefgrowing")
-
-    def test_link_replaces_stale_one(self):
-        with tempfile.TemporaryDirectory() as d:
-            src = os.path.join(d, "a.mp4.part")
-            with open(src, "wb") as f:
-                f.write(b"new")
-            os.makedirs(os.path.join(d, ".preview"))
-            with open(os.path.join(d, ".preview", "a.mp4"), "wb") as f:
-                f.write(b"stale")
-            link, err = core.make_preview_link(src, d)
-            self.assertIsNone(err)
-            with open(link, "rb") as f:
-                self.assertEqual(f.read(), b"new")
-
-    def test_link_missing_source_reports_reason(self):
-        with tempfile.TemporaryDirectory() as d:
-            link, err = core.make_preview_link(os.path.join(d, "nope.part"), d)
-            self.assertEqual(link, "")
-            self.assertTrue(err)
-
-    def test_clear_on_missing_dir_is_quiet(self):
-        core.clear_preview_links("Z:/definitely/not/here")
-
-
-@unittest.skipUnless(HAS_FFMPEG, "需要随包 ffmpeg")
-class TestProbePlayableReal(unittest.TestCase):
-    """把设计阶段的探针固化成测试：截断的 mkv/webm/ts 可读，mp4 不可读。"""
-
-    def _truncate(self, name, pct=40):
-        if not hasattr(self, "_tmp"):
-            self._tmp = tempfile.TemporaryDirectory()
-            self.addCleanup(self._tmp.cleanup)
-        src = os.path.join(FIXTURES, name)
-        dst = os.path.join(self._tmp.name, name + ".partial")
-        with open(src, "rb") as f:
-            data = f.read()
-        with open(dst, "wb") as f:
-            f.write(data[:len(data) * pct // 100])
-        return dst
-
-    def test_mkv_partial_is_playable(self):
-        self.assertTrue(core.probe_playable(self._truncate("probe.mkv"))["ok"])
-
-    def test_webm_partial_is_playable(self):
-        self.assertTrue(core.probe_playable(self._truncate("probe.webm"))["ok"])
-
-    def test_mpegts_partial_is_playable(self):
-        self.assertTrue(core.probe_playable(self._truncate("probe.ts"))["ok"])
-
-    def test_mp4_partial_is_not_playable(self):
-        v = core.probe_playable(self._truncate("probe.mp4"))
-        self.assertFalse(v["ok"])
-        self.assertTrue(v["reason"])
-
-
-class TestPlayWhileCmd(unittest.TestCase):
-    """边下边播只读 .part，不许改动下载命令，产物必须与关掉开关时逐字节一致。"""
-
-    URLS = ["https://example.com/v"]
-
-    def test_off_by_default(self):
-        self.assertFalse(core.DEFAULT_CONFIG["play_while"])
-
-    def test_command_identical_for_every_mode_and_merge(self):
-        for mode in ("single", "best", "audio_mp3", "audio_raw", "custom"):
-            for merge in ("", "不转换", "mp4", "mkv", "webm"):
-                off = dict(core.default_config(), mode=mode, merge=merge,
-                           play_while=False)
-                on = dict(off, play_while=True)
-                self.assertEqual(
-                    core.build_download_cmd(on, self.URLS),
-                    core.build_download_cmd(off, self.URLS),
-                    "mode=%s merge=%s" % (mode, merge))
-
-    def test_never_adds_no_part(self):
-        for pw in (False, True):
-            cfg = dict(core.default_config(), play_while=pw)
-            self.assertNotIn("--no-part", core.build_download_cmd(cfg, self.URLS))
-
-    def test_never_adds_hls_use_mpegts(self):
-        # 实测：HLS 的 .part 本来就是 mpegts，无需这个开关；加了反而会关掉
-        # yt-dlp 收尾的 FixupM3u8，把 mpegts 留在 .mp4 名字里。
-        for mode in ("single", "best", "audio_raw"):
-            cfg = dict(core.default_config(), play_while=True, mode=mode)
-            self.assertNotIn("--hls-use-mpegts",
-                             core.build_download_cmd(cfg, self.URLS))
-
-    def test_never_adds_remux_video(self):
-        for merge in ("", "不转换", "mp4", "mkv"):
-            cfg = dict(core.default_config(), play_while=True, mode="single",
-                       merge=merge)
-            self.assertNotIn("--remux-video",
-                             core.build_download_cmd(cfg, self.URLS))
-
-    def test_merge_output_format_still_honoured(self):
-        cfg = dict(core.default_config(), play_while=True, mode="best", merge="mkv")
-        cmd = core.build_download_cmd(cfg, self.URLS)
-        self.assertEqual(cmd[cmd.index("--merge-output-format") + 1], "mkv")
-
-    def test_type_coercion(self):
-        cfg, warns = core.coerce_config({"play_while": "false"})
-        self.assertIs(cfg["play_while"], False)
-        cfg, _ = core.coerce_config({"play_while": "开"})
-        self.assertIs(cfg["play_while"], True)
-
-
-class TestPlayState(unittest.TestCase):
-    def setUp(self):
-        self.srv = load_web_server()
-
-    def test_separated_source_verdict(self):
-        out = []
-        self.srv._play_probe_loop("C:/d/a.f137.mp4", {"mode": "best"}, "C:/d", out.append)
-        self.assertFalse(out[-1]["ok"])
-        self.assertIn("分离", out[-1]["reason"])
-
-    def test_aria_source_verdict(self):
-        out = []
-        self.srv._play_probe_loop("C:/d/a.mp4", {"mode": "single", "aria": True}, "C:/d", out.append)
-        self.assertFalse(out[-1]["ok"])
-        self.assertIn("aria2c", out[-1]["reason"])
-
-    def test_play_state_defaults_not_playable(self):
-        with self.srv.PLAY_LOCK:
-            self.assertFalse(self.srv.PLAY_STATE["ok"])
 
 
 if __name__ == "__main__":

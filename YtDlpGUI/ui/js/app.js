@@ -1,5 +1,5 @@
 import { ready, call, on } from './bridge.js';
-import { initTheme } from './theme.js';
+import { initTheme, resolvedTheme } from './theme.js';
 import { initTabs } from './tabs.js';
 import { initDownload } from './download.js';
 import { initLog } from './log.js';
@@ -54,19 +54,10 @@ on('done', ev => {
     document.getElementById('prog-file').textContent = '出错或中断 — 见日志中的原因与建议';
   }
 });
-on('playable', ev => {
-  document.getElementById('btn-play').disabled = !ev.ok;
-  document.getElementById('play-reason').textContent =
-    ev.reason || (ev.ok ? '可以边下边播' : '此源不支持边下边播');
-});
-document.getElementById('btn-play').addEventListener('click', async () => {
-  const r = await call('play_now');
-  if (!r.ok) dialogs.toast(r.error || '无法播放', 'err');
-});
 
 // ---------------- 工具栏 ----------------
 document.getElementById('btn-browser').addEventListener('click', async () => {
-  const res = await call('open_browser');
+  const res = await call('open_browser', resolvedTheme());
   if (!res.ok) dialogs.toast(res.error || '无法打开内嵌浏览器', 'err');
 });
 
@@ -102,7 +93,8 @@ document.getElementById('btn-trouble').addEventListener('click', async () => {
   if (!res.ok) dialogs.toast(res.error || '无法排障', 'err');
 });
 document.getElementById('btn-update').addEventListener('click', async () => {
-  const res = await call('update_ytdlp', download.collectCfg().proxy);
+  const cfg = download.collectCfg();
+  const res = await call('update_ytdlp', cfg.proxy, cfg.update_mirror);
   if (!res.ok) dialogs.toast(res.error || '无法更新', 'err');
 });
 document.getElementById('btn-copy').addEventListener('click', async () => {

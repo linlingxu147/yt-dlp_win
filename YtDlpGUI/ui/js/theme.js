@@ -6,6 +6,12 @@ function stored() {
   try { return localStorage.getItem(KEY); } catch { return null; }
 }
 
+export function resolvedTheme() {
+  const v = stored();
+  if (v === 'light' || v === 'dark') return v;
+  return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
 export function initTheme() {
   const sel = document.getElementById('theme');
   meta.content = stored() || 'light dark';

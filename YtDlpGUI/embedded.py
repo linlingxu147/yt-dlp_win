@@ -8,6 +8,8 @@
 * 自建 WebView2 不经过 pywebview 注入，页面里不存在 window.pywebview；
 * 顶层导航只放行 http/https（外加初始 about:blank），拦掉 file:/javascript:/data:；
 * 站点请求新窗口时交给系统浏览器；页面直接触发的下载一律取消（下载走嗅探列表）；
+* 工具栏与起始页跟随应用传入的浅色/深色主题（应用主题可能与系统主题不同）；
+* 快捷键只经 UI 线程消息过滤器拦截（浏览器视图可见时安装），不改网页自己的按键行为；
 * 所有 CoreWebView2 访问都必须在 UI 线程上做，事件回调里不做 IO。
 
 pywebview 没有公开「在窗口里再放一个 WebView2」的 API，所以这里直接使用
@@ -34,22 +36,227 @@ except Exception:            # 没有 sniffer_extension 目录时浏览器仍可
 WINDOW_TITLE = "内嵌浏览器 · 嗅探"
 HOME_STATUS = "输入网址回车打开"
 _PROFILE_PREFIX = "ytdlp_embedded_"
-_START_PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="color-scheme" content="light dark">
+
+# 与应用 app.css 同一套令牌；工具栏/起始页都取这里，避免两处主题漂移。
+_THEMES = {
+    "light": {
+        "bg": "#f6f8fa",
+        "field": "#ffffff",
+        "text": "#1f2328",
+        "muted": "#57606a",
+        "border": "#d0d7de",
+        "hover": "#eaeef2",
+        "press": "#d0d7de",
+        "accent": "#0550ae",
+        "err": "#cf222e",
+    },
+    "dark": {
+        "bg": "#161b22",
+        "field": "#0d1117",
+        "text": "#e6edf3",
+        "muted": "#8b949e",
+        "border": "#30363d",
+        "hover": "#21262d",
+        "press": "#30363d",
+        "accent": "#4493f8",
+        "err": "#f85149",
+    },
+}
+
+_START_PAGE_TEMPLATE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="__SCHEME__">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>内嵌浏览器</title>
 <style>
-:root { color-scheme: light dark; }
-body { margin: 0; padding: 48px; font: 15px/1.7 "Microsoft YaHei UI", system-ui, sans-serif;
-       background: light-dark(#f6f8fa, #0d1117); color: light-dark(#1f2328, #e6edf3); }
-h1 { font-size: 22px; margin: 0 0 10px; }
-p { margin: 6px 0; }
-.hint { color: light-dark(#57606a, #8b949e); }
-</style></head><body>
-<h1>内嵌浏览器</h1>
-<p>在上方地址栏输入网址，按回车打开。</p>
-<p class="hint">点「← 返回下载器」回到主界面；这个页面会保留，可再次切回。</p>
-</body></html>"""
+:root {
+  color-scheme: __SCHEME__;
+  --bg: light-dark(#f6f8fa, #0d1117);
+  --surface: light-dark(#ffffff, #161b22);
+  --border: light-dark(#d0d7de, #30363d);
+  --text: light-dark(#1f2328, #e6edf3);
+  --muted: light-dark(#57606a, #8b949e);
+  --accent: light-dark(#0550ae, #4493f8);
+  --err: light-dark(#cf222e, #f85149);
+  accent-color: var(--accent);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; min-block-size: 100vh;
+  display: grid; place-items: center;
+  padding: 40px 24px;
+  background: var(--bg); color: var(--text);
+  font: 14px/1.6 "Microsoft YaHei UI", system-ui, sans-serif;
+}
+main { inline-size: min(640px, 100%); display: grid; gap: 28px; }
+h1 { font-size: 26px; margin: 0 0 6px; }
+h2 { font-size: 13px; color: var(--muted); font-weight: 600; margin: 0 0 8px; }
+header p { margin: 0; color: var(--muted); }
+form { display: grid; gap: 8px; }
+label { font-size: 13px; font-weight: 600; }
+.open-row { display: flex; gap: 8px; }
+input[type="text"] {
+  flex: 1; min-inline-size: 0;
+  font: inherit; color: var(--text); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+}
+input[type="text"]::placeholder { color: var(--muted); }
+input[type="text"]:focus-visible,
+a:focus-visible,
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button {
+  font: inherit; font-weight: 600; color: light-dark(#ffffff, #0d1117);
+  background: var(--accent); border: 1px solid var(--accent);
+  border-radius: 8px; padding: 10px 18px;
+  cursor: pointer; transition: filter 150ms ease-out, scale 150ms ease-out;
+}
+button:hover { filter: brightness(1.08); }
+button:active { scale: .97; }
+.error { margin: 0; color: var(--err); font-size: 13px; }
+ul { list-style: none; margin: 0; padding: 0; }
+.links { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+.links a {
+  display: grid; gap: 2px; padding: 12px 14px;
+  color: inherit; text-decoration: none;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  transition: border-color 150ms ease-out, box-shadow 150ms ease-out, scale 150ms ease-out;
+}
+.links a:hover { border-color: var(--accent); box-shadow: 0 2px 10px rgb(0 0 0 / .08); }
+.links a:active { scale: .98; }
+.links strong { font-size: 14px; }
+.links span { color: var(--muted); font-size: 12px; }
+.tips { display: grid; gap: 6px; }
+.tips li { padding-inline-start: 1.1em; position: relative; color: var(--muted); }
+.tips li::before { content: "·"; position: absolute; inset-inline-start: .2em; color: var(--accent); font-weight: 700; }
+kbd {
+  font: 12px/1 "Cascadia Mono", Consolas, monospace;
+  border: 1px solid var(--border); border-block-end-width: 2px;
+  border-radius: 4px; padding: 1px 5px; color: var(--text); background: var(--surface);
+}
+@media (prefers-reduced-motion: reduce) {
+  button, .links a { transition: none; }
+}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>内嵌浏览器</h1>
+    <p>在同一个窗口里打开网页；页面里的媒体请求会自动出现在「扩展嗅探」页签。</p>
+  </header>
+  <form id="open-form" aria-labelledby="open-label">
+    <label for="url-input" id="open-label">输入网址</label>
+    <div class="open-row">
+      <input id="url-input" name="url" type="text" inputmode="url"
+             autocomplete="off" autocorrect="off" autocapitalize="none"
+             spellcheck="false" enterkeyhint="go"
+             placeholder="www.bilibili.com 或完整 https 地址">
+      <button type="submit">打开</button>
+    </div>
+    <p id="url-error" class="error" role="status" aria-live="polite" hidden></p>
+  </form>
+  <nav aria-labelledby="links-title">
+    <h2 id="links-title">常用站点</h2>
+    <ul class="links">
+      <li><a href="https://www.bilibili.com/">
+        <strong>哔哩哔哩</strong><span>视频、番剧与直播</span></a></li>
+      <li><a href="https://www.douyin.com/">
+        <strong>抖音</strong><span>短视频与直播</span></a></li>
+      <li><a href="https://www.youtube.com/">
+        <strong>YouTube</strong><span>登录可能被 WebView2 拒绝</span></a></li>
+    </ul>
+  </nav>
+  <section aria-labelledby="tips-title">
+    <h2 id="tips-title">使用提示</h2>
+    <ul class="tips">
+      <li>工具栏左侧「← 返回下载器」切回主界面，浏览器页面会保留。</li>
+      <li><kbd>Ctrl</kbd>+<kbd>L</kbd> 定位地址栏，<kbd>F5</kbd> 刷新，<kbd>Esc</kbd> 停止加载，<kbd>Alt</kbd>+<kbd>←</kbd>/<kbd>→</kbd> 前进后退。</li>
+      <li>页面直接触发的下载会被取消；请从嗅探列表里选择资源下载。</li>
+    </ul>
+  </section>
+</main>
+<script>
+(() => {
+  const form = document.getElementById('open-form');
+  const input = document.getElementById('url-input');
+  const error = document.getElementById('url-error');
+
+  function allowed(text) {
+    try {
+      const url = new URL(text);
+      return (url.protocol === 'http:' || url.protocol === 'https:') && !!url.hostname
+        ? url.href : '';
+    } catch {
+      return '';
+    }
+  }
+
+  function normalize(text) {
+    const s = text.trim();
+    if (!s) return '';
+    if (!s.includes('://')) {
+      if (/^[a-z][a-z0-9+.-]*:/i.test(s)) return '';
+      const first = s.split('/')[0];
+      if (!first.includes('.') && !first.includes(':')) return '';
+      return allowed('https://' + s);
+    }
+    return allowed(s);
+  }
+
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const url = normalize(input.value);
+    if (!url) {
+      error.textContent = '只支持 http(s) 网址，例如 www.bilibili.com';
+      error.hidden = false;
+      input.setAttribute('aria-invalid', 'true');
+      input.focus();
+      return;
+    }
+    location.href = url;
+  });
+
+  input.addEventListener('input', () => {
+    if (error.hidden) return;
+    error.hidden = true;
+    error.textContent = '';
+    input.removeAttribute('aria-invalid');
+  });
+})();
+</script>
+</body>
+</html>"""
+
+
+def normalize_theme(value):
+    v = str(value or "").strip().lower()
+    return v if v in ("light", "dark") else ""
+
+
+def palette_for(theme):
+    """主题 → 颜色表（十六进制字符串）；未知值按浅色，返回副本。"""
+    return dict(_THEMES["dark" if normalize_theme(theme) == "dark" else "light"])
+
+
+def start_page_html(theme="light"):
+    """起始页 HTML；主题在这里定型，不依赖 WebView2 的系统配色偏好。"""
+    scheme = "dark" if normalize_theme(theme) == "dark" else "light"
+    return _START_PAGE_TEMPLATE.replace("__SCHEME__", scheme)
 
 _BLANK_URLS = ("about:blank",)
+# 普通 Esc 不属于 WebView2 的“加速键”（只含 Ctrl/Alt/功能键），用页面脚本兜底。
+_ESCAPE_SCRIPT = """
+(() => {
+  if (window.__ytdlpEscHooked) return;
+  window.__ytdlpEscHooked = true;
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    try { window.chrome.webview.postMessage({ __ytdlp: 'escape' }); } catch (err) {}
+  }, true);
+})();
+"""
 _ALLOWED_SCHEMES = ("http", "https")
 # 这些「没有 //」的伪协议不能被补成 https://javascript:...
 _BLOCKED_PREFIXES = (
@@ -191,9 +398,26 @@ class EmbeddedBrowser:
         self._btn_back = None
         self._btn_forward = None
         self._btn_return = None
+        self._btn_reload = None
         self._wf = None
-        self._normal_color = None
-        self._err_color = None
+        self._colors = None
+        self._renderer = None
+        self._menu = None
+        self._mi_undo = None
+        self._mi_cut = None
+        self._mi_copy = None
+        self._mi_paste = None
+        self._mi_select_all = None
+        self._mi_copy_url = None
+        self._mi_open_ext = None
+        self._mi_paste_open = None
+        self._controller = None
+        self._accel_hooked = False
+        self._theme = "light"
+        self._palette = palette_for("light")
+        self._loading = False
+        self._stopped = False
+        self._status_tone = "info"
         self._core_ready = False
         self._init_started = False
         self._cancelled = False
@@ -204,10 +428,23 @@ class EmbeddedBrowser:
         self.last_status = ""
 
     # ---------------- 打开 / 关闭 ----------------
-    def open(self, window=None):
-        """在主窗口里显示浏览器视图；window 是 pywebview Window（第一次必传）。"""
+    def open(self, window=None, theme=""):
+        """在主窗口里显示浏览器视图；window 是 pywebview Window（第一次必传）。
+
+        theme 由应用前端解析后传入（system 已解析成 light/dark）；视图已存在时
+        每次打开都重新套用，停在起始页时按新主题重写。
+        """
+        requested = normalize_theme(theme)
+        changed = bool(requested and requested != self._theme)
+        if requested:
+            self._theme = requested
         if self._panel is not None and self._form is not None:
-            self._ui(self._show_browser)
+            def show():
+                self._apply_theme(self._theme)
+                self._show_browser()
+                if changed:
+                    self._maybe_rewrite_start_page()
+            self._ui(show)
             self._start_sniff()
             return {"ok": True}
         if window is None:
@@ -221,6 +458,7 @@ class EmbeddedBrowser:
         def build():
             try:
                 self._create_view()
+                self._apply_theme(self._theme)
                 self._show_browser()
                 result["ok"] = True
             except Exception as e:
@@ -244,6 +482,7 @@ class EmbeddedBrowser:
             profile = self._profile_dir
             self._show_app()
             try:
+                self._detach_accelerators()
                 if self._webv is not None:
                     try:
                         self._webv.Dispose()
@@ -256,6 +495,11 @@ class EmbeddedBrowser:
                         pass
                     try:
                         self._panel.Dispose()
+                    except Exception:
+                        pass
+                if self._menu is not None:
+                    try:
+                        self._menu.Dispose()
                     except Exception:
                         pass
             finally:
@@ -289,6 +533,23 @@ class EmbeddedBrowser:
         self._btn_back = None
         self._btn_forward = None
         self._btn_return = None
+        self._btn_reload = None
+        self._colors = None
+        self._renderer = None
+        self._menu = None
+        self._mi_undo = None
+        self._mi_cut = None
+        self._mi_copy = None
+        self._mi_paste = None
+        self._mi_select_all = None
+        self._mi_copy_url = None
+        self._mi_open_ext = None
+        self._mi_paste_open = None
+        self._controller = None
+        self._accel_hooked = False
+        self._loading = False
+        self._stopped = False
+        self._status_tone = "info"
         self._core_ready = False
         self._init_started = False
         self._cancelled = False
@@ -312,13 +573,13 @@ class EmbeddedBrowser:
         except Exception:
             pass
         import System.Windows.Forms as WinForms
-        from System.Drawing import Color, ContentAlignment, SystemColors
+        from System.Drawing import ContentAlignment, ColorTranslator
         from Microsoft.Web.WebView2.WinForms import WebView2, CoreWebView2CreationProperties
 
         form = self._form
         self._wf = WinForms
-        self._normal_color = SystemColors.ControlText
-        self._err_color = Color.Firebrick
+        self._palette = palette_for(self._theme)
+        self._colors = {k: ColorTranslator.FromHtml(v) for k, v in self._palette.items()}
         self._app_webview = getattr(form, "webview", None)
         self._app_title = str(form.Text or "")
 
@@ -333,7 +594,7 @@ class EmbeddedBrowser:
             webv = WebView2()
             webv.Dock = WinForms.DockStyle.Fill
             try:
-                webv.DefaultBackgroundColor = Color.White
+                webv.DefaultBackgroundColor = self._colors["bg"]
             except Exception:
                 pass
             try:
@@ -372,37 +633,72 @@ class EmbeddedBrowser:
     def _build_strip(self, form):
         WinForms = self._wf
         from System.Drawing import ContentAlignment
+        owner = self
+
+        class _BrowserStrip(WinForms.ToolStrip):
+            """地址栏聚焦时 Esc / Alt+方向键属于对话框键，先于 KeyDown 被 ToolStrip
+            消费；在这里交给宿主处理，其余仍走默认行为。"""
+
+            def ProcessDialogKey(self, keyData):
+                try:
+                    data = int(keyData)
+                    vk = data & 0xFFFF
+                    ctrl = bool(data & int(WinForms.Keys.Control))
+                    alt = bool(data & int(WinForms.Keys.Alt))
+                    if vk == 0x1B or (alt and vk in (0x25, 0x27)):
+                        if owner._handle_shortcut(vk, ctrl, alt):
+                            return True
+                except Exception:
+                    pass
+                return super().ProcessDialogKey(keyData)
 
         def mk(text, tip, fn):
             b = WinForms.ToolStripButton(text)
             b.DisplayStyle = WinForms.ToolStripItemDisplayStyle.Text
             b.ToolTipText = tip
             b.Click += lambda s, e: fn()
+            try:
+                b.Margin = WinForms.Padding(3, 0, 3, 0)
+            except Exception:
+                pass
+            # 导航按钮永远留在工具栏上；溢出后 GetPreferredSize 会让地址栏宽度计算失败
+            b.Overflow = WinForms.ToolStripItemOverflow.Never
             return b
 
-        strip = WinForms.ToolStrip()
+        strip = _BrowserStrip()
         strip.GripStyle = WinForms.ToolStripGripStyle.Hidden
         strip.Dock = WinForms.DockStyle.Top
         strip.AutoSize = True
         try:
+            strip.Padding = WinForms.Padding(8, 3, 8, 3)
+        except Exception:
+            pass
+        try:
             strip.Font = form.Font
         except Exception:
             pass
+        self._renderer = self._make_renderer()
+        strip.Renderer = self._renderer
 
         self._btn_return = mk("← 返回下载器", "回到下载器界面（浏览器页面保留，可再切回）",
                               self.return_to_app)
-        self._btn_back = mk("后退", "后退", self.go_back)
-        self._btn_forward = mk("前进", "前进", self.go_forward)
+        self._btn_back = mk("后退", "后退（Alt+←）", self.go_back)
+        self._btn_forward = mk("前进", "前进（Alt+→）", self.go_forward)
         self._btn_back.Enabled = False
         self._btn_forward.Enabled = False
+        self._btn_reload = mk("刷新", "重新加载当前页（F5 / Ctrl+R）", self.go_reload)
         self._addr = WinForms.ToolStripTextBox()
         self._addr.AutoSize = False
         self._addr.Width = 480
         self._addr.ToolTipText = "输入网址后按回车（只支持 http/https）"
         self._addr.Overflow = WinForms.ToolStripItemOverflow.Never
         self._addr.KeyDown += self._on_addr_key
+        try:
+            self._addr.TextBox.Enter += self._on_addr_enter
+            self._addr.TextBox.MouseUp += self._on_addr_mouseup
+        except Exception:
+            pass
         self._status = WinForms.ToolStripLabel("")
-        self._status.ForeColor = self._normal_color
         # 状态栏固定宽度：长错误只裁显示，全文放 tooltip，避免把工具栏挤进溢出菜单
         self._status.AutoSize = False
         try:
@@ -414,18 +710,471 @@ class EmbeddedBrowser:
                 scale = float(getattr(form, "DeviceDpi", 96) or 96) / 96.0
             except Exception:
                 scale = 1.0
-        self._status.Width = int(210 * max(1.0, scale))
+        self._status.Width = int(240 * max(1.0, scale))
         self._status.TextAlign = ContentAlignment.MiddleLeft
         self._status.Overflow = WinForms.ToolStripItemOverflow.Never
 
         strip.Items.Add(self._btn_return)
         strip.Items.Add(WinForms.ToolStripSeparator())
-        for it in (self._btn_back, self._btn_forward,
-                   mk("刷新", "重新加载当前页", self.go_reload),
-                   mk("停止", "停止加载", self.go_stop),
+        for it in (self._btn_back, self._btn_forward, self._btn_reload,
                    self._addr, self._status):
             strip.Items.Add(it)
+        self._build_context_menu()
         return strip
+
+    # ---------------- 自绘主题 ----------------
+    def _make_renderer(self):
+        WinForms = self._wf
+        from System.Drawing import Pen, Rectangle, SolidBrush
+        owner = self
+
+        class _ThemedRenderer(WinForms.ToolStripProfessionalRenderer):
+            """平铺配色；不使用默认 Office 风格渐变，避免深色主题下露出亮色底。"""
+
+            def OnRenderToolStripBackground(self, e):
+                try:
+                    e.Graphics.Clear(owner._colors["bg"])
+                except Exception:
+                    pass
+
+            def OnRenderToolStripBorder(self, e):
+                try:
+                    ts = e.ToolStrip
+                    if ts is None:
+                        return
+                    pen = Pen(owner._colors["border"])
+                    try:
+                        if isinstance(ts, WinForms.ContextMenuStrip):
+                            e.Graphics.DrawRectangle(
+                                pen, 0, 0, max(0, ts.Width - 1), max(0, ts.Height - 1))
+                        else:
+                            e.Graphics.DrawLine(pen, 0, ts.Height - 1, ts.Width, ts.Height - 1)
+                    finally:
+                        pen.Dispose()
+                except Exception:
+                    pass
+
+            def OnRenderButtonBackground(self, e):
+                try:
+                    item = e.Item
+                    if item is None or not item.Enabled:
+                        return
+                    if item.Pressed:
+                        color = owner._colors["press"]
+                    elif item.Selected:
+                        color = owner._colors["hover"]
+                    else:
+                        return
+                    rect = Rectangle(0, 0, item.Width, item.Height)
+                    rect.Inflate(-1, -1)
+                    brush = SolidBrush(color)
+                    try:
+                        e.Graphics.FillRectangle(brush, rect)
+                    finally:
+                        brush.Dispose()
+                except Exception:
+                    pass
+
+            def OnRenderMenuItemBackground(self, e):
+                try:
+                    item = e.Item
+                    if item is None or not item.Enabled:
+                        return
+                    if not (item.Selected or item.Pressed):
+                        return
+                    color = owner._colors["press"] if item.Pressed else owner._colors["hover"]
+                    brush = SolidBrush(color)
+                    try:
+                        e.Graphics.FillRectangle(brush, 0, 0, item.Width, item.Height)
+                    finally:
+                        brush.Dispose()
+                except Exception:
+                    pass
+
+            def OnRenderSeparator(self, e):
+                try:
+                    item = e.Item
+                    if item is None:
+                        return
+                    pen = Pen(owner._colors["border"])
+                    try:
+                        if item.Height > item.Width:
+                            x = item.Width // 2
+                            e.Graphics.DrawLine(pen, x, 3, x, max(4, item.Height - 4))
+                        else:
+                            y = item.Height // 2
+                            e.Graphics.DrawLine(pen, 6, y, max(7, item.Width - 7), y)
+                    finally:
+                        pen.Dispose()
+                except Exception:
+                    pass
+
+            def OnRenderItemText(self, e):
+                try:
+                    text = str(e.Text or "")
+                    if e.Item is None or not text:
+                        return
+                    color = e.Item.ForeColor if e.Item.Enabled else owner._colors["muted"]
+                    flags = (WinForms.TextFormatFlags.NoPrefix
+                             | WinForms.TextFormatFlags.VerticalCenter)
+                    align = e.Item.TextAlign
+                    if align in (WinForms.ContentAlignment.MiddleLeft,
+                                 WinForms.ContentAlignment.TopLeft,
+                                 WinForms.ContentAlignment.BottomLeft):
+                        flags = flags | WinForms.TextFormatFlags.Left
+                    elif align in (WinForms.ContentAlignment.MiddleRight,
+                                   WinForms.ContentAlignment.TopRight,
+                                   WinForms.ContentAlignment.BottomRight):
+                        flags = flags | WinForms.TextFormatFlags.Right
+                    else:
+                        flags = flags | WinForms.TextFormatFlags.HorizontalCenter
+                    font = e.TextFont or e.Item.Font
+                    WinForms.TextRenderer.DrawText(
+                        e.Graphics, text, font, e.TextRectangle, color, flags)
+                except Exception:
+                    pass
+
+        return _ThemedRenderer()
+
+    def _build_context_menu(self):
+        WinForms = self._wf
+
+        def add(text, fn):
+            item = WinForms.ToolStripMenuItem(text)
+            item.Click += lambda s, e: fn()
+            menu.Items.Add(item)
+            return item
+
+        menu = WinForms.ContextMenuStrip()
+        menu.ShowImageMargin = False
+        menu.Renderer = self._renderer
+        menu.Opening += self._on_menu_opening
+        self._menu = menu
+        self._mi_undo = add("撤销", self._menu_undo)
+        self._mi_cut = add("剪切", self._menu_cut)
+        self._mi_copy = add("复制", self._menu_copy)
+        self._mi_paste = add("粘贴", self._menu_paste)
+        self._mi_select_all = add("全选", self._menu_select_all)
+        menu.Items.Add(WinForms.ToolStripSeparator())
+        self._mi_copy_url = add("复制页面地址", self._menu_copy_url)
+        self._mi_open_ext = add("在系统浏览器中打开", self._menu_open_ext)
+        self._mi_paste_open = add("粘贴并打开", self._menu_paste_open)
+        try:
+            self._addr.TextBox.ContextMenuStrip = menu
+        except Exception:
+            pass
+
+    def _box(self):
+        try:
+            return self._addr.TextBox
+        except Exception:
+            return None
+
+    def _menu_undo(self):
+        tb = self._box()
+        if tb is not None:
+            try:
+                tb.Undo()
+            except Exception:
+                pass
+
+    def _menu_cut(self):
+        tb = self._box()
+        if tb is not None:
+            try:
+                tb.Cut()
+            except Exception:
+                pass
+
+    def _menu_copy(self):
+        tb = self._box()
+        if tb is not None:
+            try:
+                tb.Copy()
+            except Exception:
+                pass
+
+    def _menu_paste(self):
+        tb = self._box()
+        if tb is not None:
+            try:
+                tb.Paste()
+            except Exception:
+                pass
+
+    def _menu_select_all(self):
+        tb = self._box()
+        if tb is not None:
+            try:
+                tb.SelectAll()
+            except Exception:
+                pass
+
+    def _current_url(self):
+        src = ""
+        core = self._core()
+        if core is not None:
+            try:
+                src = str(core.Source or "")
+            except Exception:
+                src = ""
+        if not src and self._addr is not None:
+            try:
+                src = str(self._addr.Text or "").strip()
+            except Exception:
+                src = ""
+        if src.lower() in _BLANK_URLS:
+            return ""
+        return src if is_allowed_navigation(src) else ""
+
+    def _clip_text(self):
+        try:
+            if not self._wf.Clipboard.ContainsText():
+                return ""
+            return str(self._wf.Clipboard.GetText() or "")
+        except Exception:
+            return ""
+
+    def _menu_copy_url(self):
+        url = self._current_url()
+        if not url:
+            self._set_status("当前页不是 http(s) 地址", bad=True)
+            return
+        try:
+            self._wf.Clipboard.SetText(url)
+            self._set_status("地址已复制")
+        except Exception as e:
+            self._set_status("复制失败：%s" % e, bad=True)
+
+    def _menu_open_ext(self):
+        url = self._current_url()
+        if not url:
+            self._set_status("当前页不是 http(s) 地址", bad=True)
+            return
+        try:
+            webbrowser.open(url)
+            self._set_status("已交给系统浏览器打开")
+        except Exception as e:
+            self._set_status("打不开系统浏览器：%s" % e, bad=True)
+
+    def _menu_paste_open(self):
+        target = normalize_address(self._clip_text())
+        if not target:
+            self._set_status("剪贴板里没有可打开的 http(s) 网址", bad=True)
+            return
+        self.navigate(target)
+
+    def _on_menu_opening(self, sender, args):
+        tb = self._box()
+        selected = 0
+        if tb is not None:
+            try:
+                selected = int(tb.SelectionLength)
+            except Exception:
+                selected = 0
+        try:
+            self._mi_undo.Enabled = bool(tb is not None and tb.CanUndo)
+        except Exception:
+            self._mi_undo.Enabled = False
+        self._mi_cut.Enabled = selected > 0
+        self._mi_copy.Enabled = selected > 0
+        try:
+            self._mi_select_all.Enabled = bool(tb is not None and str(tb.Text or ""))
+        except Exception:
+            self._mi_select_all.Enabled = False
+        has_text = bool(self._clip_text())
+        self._mi_paste.Enabled = has_text
+        url = self._current_url()
+        self._mi_copy_url.Enabled = bool(url)
+        self._mi_open_ext.Enabled = bool(url)
+        self._mi_paste_open.Enabled = bool(has_text and normalize_address(self._clip_text()))
+
+    # ---------------- 快捷键（WebView2 加速键 + 地址栏） ----------------
+    def _attach_accelerators(self):
+        """pythonnet 无法实现 IMessageFilter 接口，改用 WebView2 自带的
+        AcceleratorKeyPressed；控制器只暴露内部字段，取不到就静默降级。"""
+        if self._accel_hooked or self._webv is None:
+            return
+        try:
+            import System.Reflection as Reflection
+            flags = (Reflection.BindingFlags.NonPublic
+                     | Reflection.BindingFlags.Instance)
+            field = self._webv.GetType().GetField("_coreWebView2Controller", flags)
+            ctrl = field.GetValue(self._webv) if field is not None else None
+            if ctrl is None:
+                return
+            ctrl.AcceleratorKeyPressed += self._on_accelerator_key
+            self._controller = ctrl
+            self._accel_hooked = True
+        except Exception:
+            self._controller = None
+            self._accel_hooked = False
+
+    def _detach_accelerators(self):
+        if not self._accel_hooked or self._controller is None:
+            self._accel_hooked = False
+            return
+        try:
+            self._controller.AcceleratorKeyPressed -= self._on_accelerator_key
+        except Exception:
+            pass
+        self._controller = None
+        self._accel_hooked = False
+
+    def _on_accelerator_key(self, sender, args):
+        """页面有焦点时的浏览器快捷键；只处理明确支持的组合，其余交还页面。"""
+        try:
+            kind = str(getattr(args, "KeyEventKind", "") or "")
+            if "KeyDown" not in kind:
+                return
+            vk = int(getattr(args, "VirtualKey", 0) or 0)
+            Keys = self._wf.Keys
+            mods = self._wf.Control.ModifierKeys
+            if self._handle_shortcut(vk, bool(mods & Keys.Control), bool(mods & Keys.Alt)):
+                try:
+                    args.Handled = True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _handle_shortcut(self, vk, ctrl, alt):
+        """vk 是 Win32 虚拟键码；返回 True 表示该按键由宿主消费。"""
+        if ctrl and vk == 0x4C:            # Ctrl+L
+            self._focus_address()
+            return True
+        if ctrl and vk == 0x52:            # Ctrl+R
+            self.go_reload()
+            return True
+        if vk == 0x74:                     # F5
+            self.go_reload()
+            return True
+        if vk == 0x1B:                     # Esc
+            if self._loading:
+                self.go_stop()
+                return True
+            tb = self._box()
+            try:
+                if tb is not None and tb.Focused:
+                    self._sync_addr()
+                    self._focus_page()
+                    return True
+            except Exception:
+                pass
+            return False
+        if alt and vk == 0x25:             # Alt+Left
+            if self._can_go(True):
+                self.go_back()
+                return True
+            return False
+        if alt and vk == 0x27:             # Alt+Right
+            if self._can_go(False):
+                self.go_forward()
+                return True
+            return False
+        return False
+
+    # ---------------- Form/工具栏上的快捷键（页面内走 WebView2 加速键） ----------------
+    def _can_go(self, back):
+        core = self._core()
+        if core is None:
+            return False
+        try:
+            return bool(core.CanGoBack if back else core.CanGoForward)
+        except Exception:
+            return False
+
+    def _focus_address(self):
+        """延后到下一轮消息循环：在 WebView2 的加速键回调里直接抢焦点会被它拿回去。"""
+        form = self._form
+        if form is None:
+            return
+        try:
+            from System import Action
+            form.BeginInvoke(Action(self._focus_address_now))
+        except Exception:
+            self._focus_address_now()
+
+    def _focus_address_now(self):
+        try:
+            self._addr.TextBox.Focus()
+            self._addr.TextBox.SelectAll()
+        except Exception:
+            pass
+
+    def _focus_page(self):
+        def run():
+            try:
+                self._webv.Focus()
+            except Exception:
+                pass
+        self._ui(run)
+
+    # ---------------- 主题应用 ----------------
+    def _apply_theme(self, theme):
+        self._theme = normalize_theme(theme) or "light"
+        self._palette = palette_for(self._theme)
+        if self._strip is None:
+            return
+        try:
+            from System.Drawing import ColorTranslator
+            self._colors = {k: ColorTranslator.FromHtml(v) for k, v in self._palette.items()}
+        except Exception:
+            return
+        colors = self._colors
+        try:
+            self._strip.BackColor = colors["bg"]
+            self._strip.ForeColor = colors["text"]
+            for item in self._strip.Items:
+                try:
+                    item.ForeColor = colors["accent"] if item == self._btn_return else colors["text"]
+                except Exception:
+                    pass
+            self._addr.TextBox.BackColor = colors["field"]
+            self._addr.TextBox.ForeColor = colors["text"]
+            if self._panel is not None:
+                self._panel.BackColor = colors["bg"]
+            try:
+                self._webv.DefaultBackgroundColor = colors["bg"]
+            except Exception:
+                pass
+            if self._menu is not None:
+                self._menu.BackColor = colors["bg"]
+                self._menu.ForeColor = colors["text"]
+                for item in self._menu.Items:
+                    try:
+                        item.ForeColor = colors["text"]
+                    except Exception:
+                        pass
+            self._apply_status_color()
+            self._strip.Invalidate()
+            if self._menu is not None:
+                self._menu.Invalidate()
+        except Exception:
+            pass
+
+    def _apply_status_color(self):
+        if self._status is None or self._colors is None:
+            return
+        key = {"bad": "err", "busy": "accent"}.get(self._status_tone, "muted")
+        try:
+            self._status.ForeColor = self._colors[key]
+        except Exception:
+            pass
+
+    def _maybe_rewrite_start_page(self):
+        """主题变了且仍停在起始页时重写一次，避免旧配色残留。"""
+        if not self._start_page_shown:
+            return
+        core = self._core()
+        if core is None:
+            return
+        try:
+            src = str(core.Source or "")
+        except Exception:
+            src = ""
+        if src.lower() in ("", "about:blank"):
+            self._write_start_page(core)
 
     def _addr_width(self):
         """地址栏占满工具栏剩余宽度（按钮/状态栏按实际 DPI 计算）。"""
@@ -436,9 +1185,9 @@ class EmbeddedBrowser:
             from System.Drawing import Size
             fixed = 0
             for it in self._strip.Items:
-                if it is self._addr:
+                if it == self._addr:
                     continue
-                if it is self._status:
+                if it == self._status:
                     fixed += int(self._status.Width)
                     continue
                 try:
@@ -639,7 +1388,7 @@ class EmbeddedBrowser:
     def _write_start_page(self, core):
         """把起始页写进当前 about:blank；不走导航，避免被 data: 守卫拦掉。"""
         script = ("document.open();document.write(%s);document.close();"
-                  % json.dumps(_START_PAGE))
+                  % json.dumps(start_page_html(self._theme)))
         try:
             core.ExecuteScriptAsync(script)
             return True
@@ -654,6 +1403,10 @@ class EmbeddedBrowser:
                     core.Stop()
             except Exception:
                 pass
+            self._loading = False
+            self._stopped = True
+            self._update_buttons()
+            self._set_status("已停止")
         self._ui(run)
 
     def _on_addr_key(self, sender, args):
@@ -661,6 +1414,21 @@ class EmbeddedBrowser:
             if args.KeyCode == self._wf.Keys.Enter:
                 args.SuppressKeyPress = True
                 self._navigate_from_box()
+        except Exception:
+            pass
+
+    def _on_addr_enter(self, sender, args):
+        """聚焦地址栏时全选，直接输入即可替换当前网址。"""
+        try:
+            self._addr.TextBox.SelectAll()
+        except Exception:
+            pass
+
+    def _on_addr_mouseup(self, sender, args):
+        try:
+            if args.Button == self._wf.MouseButtons.Left and int(
+                    self._addr.TextBox.SelectionLength) == 0:
+                self._addr.TextBox.SelectAll()
         except Exception:
             pass
 
@@ -683,6 +1451,7 @@ class EmbeddedBrowser:
             return
         self._attach_core(core)
         self._core_ready = True
+        self._attach_accelerators()
         self._sync_addr()
         self._update_buttons()
         if self._pending_nav:
@@ -712,10 +1481,27 @@ class EmbeddedBrowser:
         core.NewWindowRequested += self._on_new_window
         core.DownloadStarting += self._on_download_starting
         core.WebResourceResponseReceived += self._on_web_resource_response
+        core.WebMessageReceived += self._on_web_message
+        try:
+            core.AddScriptToExecuteOnDocumentCreatedAsync(_ESCAPE_SCRIPT)
+        except Exception:
+            pass
         try:
             self._ua = str(core.Settings.UserAgent or "")
         except Exception:
             self._ua = ""
+
+    def _on_web_message(self, sender, args):
+        """页面脚本只发 Esc 消息；用于停止加载（普通按键不走加速键）。"""
+        try:
+            msg = json.loads(str(getattr(args, "WebMessageAsJson", "") or "{}"))
+        except Exception:
+            return
+        try:
+            if isinstance(msg, dict) and msg.get("__ytdlp") == "escape" and self._loading:
+                self.go_stop()
+        except Exception:
+            pass
 
     # ---------------- 网络嗅探：过滤入队 → 后台合批登记 ----------------
     def _start_sniff(self):
@@ -815,13 +1601,19 @@ class EmbeddedBrowser:
             self._set_status("已拦截非 http(s) 地址：%s" % _short(uri), bad=True)
             return
         self._cancelled = False
+        self._stopped = False
         self._page_url = uri if uri.lower().startswith(("http://", "https://")) else ""
-        self._set_status("正在加载…")
+        self._loading = True
+        self._update_buttons()
+        self._set_status("正在加载…", busy=True)
 
     def _on_nav_completed(self, sender, args):
         ok = bool(getattr(args, "IsSuccess", True))
+        self._loading = False
         if ok:
             self._set_status("已打开")
+        elif self._stopped:
+            pass                     # 用户主动停止，保留 go_stop 的「已停止」
         elif not self._cancelled:
             hint = describe_nav_error(getattr(args, "WebErrorStatus", ""))
             if hint:
@@ -904,8 +1696,9 @@ class EmbeddedBrowser:
         except Exception:
             pass
 
-    def _set_status(self, text, bad=False):
+    def _set_status(self, text, bad=False, busy=False):
         self.last_status = text
+        self._status_tone = "bad" if bad else ("busy" if busy else "info")
 
         def run():
             if self._status is None:
@@ -913,7 +1706,7 @@ class EmbeddedBrowser:
             try:
                 self._status.Text = text
                 self._status.ToolTipText = text
-                self._status.ForeColor = self._err_color if bad else self._normal_color
+                self._apply_status_color()
             except Exception:
                 pass
         self._ui(run)
@@ -955,6 +1748,16 @@ class EmbeddedBrowser:
                     self._btn_back.Enabled = back
                 if self._btn_forward is not None:
                     self._btn_forward.Enabled = forward
+                if self._btn_reload is not None:
+                    if self._loading:
+                        self._btn_reload.Text = "停止"
+                        self._btn_reload.ToolTipText = "停止加载（Esc）"
+                    else:
+                        self._btn_reload.Text = "刷新"
+                        self._btn_reload.ToolTipText = "重新加载当前页（F5 / Ctrl+R）"
+                if self._addr is not None:
+                    self._addr.Width = self._addr_width()
+                    self._schedule_relayout()
             except Exception:
                 pass
         self._ui(run)

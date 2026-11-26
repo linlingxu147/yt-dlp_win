@@ -29,7 +29,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 # 本文件在项目根目录；便携运行文件统一放在 runtime/（exe / _internal / ffmpeg / downloads），
 # 源码目录保持干净。旧布局的根目录 exe 仍然兼容。
@@ -352,13 +352,78 @@ def origin_of(url):
     return m.group(1) if m else ""
 
 
+# 自动 Referer 只对这些站点补首页；未知站点不猜，避免把 A 站 Referer 发给 B 站。
+SITE_HOMES = {
+    "douyin.com": "https://www.douyin.com/",
+    "bilibili.com": "https://www.bilibili.com/",
+    "tiktok.com": "https://www.tiktok.com/",
+    "youtube.com": "https://www.youtube.com/",
+}
+SITE_ALIASES = {
+    "v.douyin.com": "douyin.com",
+    "iesdouyin.com": "douyin.com",
+    "b23.tv": "bilibili.com",
+    "youtu.be": "youtube.com",
+    "vm.tiktok.com": "tiktok.com",
+}
+
+
+def _site_key(host):
+    h = str(host or "").lower().strip(".")
+    if h in SITE_ALIASES:
+        return SITE_ALIASES[h]
+    for domain in SITE_HOMES:
+        if h == domain or h.endswith("." + domain):
+            return domain
+    parts = h.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else h
+
+
+def _site_home(url):
+    try:
+        host = urlsplit(str(url or "")).hostname or ""
+    except ValueError:
+        host = ""
+    return SITE_HOMES.get(_site_key(host), "")
+
+
+def effective_referer(cfg, urls=None):
+    """按目标站点选 Referer，避免「A 站 Referer 发给 B 站」。
+
+    优先级：条目显式 referer > 与目标同站的全局设置 > 目标站点首页 > 空。
+    多个不同站点的链接共用一个全局 Referer 没有意义，直接不带。
+    """
+    cfg_ref = str(cfg.get("referer") or "").strip()
+    if cfg.get("_referer_explicit"):
+        return cfg_ref
+    good = [str(u or "").strip() for u in (urls or []) if str(u or "").strip()]
+    if not good:
+        return cfg_ref
+    keys = set()
+    for u in good:
+        try:
+            keys.add(_site_key(urlsplit(u).hostname))
+        except ValueError:
+            keys.add("")
+    if cfg_ref:
+        try:
+            ref_key = _site_key(urlsplit(cfg_ref).hostname)
+        except ValueError:
+            ref_key = ""
+        if len(keys) == 1 and ref_key in keys:
+            return cfg_ref
+    if len(keys) == 1:
+        return _site_home(good[0])
+    return ""
+
+
 def path_inside(path, root):
     """判断 path 是否落在 root 目录内（Windows 下大小写不敏感）。"""
     try:
         p = os.path.normcase(os.path.realpath(path))
         r = os.path.normcase(os.path.realpath(root))
         # 目录根（"C:\\"）本身就以分隔符结尾，再拼一次会变成 "c:\\\\"，
-        # 于是整个盘里的路径都被判成「不在里面」——边下边播的预览链接校验会受影响。
+        # 于是整个盘里的路径都被判成「不在里面」。
         if not r.endswith(os.sep):
             r += os.sep
         if not p.endswith(os.sep):
@@ -646,30 +711,6 @@ def fetch_thumb(url, cfg, cache_dir=None, timeout=THUMB_TIMEOUT, max_bytes=THUMB
     return path, None
 
 
-# ---------------- 边下边播 ----------------
-
-PREVIEW_SUBDIR = ".preview"
-
-
-def fmt_is_separated(cfg):
-    """最终格式表达式含 "+" 即音视频分离（下出来是两个文件，任何一个都不是完整片子）。"""
-    fmt = str(cfg.get("fmt") or "").strip()
-    if not fmt:
-        fmt = MODE_FMT.get(mode_key(cfg.get("mode")), "")
-    return "+" in fmt
-
-
-def real_download_path(raw_path):
-    """progress.filename 给的是目标名；磁盘上先找 .part，没有才用目标名本身。"""
-    p = str(raw_path or "").strip()
-    if not p:
-        return ""
-    part = p + ".part"
-    if os.path.isfile(part):
-        return part
-    return p if os.path.isfile(p) else ""
-
-
 # ---------------- 直链预览：截帧 / 短片段 / 时长 ----------------
 # 扩展嗅探到的多是 .mp4 / .m3u8 直链，yt-dlp 的 generic 提取器不会给它缩略图，
 # 所以封面只能自己截；而 m3u8 浏览器原生播不了，只能先抓一小段再交给 <video>。
@@ -829,71 +870,29 @@ def grab_stream_clip(url, cfg, out_path, seconds=SNIFF_CLIP_SECONDS,
     return False
 
 
-def probe_playable(path, timeout=6):
-    """让 ffmpeg 读正在增长的文件，读得到时长才算能播。只读不转码。"""
-    if not os.path.isfile(path):
-        return {"ok": False, "reason": "文件还没写出来"}
-    ok, out = _run_stream_tool(
-        [find_tool("ffmpeg.exe"), "-hide_banner", "-i", path], timeout)
-    if _parse_duration_text(out) is not None:
-        return {"ok": True, "reason": ""}
-    if out == "超时":
-        return {"ok": False, "reason": "ffmpeg 超时"}
-    if out.startswith("找不到 ffmpeg"):
-        return {"ok": False, "reason": out}
-    lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
-    for ln in lines:
-        low = ln.lower()
-        if any(k in low for k in ("error", "invalid", "moov", "failed", "could not")):
-            return {"ok": False, "reason": ln}
-    return {"ok": False, "reason": "读不到媒体时长"}
+def normalize_site_url(url):
+    """把站点里「带视频 ID 的页面形态」归一成 yt-dlp 认识的地址。
 
-
-def make_preview_link(real_path, outdir):
-    """硬链接出一个扩展名正确的名字给系统播放器。
-
-    播放器按内容识别、不看扩展名，但 .part 没有文件关联，os.startfile 会弹
-    「选择打开方式」。硬链接零字节拷贝，且放在下载目录内的子目录保证同卷。
+    抖音从精选/推荐页点开视频时地址栏常是 `...?modal_id=<id>`，
+    yt-dlp 的 Douyin 提取器只认 `/video/<id>`；这里直接换掉，不碰页面内容。
     """
-    if not os.path.isfile(real_path):
-        return "", "文件还没写出来"
-    base = os.path.basename(real_path)
-    if base.lower().endswith(".part"):
-        base = base[:-5]
-    d = os.path.join(outdir or "", PREVIEW_SUBDIR)
+    s = clean_media_url(url)
     try:
-        os.makedirs(d, exist_ok=True)
-    except OSError as e:
-        return "", f"无法创建预览目录：{e}"
-    link = os.path.join(d, base)
+        parts = urlsplit(s)
+    except ValueError:
+        return s
+    host = (parts.hostname or "").lower()
+    if not (host == "douyin.com" or host.endswith(".douyin.com") or
+            host == "iesdouyin.com" or host.endswith(".iesdouyin.com")):
+        return s
     try:
-        if os.path.exists(link):
-            os.remove(link)
-        os.link(real_path, link)
-    except OSError as e:
-        # 分因归因：只有「文件系统不支持硬链接」（exFAT/FAT32/部分网络盘）才该
-        # 甩给磁盘格式；权限不足、目标被占用、跨卷都另有说法，混为一谈会把人带偏。
-        winerr = getattr(e, "winerror", None)
-        if winerr in (1, 50, 1314):        # ERROR_INVALID_FUNCTION / 不支持 / 权限
-            return "", f"此磁盘不支持硬链接（常见于 exFAT/FAT32 U 盘）：{e}"
-        if winerr == 32:                   # ERROR_SHARING_VIOLATION
-            return "", "上一个预览文件还在播放器里打开着，关掉播放器再试"
-        return "", f"无法创建预览文件（{e}），可稍后重试或改用「下载完成再播放」"
-    return link, None
-
-
-def clear_preview_links(outdir):
-    """只删链接，不动被链接的数据——删硬链接不影响源文件。"""
-    d = os.path.join(outdir or "", PREVIEW_SUBDIR)
-    try:
-        for name in os.listdir(d):
-            try:
-                os.remove(os.path.join(d, name))
-            except OSError:
-                pass
-        os.rmdir(d)
-    except OSError:
-        pass
+        qs = parse_qs(parts.query)
+    except ValueError:
+        return s
+    aid = str((qs.get("modal_id") or [""])[0] or "").strip()
+    if aid.isdigit():
+        return "https://www.douyin.com/video/%s" % aid
+    return s
 
 
 def sanitize_urls(urls):
@@ -901,6 +900,7 @@ def sanitize_urls(urls):
 
     - 丢掉空行与以 # 开头的注释行
     - 裸域名（www.example.com/xxx）自动补 https://
+    - 抖音 `?modal_id=` 页面自动换成 `/video/<id>`
     - 其余非法项（含以 - 开头的伪链接）一律返回给调用方提示
     """
     good, bad = [], []
@@ -911,7 +911,7 @@ def sanitize_urls(urls):
         if _BARE_DOMAIN_RE.match(u):
             u = "https://" + u
         if is_http_url(u):
-            good.append(u)
+            good.append(normalize_site_url(u))
         else:
             bad.append(str(raw or "").strip())
     return good, bad
@@ -990,7 +990,7 @@ DEFAULT_CONFIG = {
     "thumb": True, "meta": True,
     "pl": True, "items": "", "ignore": True,
     "open_after": True,
-    "rate": "", "proxy": "", "cookie": "", "cookie_header": "",
+    "rate": "", "proxy": "", "update_mirror": "", "cookie": "", "cookie_header": "",
     "conc": True, "conc_n": "4", "aria": False, "aria_args": "aria2c:-x 16 -s 16 -k 1M",
     "flat": False, "extra": "",
     "browser": "（不使用）", "browser_profile": "",
@@ -998,7 +998,7 @@ DEFAULT_CONFIG = {
     "generic": False, "extractor_args": "", "retries": "",
     # 网络自愈用的键（桌面版界面不暴露，但加载/保存时不能丢）
     "impersonate": "", "ipv4": False, "chunk": "", "proxy_off": False,
-    "socket_timeout": "", "net_hard": True, "play_while": False,
+    "socket_timeout": "", "net_hard": True,
     # 桌面版内嵌的浏览器扩展服务（扩展靠它下载/预览）。关掉就只有桌面版能用。
     "ext_service": True,
     "yt_dlp_path": find_tool("yt-dlp.exe"),
@@ -1006,6 +1006,8 @@ DEFAULT_CONFIG = {
 }
 # 旧键名 → 新键名（桌面版曾用 open，网页版用 open_after）
 LEGACY_KEYS = {"open": "open_after"}
+# 功能已删除的配置键：旧配置里可能还在，加载时静默丢弃
+REMOVED_KEYS = ("play_while",)
 
 
 def default_config():
@@ -1061,6 +1063,8 @@ def coerce_config(cfg, defaults=None):
                 warnings.append(f"配置项「{k}」已改名为「{new_k}」")
             continue
         merged[k] = v
+    for key in REMOVED_KEYS:
+        merged.pop(key, None)
     # v3：分片并发改成默认开（-N 4 是实测甜点）。只升级「从没动过」的旧配置：
     # 用户自己调过 conc_n 的，说明他有意为之，不覆盖。
     if int(str(src.get("schema_version") or 0) or 0) < 3:
@@ -1086,8 +1090,7 @@ def coerce_config(cfg, defaults=None):
 _INT_FIELDS = {"retries": ("重试次数", 0, 999), "conc_n": ("分片并发", 1, 64),
                "socket_timeout": ("超时秒数", 1, 600)}
 _BOOL_FIELDS = ("sub", "embedsub", "thumb", "meta", "pl", "open_after", "ignore",
-                "conc", "aria", "flat", "generic", "ipv4", "proxy_off", "net_hard",
-                "play_while")
+                "conc", "aria", "flat", "generic", "ipv4", "proxy_off", "net_hard")
 _BYTES_RE = re.compile(r"^\d+(?:\.\d+)?[KMG]?(?:-\d+(?:\.\d+)?[KMG]?)?$", re.I)
 _TRUE_WORDS = {"1", "true", "yes", "on", "y", "是", "开"}
 _FALSE_WORDS = {"", "0", "false", "no", "off", "n", "否", "关"}
@@ -1298,10 +1301,11 @@ def save_config(path, cfg, warn=None):
 
 # ---------------- 命令行构建 ----------------
 
-def add_access_args(cmd, cfg):
+def add_access_args(cmd, cfg, urls=None):
     """把「访问与身份」相关的参数追加到命令里。
 
     探测、下载、看格式用的是同一套凭据——否则会出现「探测不到但能下载」的矛盾。
+    urls 用于按站点自动选 Referer；不传时沿用旧行为（直接用配置里的 Referer）。
     """
     browser = str(cfg.get("browser") or "（不使用）").strip()
     cookie_file = str(cfg.get("cookie") or "").strip()
@@ -1320,8 +1324,9 @@ def add_access_args(cmd, cfg):
         cmd += ["--cookies", cookie_file]
     if str(cfg.get("ua") or "").strip():
         cmd += ["--user-agent", str(cfg["ua"]).strip()]
-    if str(cfg.get("referer") or "").strip():
-        cmd += ["--referer", str(cfg["referer"]).strip()]
+    ref = effective_referer(cfg, urls)
+    if ref:
+        cmd += ["--referer", ref]
     for line in normalize_headers(cfg.get("headers")).splitlines():
         cmd += ["--add-header", line]
     cookie_hdr = scrub_header_value(cfg.get("cookie_header"))
@@ -1377,9 +1382,6 @@ def build_download_cmd(cfg, urls, no_playlist=False, warn=None):
             cmd += ["--merge-output-format", str(cfg["merge"])]
     elif mode == "audio_mp3":
         cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
-    # play_while 不改命令：HLS 的 .part 本来就是 mpegts，下完由 yt-dlp 的
-    # FixupM3u8 修回 mp4。加 --hls-use-mpegts 会关掉这道收尾，把 mpegts
-    # 留在 .mp4 名字里，所以边下边播只读 .part，不碰下载参数。
     if cfg.get("sub"):
         cmd += ["--write-subs", "--write-auto-subs",
                 "--sub-langs", str(cfg.get("sublang") or "zh-Hans,zh,en")]
@@ -1398,7 +1400,7 @@ def build_download_cmd(cfg, urls, no_playlist=False, warn=None):
         cmd += ["--limit-rate", str(cfg["rate"])]
     if cfg.get("proxy"):
         cmd += ["--proxy", str(cfg["proxy"])]
-    add_access_args(cmd, cfg)
+    add_access_args(cmd, cfg, urls)
     if cfg.get("conc"):
         try:
             n = max(1, min(32, int(str(cfg.get("conc_n") or 8).strip())))
@@ -1428,12 +1430,12 @@ def build_detect_cmd(cfg, urls):
         cmd.append("--flat-playlist")
     if str(cfg.get("proxy") or "").strip():
         cmd += ["--proxy", str(cfg["proxy"]).strip()]
-    add_access_args(cmd, cfg)
+    # 多个链接一起探测时，单个失败不应中断其余链接
+    good, _bad = sanitize_urls(urls)
+    add_access_args(cmd, cfg, good)
     if cfg.get("items"):
         cmd += ["--playlist-items", str(cfg["items"])]
     cmd += ["--yes-playlist" if cfg.get("pl") else "--no-playlist"]
-    # 多个链接一起探测时，单个失败不应中断其余链接
-    good, _bad = sanitize_urls(urls)
     cmd += ["-i", "--", *good]
     return cmd
 
@@ -1446,7 +1448,7 @@ def build_formats_cmd(cfg, url):
     cmd = [_exe(cfg), "-F"]
     if str(cfg.get("proxy") or "").strip():
         cmd += ["--proxy", str(cfg["proxy"]).strip()]
-    add_access_args(cmd, cfg)
+    add_access_args(cmd, cfg, [url])
     cmd += ["--", url]
     return cmd
 
@@ -1926,7 +1928,7 @@ def build_probe_cmd(cfg, url, variant):
         cmd += ["--proxy", str(cfg["proxy"]).strip()]
     if variant == "ua":
         cmd += ["--user-agent", UA_WINDOWS]
-        r = referer_of(url)
+        r = _site_home(url) or referer_of(url)
         if r:
             cmd += ["--referer", r]
     elif variant == "cookies":
@@ -1943,7 +1945,7 @@ def build_probe_cmd(cfg, url, variant):
         ua = str(cfg.get("ua") or "").strip()
         if ua:
             cmd += ["--user-agent", ua]
-        ref = str(cfg.get("referer") or "").strip() or referer_of(url)
+        ref = effective_referer(cfg, [url]) or referer_of(url)
         if ref:
             cmd += ["--referer", ref]
         for name, value in normalize_headers(cfg.get("headers")):
@@ -1968,7 +1970,7 @@ def apply_probe_fix(cfg, url, fix):
         cfg["ua"] = UA_WINDOWS
         touched.append("User-Agent")
     if fix.get("referer"):
-        r = referer_of(url)
+        r = _site_home(url) or referer_of(url)
         if r:
             cfg["referer"] = r
             touched.append("Referer")

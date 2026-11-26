@@ -31,6 +31,64 @@ def load_host():
     return mod
 
 
+class TestThemePalette(unittest.TestCase):
+    def test_light_and_dark_palettes(self):
+        light = embedded.palette_for("light")
+        dark = embedded.palette_for("dark")
+        self.assertEqual(light["bg"], "#f6f8fa")
+        self.assertEqual(dark["bg"], "#161b22")
+        self.assertNotEqual(light["text"], dark["text"])
+        for key in ("bg", "field", "text", "muted", "border",
+                    "hover", "press", "accent", "err"):
+            self.assertIn(key, light)
+            self.assertIn(key, dark)
+
+    def test_unknown_theme_falls_back_to_light(self):
+        self.assertEqual(embedded.palette_for("sepia"), embedded.palette_for("light"))
+        self.assertEqual(embedded.palette_for(""), embedded.palette_for("light"))
+        self.assertEqual(embedded.palette_for(None), embedded.palette_for("light"))
+
+    def test_palette_is_a_copy(self):
+        dark = embedded.palette_for("dark")
+        dark["bg"] = "#000000"
+        self.assertEqual(embedded.palette_for("dark")["bg"], "#161b22")
+
+    def test_normalize_theme(self):
+        self.assertEqual(embedded.normalize_theme(" DARK "), "dark")
+        self.assertEqual(embedded.normalize_theme("light"), "light")
+        self.assertEqual(embedded.normalize_theme("system"), "")
+        self.assertEqual(embedded.normalize_theme(None), "")
+
+
+class TestStartPage(unittest.TestCase):
+    def test_dark_page_declares_color_scheme(self):
+        html = embedded.start_page_html("dark")
+        self.assertIn('name="color-scheme" content="dark"', html)
+        self.assertIn("color-scheme: dark", html)
+        self.assertIn("light-dark(", html)
+
+    def test_light_page_and_fallback(self):
+        for theme in ("light", "", "system", "weird"):
+            html = embedded.start_page_html(theme)
+            self.assertIn('name="color-scheme" content="light"', html, theme)
+            self.assertIn("color-scheme: light", html, theme)
+
+    def test_page_has_url_form_and_quick_links(self):
+        html = embedded.start_page_html("light")
+        self.assertIn("<form", html)
+        self.assertIn('id="url-input"', html)
+        self.assertIn('type="submit"', html)
+        self.assertIn('aria-live="polite"', html)
+        for site in ("bilibili.com", "douyin.com", "youtube.com"):
+            self.assertIn(site, html)
+
+    def test_page_has_no_bridge_and_no_keydown_submit(self):
+        """起始页不能依赖 pywebview；回车必须走原生表单提交（输入法安全）。"""
+        html = embedded.start_page_html("dark")
+        self.assertNotIn("pywebview", html)
+        self.assertNotIn("keydown", html)
+
+
 class TestNavigationPolicy(unittest.TestCase):
     def test_http_and_https_are_allowed(self):
         for url in ("http://example.com", "https://example.com/a?b=1#c",

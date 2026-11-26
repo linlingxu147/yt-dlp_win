@@ -10,7 +10,6 @@ yt-dlp 下载器 · 浏览器扩展服务（无网页界面）
   POST /api/sniff        提交嗅探地址，下载交还桌面版流水线
   GET  /api/sniff/log    嗅探下载任务的进度与日志（扩展轮询用）
   POST /api/stop         停止当前任务
-  POST /api/play         边下边播（硬链接 .part 后交系统播放器）
 
 默认假设（业务信息未指定时的合理兜底，界面设置区同样标注）：
   1. 单任务队列：同一时间只运行一个探测/下载任务，避免日志与进度混淆。
@@ -45,7 +44,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 PORT_RANGE = core.PORT_RANGE
 APP_ID = "yt-dlp-web"          # 扩展靠它确认「端口上跑的是本项目」，而不是别的服务
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.10.1"
 
 # 唯一被放行的扩展 ID——由 sniffer_extension\manifest.json 里的 "key" 决定（打包后固定不变）。
 # 以前这里是「任何 chrome-extension:// 都放行」，等于让本机的其它扩展也能改配置、
@@ -69,11 +68,11 @@ def extension_origin_ok(origin):
 # 与桌面版共用的实现统一放在 ytdlp_core：这里只导入本文件真正用到的名字。
 from ytdlp_core import (  # noqa: E402
     NET_PLAN_LABEL, PROBE_VARIANTS, build_probe_cmd, classify_line, clean_media_url,
-    clear_preview_links, command_text, diagnose, find_tool, fmt_is_separated,
+    command_text, diagnose, find_tool,
     info_from_json, is_net_failure, iter_lines_watch, json_ok as _json_ok, kill_tree,
-    COOKIE_PLAN_LABEL, make_preview_link, new_progress_state, next_cookie_plan,
+    COOKIE_PLAN_LABEL, new_progress_state, next_cookie_plan,
     next_net_plan, parse_format_line, path_inside,
-    probe_playable, progress_event, progress_text, real_download_path, sanitize_urls,
+    progress_event, progress_text, sanitize_urls,
     scrub_header_value, spawn, unsafe_arg_in,
 )
 
@@ -101,61 +100,6 @@ def load_config(warn=None):
 
 def build_download_cmd(cfg, urls, no_playlist=False, warn=None):
     return core.build_download_cmd(cfg, urls, no_playlist=no_playlist, warn=warn)
-
-
-PLAY_LOCK = threading.Lock()
-PLAY_STATE = {"raw_path": "", "outdir": "", "cfg": {}, "ok": False,
-              "reason": "还没有开始下载"}
-
-
-def _play_verdict(ok, reason, emit):
-    with PLAY_LOCK:
-        PLAY_STATE["ok"] = bool(ok)
-        PLAY_STATE["reason"] = reason
-    emit({"type": "playable", "ok": bool(ok), "reason": reason})
-
-
-def _play_probe_loop(raw, cfg, outdir, emit):
-    """后台判断能否边下边播。只读不转码，不占下载带宽。"""
-    if fmt_is_separated(cfg):
-        return _play_verdict(False, "此源音视频分离，边下边播不适用（改用单文件模式或关掉此开关）", emit)
-    if cfg.get("aria"):
-        return _play_verdict(False, "aria2c 外部下载器的文件布局不可控，边下边播不适用", emit)
-    reason = "文件还没写出来"
-    deadline = time.time() + 3
-    for _ in range(3):
-        # 「≥256KB」与「≥3 秒」任一满足即探：慢源不干等体积，快源不白等 3 秒
-        while time.time() < deadline:
-            with PLAY_LOCK:
-                if PLAY_STATE["raw_path"] != raw:
-                    return
-            p = real_download_path(raw)
-            try:
-                if p and os.path.getsize(p) >= 256 * 1024:
-                    break
-            except OSError:
-                pass
-            time.sleep(0.5)
-        with PLAY_LOCK:
-            if PLAY_STATE["raw_path"] != raw:
-                return
-        p = real_download_path(raw)
-        if p:
-            v = probe_playable(p)
-            if v["ok"]:
-                return _play_verdict(True, "", emit)
-            reason = v["reason"]
-        deadline = time.time() + 5
-    return _play_verdict(False, "此源要下完才能播：%s" % reason, emit)
-
-
-def _start_play_probe(raw, cfg, outdir, emit):
-    with PLAY_LOCK:
-        PLAY_STATE.update({"raw_path": raw, "outdir": outdir, "cfg": dict(cfg),
-                           "ok": False, "reason": "正在判断能否边下边播…"})
-    emit({"type": "playable", "ok": False, "reason": "正在判断能否边下边播…"})
-    threading.Thread(target=_play_probe_loop, args=(raw, dict(cfg), outdir, emit),
-                     daemon=True).start()
 
 
 class Runner:
@@ -247,38 +191,33 @@ def run_download(cfg, urls, emit, no_playlist=False, abort=None, keepalive=None)
     # 失败后按「直连 → 换浏览器指纹 → 换传输方式」阶梯自愈，专治 ConnectionReset(10054)
     tried = set()
     name, extra = "normal", {}
-    try:
-        while True:
-            c = cfg if not extra else dict(cfg, **extra)
-            if name != "normal":
-                emit({"type": "log", "level": "warn",
-                      "text": "[自动重试] 换用%s重试（已下载部分会续传）"
-                              % (NET_PLAN_LABEL.get(name) or COOKIE_PLAN_LABEL)})
-            code, tail, stopped, done_count = _download_attempt(
-                c, urls, emit, no_playlist, abort, outdir, keepalive)
-            if code is None:          # 启动失败，launch 已自行上报
-                return
-            if code == 0 or stopped:
-                emit({"type": "done", "code": code, "elapsed": round(time.time() - t0, 1),
-                      "done_count": done_count,
-                      "diag": diagnose(tail) if code != 0 else []})
-                return
-            tried.add(name)
-            # 浏览器 Cookies 数据库被独占锁住：先脱掉登录态重试一次，
-            # 公开内容不需要它，读不出来不该让整个下载直接失败。
-            nxt = next_cookie_plan(tail, tried, cfg)
-            if not nxt and cfg.get("net_hard", True) and is_net_failure(tail):
-                # 用原始 cfg 推导 Origin：no-referer 那招已经把 referer 清空了
-                nxt = next_net_plan(tail, tried, cfg, url=urls[0])
-            if not nxt:
-                emit({"type": "done", "code": code, "elapsed": round(time.time() - t0, 1),
-                      "done_count": done_count, "diag": diagnose(tail)})
-                return
-            name, extra = nxt
-    finally:
-        clear_preview_links(outdir)
-        with PLAY_LOCK:
-            PLAY_STATE.update({"raw_path": "", "ok": False, "reason": "还没有开始下载"})
+    while True:
+        c = cfg if not extra else dict(cfg, **extra)
+        if name != "normal":
+            emit({"type": "log", "level": "warn",
+                  "text": "[自动重试] 换用%s重试（已下载部分会续传）"
+                          % (NET_PLAN_LABEL.get(name) or COOKIE_PLAN_LABEL)})
+        code, tail, stopped, done_count = _download_attempt(
+            c, urls, emit, no_playlist, abort, outdir, keepalive)
+        if code is None:          # 启动失败，launch 已自行上报
+            return
+        if code == 0 or stopped:
+            emit({"type": "done", "code": code, "elapsed": round(time.time() - t0, 1),
+                  "done_count": done_count,
+                  "diag": diagnose(tail) if code != 0 else []})
+            return
+        tried.add(name)
+        # 浏览器 Cookies 数据库被独占锁住：先脱掉登录态重试一次，
+        # 公开内容不需要它，读不出来不该让整个下载直接失败。
+        nxt = next_cookie_plan(tail, tried, cfg)
+        if not nxt and cfg.get("net_hard", True) and is_net_failure(tail):
+            # 用原始 cfg 推导 Origin：no-referer 那招已经把 referer 清空了
+            nxt = next_net_plan(tail, tried, cfg, url=urls[0])
+        if not nxt:
+            emit({"type": "done", "code": code, "elapsed": round(time.time() - t0, 1),
+                  "done_count": done_count, "diag": diagnose(tail)})
+            return
+        name, extra = nxt
 
 
 def _download_attempt(cfg, urls, emit, no_playlist, abort, outdir, keepalive=None):
@@ -306,12 +245,6 @@ def _download_attempt(cfg, urls, emit, no_playlist, abort, outdir, keepalive=Non
                       "item_i": state["item_i"], "item_total": state["item_total"],
                       "done_count": len(state["done"]),
                       "text": line if ev["kind"] == "file" else progress_text(state)})
-                raw = state.get("raw_path") or ""
-                if raw and cfg.get("play_while"):
-                    with PLAY_LOCK:
-                        known = PLAY_STATE["raw_path"]
-                    if raw != known:
-                        _start_play_probe(raw, cfg, outdir, emit)
                 continue
             buf.append(line)
             emit({"type": "log", "level": classify_line(line), "text": line})
@@ -443,10 +376,6 @@ def sniff_log_json():
                 err = ln.strip()
                 break
         d["last_error"] = err
-    # 扩展面板据此显示「边下边播」按钮：探测是本机在后台做的，不占下载带宽
-    with PLAY_LOCK:
-        d["playable"] = {"ok": bool(PLAY_STATE["ok"]), "reason": PLAY_STATE["reason"],
-                         "active": bool(PLAY_STATE["raw_path"])}
     return d
 
 
@@ -707,6 +636,16 @@ def write_cookie_jar(jar, url):
     return path
 
 
+def _drop_cookie(cfg):
+    """删掉扩展送来的临时 cookie 文件；任务没启动/槽位被占时也要清。"""
+    path = cfg.get("_sniff_cookie_file")
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def run_sniff_task(cfg, url, kind, token=None):
     """嗅探下载线程：直接媒体地址走通用提取器 + 网页嗅探带的访问凭据。"""
     cookie_file = None
@@ -715,9 +654,8 @@ def run_sniff_task(cfg, url, kind, token=None):
         # 直链媒体（m3u8/mp4）本身没有封面和元数据，强行 embed 只会让 ffmpeg 报错、
         # 把一次成功的下载判成失败。这里只做「下回来」这一件事。
         cfg.update({"thumb": False, "meta": False, "sub": False, "embedsub": False})
-    # 直链只有一路格式，这里写死 b：否则全局的 bv*+ba/b 会被判成「音视频分离」，
-    # 可播性判断直接返回「不适用」。play_while 只用于让服务端探测，不会自动弹播放器。
-    cfg.update({"fmt": "b", "play_while": True})
+        # 直链只有一路格式，这里写死 b，避免全局的 bv*+ba/b 选到分离流。
+        cfg.update({"fmt": "b"})
     try:
         run_download(cfg, [url], emit, no_playlist=True)
     except Exception as e:
@@ -728,12 +666,7 @@ def run_sniff_task(cfg, url, kind, token=None):
         with SNIFF_LOCK:
             if token is None or SNIFF_STATE.get("token") == token:
                 SNIFF_STATE["done"] = True
-        cookie_file = cfg.get("_sniff_cookie_file")
-        if cookie_file and os.path.isfile(cookie_file):
-            try:
-                os.remove(cookie_file)
-            except Exception:
-                pass
+        _drop_cookie(cfg)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -960,37 +893,39 @@ class Handler(BaseHTTPRequestHandler):
             url = clean_media_url(body.get("url"))
             if not url.lower().startswith(("http://", "https://")):
                 return self._json({"error": "仅支持 http/https 链接（blob:/data: 无法交给 yt-dlp）"}, 400)
+            url = core.normalize_site_url(url)
             kind = body.get("kind") or "media"
-            # 直接媒体地址：带上页面嗅探到的访问凭据，绕过防盗链
+            # 扩展提交的凭据：直链与「下载本页」都用；抖音这类站点 page 也需要 fresh cookies。
+            referer = clean_media_url(body.get("referer"))
+            ua = str(body.get("ua") or "").strip().replace("\r", " ").replace("\n", " ")
+            jar = body.get("cookie_jar")
+            if referer:
+                cfg["referer"] = referer
+                cfg["_referer_explicit"] = True
+            if ua:
+                cfg["ua"] = ua
+            if isinstance(jar, list) and jar:
+                # 首选：完整 cookie 字段 → Netscape 临时文件
+                path = write_cookie_jar(jar, url)
+                if path:
+                    cfg["cookie"] = path
+                    cfg["_sniff_cookie_file"] = path
+                    # 扩展已经把本页 cookie 直接交过来了：别再让 yt-dlp 去读
+                    # 浏览器那个大概率被独占锁住的 Cookies 数据库（读了必失败）。
+                    cfg["browser"] = "（不使用）"
+                    cfg["browser_profile"] = ""
+            if not cfg.get("cookie"):
+                # 兜底：只有 Cookie 头字符串（或临时文件没写成）时原样透传。
+                # 注意别截断：Cookie 少一段，站点照样判你没登录。
+                cookie = scrub_header_value(body.get("cookie"))
+                if cookie:
+                    cfg["cookie_header"] = cookie
+            # 直链只有一路格式；page 走站点提取器，保留用户的画质/播放列表设置
             if kind == "media":
-                referer = clean_media_url(body.get("referer"))
-                ua = str(body.get("ua") or "").strip().replace("\r", " ").replace("\n", " ")
-                jar = body.get("cookie_jar")
-                if referer:
-                    cfg["referer"] = referer
-                if ua:
-                    cfg["ua"] = ua
-                if isinstance(jar, list) and jar:
-                    # 首选：完整 cookie 字段 → Netscape 临时文件
-                    path = write_cookie_jar(jar, url)
-                    if path:
-                        cfg["cookie"] = path
-                        cfg["_sniff_cookie_file"] = path
-                        # 扩展已经把本页 cookie 直接交过来了：别再让 yt-dlp 去读
-                        # 浏览器那个大概率被独占锁住的 Cookies 数据库（读了必失败）。
-                        cfg["browser"] = "（不使用）"
-                        cfg["browser_profile"] = ""
-                if not cfg.get("cookie"):
-                    # 兜底：只有 Cookie 头字符串（或临时文件没写成）时原样透传。
-                    # 注意别截断：Cookie 少一段，站点照样判你没登录。
-                    cookie = scrub_header_value(body.get("cookie"))
-                    if cookie:
-                        cfg["cookie_header"] = cookie
+                cfg.update({"thumb": False, "meta": False, "sub": False, "embedsub": False,
+                            "fmt": "b"})
             if TASK_SINK is not None:
                 # 桌面版是宿主：任务交给桌面版流水线，本服务只镜像状态
-                if kind == "media":
-                    cfg.update({"thumb": False, "meta": False, "sub": False, "embedsub": False})
-                cfg.update({"fmt": "b", "play_while": True})
                 token = RUNNER.task_id + 1
                 with SNIFF_LOCK:
                     SNIFF_STATE.update({"lines": [], "prog": None,
@@ -1001,6 +936,7 @@ class Handler(BaseHTTPRequestHandler):
                 task = {"url": url, "kind": kind, "cfg": cfg,
                         "emit": lambda obj: sniff_emit(obj, token)}
                 if not TASK_SINK(task):
+                    _drop_cookie(cfg)
                     with SNIFF_LOCK:
                         if SNIFF_STATE.get("token") == token:
                             SNIFF_STATE["done"] = True
@@ -1008,6 +944,7 @@ class Handler(BaseHTTPRequestHandler):
                                        "error": "桌面版已有任务正在进行，请先停止或等待结束"}, 409)
                 return self._json({"ok": True, "busy": False, "url": url})
             if not RUNNER.reserve("download"):
+                _drop_cookie(cfg)
                 return self._json({"ok": False, "busy": True, "running_kind": RUNNER.kind,
                                    "error": "已有任务正在运行（%s），请先停止或等待结束" % (RUNNER.kind or "")}, 409)
             token = RUNNER.task_id
@@ -1025,28 +962,6 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/stop":
             ok = STOP_HOOK() if STOP_HOOK is not None else RUNNER.stop()
             return self._json({"ok": ok})
-
-        if p == "/api/play":
-            # 路径由服务端自己掌握：客户端传路径等于让它指定打开本机任意文件
-            if body.get("path") or body.get("url"):
-                return self._json({"error": "不接受客户端指定路径"}, 400)
-            if not RUNNER.busy() or RUNNER.kind != "download":
-                return self._json({"error": "当前没有正在下载的任务"}, 409)
-            with PLAY_LOCK:
-                st = dict(PLAY_STATE)
-            if not st.get("ok"):
-                return self._json({"error": st.get("reason") or "此源不支持边下边播"}, 400)
-            real = real_download_path(st.get("raw_path"))
-            if not real:
-                return self._json({"error": "文件还没写出来"}, 400)
-            link, err = make_preview_link(real, st.get("outdir"))
-            if err:
-                return self._json({"error": err}, 400)
-            try:
-                os.startfile(link)
-            except Exception as e:
-                return self._json({"error": "打开播放器失败：%s（建议安装 VLC 或 PotPlayer）" % e}, 500)
-            return self._json({"ok": True})
 
         self._json({"error": "not found"}, 404)
 

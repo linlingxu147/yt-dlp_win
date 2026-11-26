@@ -68,6 +68,7 @@ function makeChrome(storage, calls) {
 function loadWorker(storage, calls, fetchImpl) {
   const chrome = makeChrome(storage, calls);
   const sandbox = { chrome, console, setTimeout, clearTimeout, Promise, JSON, Date, URL,
+                    navigator: { userAgent: 'NodeSmoke' },
                     fetch: fetchImpl || (async () => { throw new Error('offline'); }) };
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
@@ -116,8 +117,12 @@ function fire(listeners, name, ...args) {
 
   // ---- 4) 端口发现：校验 app 标识，且旧版服务（无 app 字段）仍可用 ----
   const seen = [];
+  const bodies = [];
   const mkFetch = (statusBody) => async (url, opt) => {
     seen.push([opt && opt.method || 'GET', url]);
+    if (opt && opt.body) {
+      try { bodies.push(JSON.parse(opt.body)); } catch (e) { /* ignore */ }
+    }
     if (url.includes('/api/status')) {
       return { ok: true, json: async () => statusBody };
     }
@@ -132,6 +137,8 @@ function fire(listeners, name, ...args) {
   const posted = seen.find(([m, u]) => m === 'POST' && u.includes('/api/sniff'));
   assert.ok(posted, '提交时 POST 到 /api/sniff');
   assert.ok(storage.local.server_port, '端口已缓存到 storage.local');
+  const mediaBody = bodies.find((b) => b && b.kind === 'media');
+  assert.ok(mediaBody && mediaBody.cookie_jar.length === 1, '直链提交带 cookies');
   log('4) 端口发现 + 提交:', posted[1].replace(/^https?:\/\//, ''), '缓存端口=', storage.local.server_port);
 
   storage.local = {};
@@ -142,7 +149,12 @@ function fire(listeners, name, ...args) {
        { tab: { id: 8 }, frameId: 0 }, () => {});
   await sleep(80);
   assert.ok(seen.some(([m, u]) => m === 'POST' && u.includes('/api/sniff')), '旧版服务也能提交');
-  log('5) 旧版服务（无 app 字段）回退成功');
+  const pageBody = bodies.filter((b) => b && b.kind === 'page').pop();
+  assert.ok(pageBody, '下载本页提交体存在');
+  assert.ok(pageBody.cookie_jar.length === 1, '下载本页也带 cookies');
+  assert.strictEqual(pageBody.referer, 'https://cdn.example.com/b.mp4',
+                     'page 没填 Referer 时默认用页面地址');
+  log('5) 旧版服务（无 app 字段）回退成功；page 提交带 cookies');
 
   // ---- 6) 音频流识别（content 脚本公共 helper） ----
   const audioSrc = fs.readFileSync(

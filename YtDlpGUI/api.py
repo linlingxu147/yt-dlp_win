@@ -73,8 +73,8 @@ class Api:
     def troubleshoot(self, urls, cfg):
         return self._guard(self.host.troubleshoot, urls, cfg)
 
-    def update_ytdlp(self, proxy=""):
-        return self._guard(self.host.update_ytdlp, proxy)
+    def update_ytdlp(self, proxy="", mirror=""):
+        return self._guard(self.host.update_ytdlp, proxy, mirror)
 
     def fetch_formats(self, url, cfg):
         return self._guard(self.host.fetch_formats, url, cfg)
@@ -85,9 +85,6 @@ class Api:
     # ---------------- 预览/播放 ----------------
     def get_thumb(self, url, cfg):
         return self._guard(self.host.get_thumb, url, cfg)
-
-    def play_now(self):
-        return self._guard(self.host.play_now)
 
     # ---------------- 扩展嗅探 ----------------
     def sniff_items(self):
@@ -146,8 +143,8 @@ class Api:
     def set_ext_service(self, on):
         return self._guard(self.host.set_ext_service, bool(on))
 
-    def open_browser(self):
-        return self._guard(self.host.open_embedded_browser, self.window)
+    def open_browser(self, theme=""):
+        return self._guard(self.host.open_embedded_browser, self.window, str(theme or ""))
 
     def exit(self):
         self.host.shutdown()

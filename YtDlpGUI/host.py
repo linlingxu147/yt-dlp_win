@@ -13,6 +13,10 @@ import threading
 import time
 
 import ytdlp_core as core
+try:
+    from . import updater
+except ImportError:          # 真实入口把 YtDlpGUI/ 放进 sys.path，按顶层模块导入
+    import updater
 from ytdlp_core import (
     MODE_CHOICES, MODE_FMT, MODE_NAME, mode_key, TEMPLATES, BROWSERS,
     diagnose, diagnose_pairs, find_tool, fmt_dur, fmt_size, info_from_json_raw,
@@ -22,8 +26,7 @@ from ytdlp_core import (
     new_progress_state, progress_event, progress_text, classify_line,
     is_net_failure, next_net_plan, next_cookie_plan,
     NET_PLAN_LABEL, COOKIE_PLAN_LABEL, PROG_MARK,
-    fetch_thumb, real_download_path, probe_playable, make_preview_link,
-    clear_preview_links, fmt_is_separated, path_inside,
+    fetch_thumb, path_inside,
 )
 
 HISTORY_MAX = 500
@@ -65,8 +68,6 @@ class Host:
         self.diag_buf = ""
         self.cookie_warned = False
         self.results = []
-        self._play_raw = ""
-        self._play_ok = False
         self._sniff_clip = ""
         self._worker = None
         self.embedded = None
@@ -349,7 +350,6 @@ class Host:
                                "item_i": st["item_i"], "item_total": st["item_total"]})
             if ev["kind"] == "file":
                 self._log((progress_text(st) if PROG_MARK in line else line) + "\n", "ok")
-                self._maybe_start_play_probe()
             elif ev["kind"] == "item":
                 self._log(line + "\n", None)
             else:
@@ -369,6 +369,12 @@ class Host:
     def stop(self):
         proc = self.proc
         if not proc or proc.poll() is not None:
+            if self.task_kind == "update":
+                # 镜像下载没有子进程，stop 也要能把更新线程叫停
+                self.user_stopped = True
+                self._status("已停止", "err")
+                self._log("[已手动停止：更新]\n", "warn")
+                return True
             self._status("当前没有进行中的任务", "idle")
             return False
         self.user_stopped = True
@@ -381,10 +387,6 @@ class Host:
         self._release_runner()
         emit, cookie = self.ext_emit, self.ext_cookie_file
         self.ext_emit = self.ext_cfg = self.ext_cookie_file = None
-        if self._web_mod:
-            with self._web_mod.PLAY_LOCK:
-                self._web_mod.PLAY_STATE.update({"raw_path": "", "ok": False,
-                                                 "reason": "还没有开始下载"})
         if emit:
             emit({"type": "done", "code": code})
         if cookie and os.path.isfile(cookie):
@@ -396,9 +398,6 @@ class Host:
     def on_done(self, code):
         base = self._task_cfg()
         was_ext = self.ext_cfg is not None
-        clear_preview_links(base.get("outdir") or core.DOWNLOAD_DIR)
-        self._play_raw = ""
-        self._set_playable(False, "还没有开始下载")
         self.running = False
         self.proc = None
         self.task_kind = None
@@ -500,76 +499,6 @@ class Host:
                 ".bmp": "image/bmp"}.get(ext, "image/jpeg")
         return {"ok": True,
                 "data_url": "data:%s;base64,%s" % (mime, base64.b64encode(data).decode())}
-
-    # ---------------- 边下边播 ----------------
-    def _maybe_start_play_probe(self):
-        cfg = self._task_cfg()
-        raw = self.pstate.get("raw_path") or ""
-        if not raw or not cfg.get("play_while") or raw == self._play_raw:
-            return
-        self._play_raw = raw
-        if self._web_mod:
-            with self._web_mod.PLAY_LOCK:
-                self._web_mod.PLAY_STATE.update({"raw_path": raw, "outdir": self.dl_outdir,
-                                                 "cfg": dict(cfg), "ok": False,
-                                                 "reason": "正在判断能否边下边播…"})
-        self._set_playable(False, "正在判断能否边下边播…")
-        threading.Thread(target=self._play_probe_loop, args=(raw, dict(cfg)), daemon=True).start()
-
-    def _play_probe_loop(self, raw, cfg):
-        if fmt_is_separated(cfg):
-            self._set_playable(False, "此源音视频分离，边下边播不适用")
-            return
-        if cfg.get("aria"):
-            self._set_playable(False, "aria2c 外部下载器不支持边下边播")
-            return
-        reason = "文件还没写出来"
-        deadline = time.time() + 3
-        for _ in range(3):
-            while time.time() < deadline:
-                p = real_download_path(raw)
-                try:
-                    if p and os.path.getsize(p) >= 256 * 1024:
-                        break
-                except OSError:
-                    pass
-                time.sleep(0.5)
-            p = real_download_path(raw)
-            if p:
-                v = probe_playable(p)
-                if v["ok"]:
-                    self._set_playable(True, "")
-                    return
-                reason = v["reason"]
-            deadline = time.time() + 5
-        self._set_playable(False, "此源要下完才能播：%s" % reason)
-
-    def _set_playable(self, ok, reason):
-        self._play_ok = bool(ok)
-        self._put({"type": "playable", "ok": bool(ok), "reason": reason})
-        if self.ext_emit:
-            self.ext_emit({"type": "playable", "ok": bool(ok), "reason": reason})
-        if self._web_mod:
-            with self._web_mod.PLAY_LOCK:
-                self._web_mod.PLAY_STATE["ok"] = bool(ok)
-                self._web_mod.PLAY_STATE["reason"] = reason
-
-    def play_now(self):
-        if not self._play_ok:
-            return {"ok": False, "error": "此源不支持边下边播"}
-        cfg = self._task_cfg()
-        outdir = cfg.get("outdir") or core.DOWNLOAD_DIR
-        real = real_download_path(self._play_raw)
-        if not real:
-            return {"ok": False, "error": "文件还没写出来，稍等再试"}
-        link, err = make_preview_link(real, outdir)
-        if err:
-            return {"ok": False, "error": err}
-        try:
-            os.startfile(link)
-        except Exception as e:
-            return {"ok": False, "error": "打开播放器失败：%s（建议安装 VLC 或 PotPlayer）" % e}
-        return {"ok": True}
 
     # ---------------- 探测 ----------------
     def detect(self, urls, cfg):
@@ -756,43 +685,134 @@ class Host:
         self._put({"type": "trodone", "ok": ok, "task": task})
 
     # ---------------- 更新 ----------------
-    def update_ytdlp(self, proxy):
+    def update_ytdlp(self, proxy, mirror=""):
         if self.task_kind:
             return self._busy()
+        proxy = str(proxy or "").strip()
+        mirror = str(mirror or "").strip()
+        self.save_config({"proxy": proxy, "update_mirror": mirror})
         yt = self.cfg.get("yt_dlp_path") or find_tool("yt-dlp.exe")
         cmd = [yt, "-U"]
-        if (proxy or "").strip():
-            cmd += ["--proxy", proxy.strip()]
+        if proxy:
+            cmd += ["--proxy", proxy]
         if not self._reserve("update"):
             return self._busy()
         self.user_stopped = False
         self._task_ev()
         self._status("更新 yt-dlp…", "run")
         self._log("> " + command_text(cmd) + "\n", "cmd")
-        self._worker = threading.Thread(target=self._update_run, args=(cmd,), daemon=True)
+        self._worker = threading.Thread(
+            target=self._update_run, args=(cmd, proxy, mirror), daemon=True)
         self._worker.start()
         return {"ok": True}
 
-    def _update_run(self, cmd):
+    def _update_run(self, cmd, proxy="", mirror=""):
+        ok = False
         try:
             proc = spawn(cmd, core.BASE_DIR)
         except Exception as e:
             self._log("启动失败：%s\n" % e, "err")
-            self._put({"type": "trodone", "ok": 0, "task": "update"})
-            return
-        self.proc = proc
-        code = -1
+            proc = None
+        if proc is not None:
+            self.proc = proc
+            code = -1
+            try:
+                for line in iter_lines_watch(proc, abort=lambda: self.user_stopped,
+                                             keep_blank=True):
+                    self._log(line + "\n", None)
+                code = proc.wait()
+            except Exception as e:
+                self._log("更新出错：%s\n" % e, "err")
+            finally:
+                self.proc = None
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                except Exception:
+                    pass
+            ok = code == 0
+        if not ok and not mirror and not self.user_stopped:
+            self._log("[更新] 官方源失败；可在「设置 → 网络与加速 → 更新镜像」"
+                      "填写 https://gh-proxy.com 后重试\n", "warn")
+        if not ok and mirror and not self.user_stopped:
+            self._log("[更新] 官方源失败，尝试镜像：%s\n" % mirror, "warn")
+            self._status("更新：尝试镜像…", "run")
+            ok = self._update_via_mirror(mirror, proxy)
+        if ok:
+            self._log("=== 更新完成，请重新探测 ===\n", "ok")
+        elif self.user_stopped:
+            self._log("=== 更新已停止 ===\n", "warn")
+        else:
+            self._log("=== 更新失败，通常是网络/代理不通 ===\n", "err")
+        self._put({"type": "trodone", "ok": 1 if ok else 0, "task": "update"})
+
+    def _update_via_mirror(self, mirror, proxy=""):
+        """官方 -U 失败后的回退：镜像下载 onedir zip → 校验 → 替换 runtime。"""
+        import shutil
+        import tempfile
+        sums_url = updater.mirror_url(mirror, updater.LATEST_URL + updater.SUMS_ASSET)
+        zip_url = updater.mirror_url(mirror, updater.LATEST_URL + updater.ZIP_ASSET)
+        if not sums_url or not zip_url:
+            self._log("[更新] 镜像地址无效（需要 http/https 前缀）：%s\n" % mirror, "err")
+            return False
+        dl = tempfile.mkdtemp(prefix="ytdlp_update_dl_")
         try:
-            for line in iter_lines_watch(proc, abort=lambda: self.user_stopped, keep_blank=True):
-                self._log(line + "\n", None)
-            code = proc.wait()
+            sums_path = os.path.join(dl, updater.SUMS_ASSET)
+            zip_path = os.path.join(dl, updater.ZIP_ASSET)
+            self._fetch_mirror(sums_url, sums_path, proxy, "校验文件")
+            with open(sums_path, encoding="utf-8", errors="replace") as f:
+                want = updater.parse_checksum(f.read(), updater.ZIP_ASSET)
+            if not want:
+                self._log("[更新] 镜像校验文件里没有 %s\n" % updater.ZIP_ASSET, "err")
+                return False
+            self._log("[更新] 镜像校验值：%s…\n" % want[:12], None)
+            self._fetch_mirror(zip_url, zip_path, proxy, updater.ZIP_ASSET)
+            got = updater.sha256_file(zip_path)
+            if got.lower() != want.lower():
+                self._log("[更新] SHA256 不一致，已拒绝安装\n", "err")
+                return False
+            self._log("[更新] 校验通过，替换 runtime/yt-dlp.exe + _internal…\n", None)
+            ok, version, backup, err = updater.install_zip(
+                zip_path, core.RUNTIME_DIR, verify=updater.verify_version)
+            if not ok:
+                self._log("[更新] 镜像安装失败：%s\n" % err, "err")
+                return False
+            self._log("[更新] 镜像更新完成：%s（备份：%s）\n"
+                      % (version or "未知版本", backup or "无"), "ok")
+            return True
+        except updater.UpdateCancelled:
+            self._log("[更新] 镜像下载已停止\n", "warn")
+            return False
         except Exception as e:
-            self._log("更新出错：%s\n" % e, "err")
+            self._log("[更新] 镜像更新失败：%s\n" % e, "err")
+            return False
         finally:
-            self.proc = None
-        self._log("=== 更新完成，请重新探测 ===\n" if code == 0
-                  else "=== 更新失败，通常是网络/代理不通 ===\n", "ok" if code == 0 else "err")
-        self._put({"type": "trodone", "ok": 1 if code == 0 else 0, "task": "update"})
+            shutil.rmtree(dl, ignore_errors=True)
+
+    def _fetch_mirror(self, url, dest, proxy, label):
+        last = [0]
+
+        def progress(done, total):
+            if done - last[0] < 5 * 1024 * 1024 and not (total and done >= total):
+                return
+            last[0] = done
+            if total:
+                self._log("[更新] %s：%d%%\n" % (label, done * 100 // total), None)
+            else:
+                self._log("[更新] %s：%d MB\n" % (label, done // 1024 // 1024), None)
+
+        try:
+            updater.download(url, dest, proxy="", abort=lambda: self.user_stopped,
+                             progress=progress)
+            return
+        except updater.UpdateCancelled:
+            raise
+        except Exception as e:
+            if not proxy:
+                raise
+            self._log("[更新] 镜像直连失败（%s），改用代理重试…\n" % e, "warn")
+            updater.download(url, dest, proxy=proxy, abort=lambda: self.user_stopped,
+                             progress=progress)
 
     # ---------------- 格式表 ----------------
     def fetch_formats(self, url, cfg):
@@ -901,14 +921,14 @@ class Host:
         return r
 
     # ---------------- 内嵌浏览器 ----------------
-    def open_embedded_browser(self, window=None):
+    def open_embedded_browser(self, window=None, theme=""):
         try:
             from embedded import EmbeddedBrowser
         except Exception as e:
             return {"ok": False, "error": "内嵌浏览器模块不可用：%s" % e}
         if self.embedded is None:
             self.embedded = EmbeddedBrowser(self.register_embedded_sniff)
-        return self.embedded.open(window)
+        return self.embedded.open(window, theme)
 
     def register_embedded_sniff(self, items, page_url=""):
         """内嵌浏览器合批后的条目 → 复用扩展服务的登记表（同址去重/300 条上限）。"""
@@ -947,12 +967,13 @@ class Host:
         if self.task_kind:
             return self._busy()
         cfg = dict(self.cfg)
-        cfg.update({"fmt": "b", "play_while": True, "thumb": False, "meta": False,
+        cfg.update({"fmt": "b", "thumb": False, "meta": False,
                     "sub": False, "embedsub": False})
         if len(items) == 1:
             it = items[0]
             if it.get("referer") or it.get("page_url"):
                 cfg["referer"] = it.get("referer") or it.get("page_url")
+                cfg["_referer_explicit"] = True
             if it.get("ua"):
                 cfg["ua"] = it["ua"]
         task = {"urls": [it["url"] for it in items], "kind": "media", "cfg": cfg,
@@ -1006,8 +1027,4 @@ class Host:
             pass
         self.close_embedded_browser()
         self.stop_ext_service()
-        try:
-            clear_preview_links(self.cfg.get("outdir") or core.DOWNLOAD_DIR)
-        except Exception:
-            pass
         self._stop_flag = True
