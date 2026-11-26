@@ -221,8 +221,6 @@ class QueueManager:
             t.cancel_requested = True
             direct = t.state in ("queued", "paused")
             if direct:
-                if t.state == "running":
-                    self._running = max(0, self._running - 1)
                 t.state = "canceled"
                 t.ended_at = time.time()
                 self._trim_finished()
@@ -261,6 +259,39 @@ class QueueManager:
         with self._cv:
             self._closed = True
             self._cv.notify_all()
+
+
+def run_process(task, cmd, cwd, on_line, stall_seconds=300):
+    """统一进程泵：起进程、逐行回调、注册 task.proc，暂停/取消可中断。
+
+    返回 (code, tail, why)：code 退出码（启动失败为 None）、tail 末尾 300 行、
+    why 为 iter_lines_watch 的原因字典（spawn 失败时 {"reason": "spawn"}）。
+    """
+    why = {}
+    try:
+        proc = core.spawn(cmd, cwd)
+    except Exception:
+        return None, "", {"reason": "spawn"}
+    task.proc = proc
+    buf = []
+
+    def abort():
+        return task.pause_requested or task.cancel_requested
+
+    try:
+        for line in core.iter_lines_watch(proc, abort=abort,
+                                          stall_seconds=stall_seconds, why=why):
+            buf.append(line)
+            on_line(line)
+    finally:
+        code = proc.wait() if proc else -1
+        task.proc = None
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
+    return code, "\n".join(buf[-300:]), why
 
 
 def purge_partials(task):

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -241,3 +242,106 @@ class TestPauseResumeCancel(unittest.TestCase):
         while time.time() < end and self.mgr.any_active():
             time.sleep(0.02)
         self.assertFalse(self.mgr.any_active())
+
+
+class TestRunProcess(unittest.TestCase):
+    def test_collects_lines_and_code(self):
+        mgr = q.QueueManager(max_concurrent=1)
+        lines = []
+        code_box = {}
+
+        def exe(task):
+            cmd = [sys.executable, "-c",
+                   "import sys;[sys.stdout.write('L%d\\n'%i) or sys.stdout.flush() for i in range(3)]"]
+            code, tail, why = q.run_process(task, cmd, None, lines.append)
+            code_box["code"] = code
+
+        tid = mgr.submit(spec(), exe)
+        # 等 executor 真正跑完（提交瞬间还是 queued，按 state=="running" 等会直接跳过）
+        end = time.time() + 5
+        while time.time() < end and "code" not in code_box:
+            time.sleep(0.02)
+        mgr.close()
+        self.assertEqual(code_box.get("code"), 0)
+        self.assertEqual(len(lines), 3)
+
+    def test_pause_aborts(self):
+        mgr = q.QueueManager(max_concurrent=1)
+        started = threading.Event()
+
+        def exe(task):
+            cmd = [sys.executable, "-c",
+                   "import time,sys;sys.stdout.write('go\\n');sys.stdout.flush();time.sleep(30)"]
+            q.run_process(task, cmd, None, lambda l: started.set())
+
+        tid = mgr.submit(spec(), exe)
+        self.assertTrue(started.wait(5))
+        mgr.pause(tid)
+        end = time.time() + 5
+        while time.time() < end and mgr.get(tid).state != "paused":
+            time.sleep(0.02)
+        mgr.close()
+        self.assertEqual(mgr.get(tid).state, "paused")
+
+    def test_spawn_failure(self):
+        task = q.Task(1, spec())
+        code, tail, why = q.run_process(
+            task, [os.path.join(tempfile.gettempdir(), "no-such-exe-t4.exe")],
+            None, lambda l: None)
+        self.assertIsNone(code)
+        self.assertEqual(tail, "")
+        self.assertEqual(why, {"reason": "spawn"})
+        self.assertIsNone(task.proc)
+
+    def test_tail_keeps_last_300_lines(self):
+        task = q.Task(1, spec())
+        lines = []
+        cmd = [sys.executable, "-c",
+               "import sys;[sys.stdout.write('L%d\\n'%i) for i in range(350)]"]
+        code, tail, why = q.run_process(task, cmd, None, lines.append)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(lines), 350)
+        self.assertEqual(tail.split("\n"), ["L%d" % i for i in range(50, 350)])
+        self.assertIsNone(task.proc)
+
+    def test_cancel_running_ends_canceled(self):
+        """运行中取消必须落到 canceled（不是 done/failed）：真实子进程 + run_process。"""
+        mgr = q.QueueManager(max_concurrent=1)
+        started = threading.Event()
+
+        def exe(task):
+            cmd = [sys.executable, "-c",
+                   "import time,sys;sys.stdout.write('go\\n');sys.stdout.flush();time.sleep(30)"]
+            code, tail, why = q.run_process(task, cmd, None,
+                                            lambda l: started.set())
+            task.exit_code = code
+
+        tid = mgr.submit(spec(), exe)
+        try:
+            self.assertTrue(started.wait(5))
+            self.assertEqual(mgr.get(tid).state, "running")
+            mgr.cancel(tid)
+            end = time.time() + 5
+            while time.time() < end and mgr.get(tid).state == "running":
+                time.sleep(0.02)
+            self.assertEqual(mgr.get(tid).state, "canceled")
+        finally:
+            mgr.close()
+
+
+class TestPurgePartials(unittest.TestCase):
+    def test_removes_only_task_partials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = q.Task(1, spec(outdir=tmp))
+            raw = os.path.join(tmp, "video.mp4")
+            task.pstate["raw_path"] = raw
+            for p in (raw + ".part", raw + ".aria2",
+                      os.path.join(tmp, "other.part")):
+                with open(p, "wb") as f:
+                    f.write(b"x")
+            removed = q.purge_partials(task)
+            self.assertFalse(os.path.exists(raw + ".part"))
+            self.assertFalse(os.path.exists(raw + ".aria2"))
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "other.part")))
+            self.assertEqual(sorted(removed),
+                             sorted([raw + ".part", raw + ".aria2"]))
