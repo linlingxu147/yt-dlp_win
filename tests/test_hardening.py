@@ -885,23 +885,91 @@ class TestTaskControls(unittest.TestCase):
             self.assertFalse(any(r.get("task_id") == t.id for r in h.history))
             h.queue.close()
 
-    def test_ext_cookie_cleaned_on_pause_early_return(self):
+    def test_ext_cookie_survives_pause_and_is_cleaned_on_cancel(self):
+        """暂停只中断进程、不删临时 Cookie（续传要接着用）；取消才清理明文 jar。"""
         with tempfile.TemporaryDirectory() as tmp:
             mod, h = self.make_host(tmp)
             jar = os.path.join(tmp, "sniff_cookies.txt")
-            _write(jar, b"# Netscape HTTP Cookie File\n")
-            for flag in ("pause_requested", "cancel_requested"):
+
+            def make_task(tid, flag):
                 _write(jar, b"# Netscape HTTP Cookie File\n")
-                t = mod.ytdlp_queue.Task(1, {
+                t = mod.ytdlp_queue.Task(tid, {
                     "urls": ["http://e/a"], "outdir": tmp,
                     "cfg": dict(core.DEFAULT_CONFIG, outdir=tmp),
                     "ext_cookie_file": jar})
                 setattr(t, flag, True)
-                with mock.patch.object(mod.ytdlp_queue, "run_process",
-                                       return_value=(1, "", {})):
-                    h._exec_download(t)
-                self.assertFalse(os.path.exists(jar), flag)
+                return t
+
+            with mock.patch.object(mod.ytdlp_queue, "run_process",
+                                   return_value=(-1, "", {})):
+                h._exec_download(make_task(1, "pause_requested"))
+                self.assertTrue(os.path.exists(jar))     # 暂停保留 jar
+                h._exec_download(make_task(2, "cancel_requested"))
+                self.assertFalse(os.path.exists(jar))    # 取消清理 jar
             h.queue.close()
+
+    def test_ext_task_pause_keeps_cookie_jar_cancel_removes_it(self):
+        """host 队列级验证：扩展任务暂停后 jar 仍在，取消后删除。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            jar = os.path.join(tmp, "sniff_cookies.txt")
+            _write(jar, b"# Netscape HTTP Cookie File\n")
+
+            def blocking_run(task, cmd, cwd, on_line, stall_seconds=300):
+                end = time.time() + 5
+                while time.time() < end:
+                    if task.pause_requested or task.cancel_requested:
+                        return -1, "", {}
+                    time.sleep(0.02)
+                return 0, "", {}
+
+            with mock.patch.object(mod.ytdlp_queue, "run_process", blocking_run):
+                tid = h.submit_server_task(
+                    {"url": "http://e/a",
+                     "cfg": dict(core.DEFAULT_CONFIG, outdir=tmp,
+                                 _sniff_cookie_file=jar)})
+                self.assertTrue(tid)
+                self._wait_state(h, tid, ("running",))
+                self.assertTrue(h.queue.pause(tid))
+                self._wait_state(h, tid, ("paused",))
+                self.assertTrue(os.path.isfile(jar))     # 暂停：jar 必须还在
+                self.assertTrue(h.queue.resume(tid))
+                self._wait_state(h, tid, ("running",))
+                self.assertTrue(h.cancel_task(tid))
+                self._wait_state(h, tid, ("canceled",))
+                self.assertFalse(os.path.exists(jar))    # 取消：jar 清理
+            h.queue.close()
+
+    def test_stop_all_downloads_cleans_ext_cookie_jars(self):
+        """退出停止不留明文 Cookie：运行中、暂停、排队的临时 jar 全部删除。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            gate = threading.Event()
+
+            def blocker(task):
+                gate.wait(5)
+                task.exit_code = 0
+
+            jars, tids = {}, {}
+            for name in ("run", "pause", "queue"):
+                jar = os.path.join(tmp, name + "_cookies.txt")
+                _write(jar, b"# Netscape HTTP Cookie File\n")
+                jars[name] = jar
+                tids[name] = h.queue.submit(
+                    {"urls": ["http://e/" + name], "cfg": {"outdir": tmp},
+                     "outdir": tmp, "source": "ext", "ext_cookie_file": jar},
+                    blocker)
+            try:
+                self._wait_state(h, tids["run"], ("running",))
+                self.assertTrue(h.queue.pause(tids["pause"]))
+                self._wait_state(h, tids["pause"], ("paused",))
+                self.assertEqual(h.queue.get(tids["queue"]).state, "queued")
+                self.assertTrue(h.stop_all_downloads()["ok"])
+                for name, jar in jars.items():
+                    self.assertFalse(os.path.exists(jar), name)
+            finally:
+                gate.set()
+                h.queue.close()
 
     def test_update_run_always_emits_trodone(self):
         with tempfile.TemporaryDirectory() as tmp:

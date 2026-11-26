@@ -118,25 +118,46 @@ class QueueManager:
     def _loop(self):
         while True:
             started = None
+            failed = []
             with self._cv:
                 while not self._closed:
                     nxt = self._next_queued()
                     if nxt is not None and self._running < self._max:
-                        nxt.state = "running"
-                        nxt.started_at = time.time()
-                        self._running += 1
-                        threading.Thread(target=self._run_worker,
-                                         args=(nxt,), daemon=True).start()
-                        self._cv.notify_all()
-                        started = nxt
+                        started = self._start_task(nxt)
+                        if started is None:
+                            failed.append(nxt)   # 线程没起来：已标 failed，接着试下一个
                         break
                     self._cv.wait(0.2)
-                if self._closed:
-                    return
-            if started is not None:
-                self._emit({"type": "queue", "action": "state",
-                            "task": started.snapshot()})
+                closed = self._closed
+            for t in failed:
+                self._safe_emit({"type": "queue", "action": "state",
+                                 "task": t.snapshot()})
+            if failed:
                 self._emit_changed()
+            if closed:
+                return
+            if started is not None:
+                self._safe_emit({"type": "queue", "action": "state",
+                                 "task": started.snapshot()})
+                self._emit_changed()
+
+    def _start_task(self, task):
+        """调度锁内起 worker：线程起不来就收回槽位并把任务标 failed，调度器不退出。"""
+        task.state = "running"
+        task.started_at = time.time()
+        self._running += 1
+        try:
+            threading.Thread(target=self._run_worker, args=(task,),
+                             daemon=True).start()
+        except Exception:
+            self._running = max(0, self._running - 1)
+            task.state = "failed"
+            task.exit_code = -1
+            task.ended_at = time.time()
+            self._cv.notify_all()
+            return None
+        self._cv.notify_all()
+        return task
 
     def _next_queued(self):
         for i in self._order:
@@ -171,7 +192,7 @@ class QueueManager:
             self._cv.notify_all()
         if canceled and not task._no_purge:
             purge_partials(task)
-        self._emit({"type": "queue", "action": "state", "task": task.snapshot()})
+        self._safe_emit({"type": "queue", "action": "state", "task": task.snapshot()})
         self._emit_changed()
 
     # ---- 暂停 / 继续 / 取消 ----
@@ -257,10 +278,17 @@ class QueueManager:
             self._tasks.pop(i, None)
             self._order.remove(i)
 
+    def _safe_emit(self, ev):
+        """emit 是外部注入的回调：回调抛异常不能连带杀死调度/worker 线程。"""
+        try:
+            self._emit(ev)
+        except Exception:
+            pass
+
     def _emit_changed(self):
         s = self.snapshot()
-        self._emit({"type": "queue_changed", "running": s["running"],
-                    "queued": s["queued"]})
+        self._safe_emit({"type": "queue_changed", "running": s["running"],
+                         "queued": s["queued"]})
 
     def close(self):
         with self._cv:
@@ -280,7 +308,7 @@ def run_process(task, cmd, cwd, on_line, stall_seconds=300):
     except Exception:
         return None, "", {"reason": "spawn"}
     task.proc = proc
-    buf = []
+    buf = collections.deque(maxlen=300)   # 只留末尾 300 行，长任务不把整段输出攒在内存里
 
     def abort():
         return task.pause_requested or task.cancel_requested
@@ -298,7 +326,7 @@ def run_process(task, cmd, cwd, on_line, stall_seconds=300):
                 proc.stdout.close()
         except Exception:
             pass
-    return code, "\n".join(buf[-300:]), why
+    return code, "\n".join(buf), why
 
 
 def purge_partials(task):

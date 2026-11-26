@@ -250,10 +250,13 @@ class Host:
             return {"ok": False, "error": "无法创建输出目录：%s" % e}
         if bad_urls:
             self._log("[提示] 已忽略 %d 个无法识别的链接\n" % len(bad_urls), "warn")
+        todo = self._dedupe_urls(good, outdir)
+        if not todo:
+            return {"ok": False, "error": "这些链接已在队列中下载"}
         self.save_config(cfg)
         ids = []
         try:
-            for u in good:
+            for u in todo:
                 spec = {"urls": [u], "cfg": dict(cfg), "outdir": outdir,
                         "no_playlist": no_playlist, "source": "gui"}
                 ids.append(self.queue.submit(spec, self._exec_download))
@@ -265,6 +268,36 @@ class Host:
                                  % (len(ids), e)}
             return {"ok": False, "error": str(e)}
         return {"ok": True, "task_ids": ids}
+
+    def _active_task_has(self, url, outdir):
+        """队列里是否已有同 URL、同输出目录的未完成任务（排队/进行中/暂停）。
+
+        两个任务写同一个输出文件会互相覆盖，所以「同链接 + 同目录」只留一个。
+        """
+        if not url:
+            return False
+        for row in self.queue.snapshot()["tasks"]:
+            if (row["state"] in ("queued", "running", "paused")
+                    and row["outdir"] == outdir and url in (row["urls"] or ())):
+                return True
+        return False
+
+    def _dedupe_urls(self, urls, outdir):
+        """去掉本批重复链接（保序）与队列中已在下载的同链接，返回待入队列表。"""
+        seen, todo, skipped = set(), [], 0
+        for u in urls:
+            if u in seen:
+                skipped += 1
+                continue
+            seen.add(u)
+            if self._active_task_has(u, outdir):
+                skipped += 1
+                continue
+            todo.append(u)
+        if skipped:
+            self._log("[提示] 已跳过 %d 个重复链接（相同链接已在队列中下载）\n"
+                      % skipped, "warn")
+        return todo
 
     def _exec_download(self, task):
         cfg = task.cfg
@@ -286,10 +319,12 @@ class Host:
             # 暂停/取消早退先于启动失败分支：取消已由控制方法记历史，不能再走 _task_done
             if task.pause_requested or task.cancel_requested:
                 task.exit_code = -1 if code is None else code
-                if task.cancel_requested and task.ext_emit:
-                    # 运行中被取消：给扩展镜像补发 done（排队中取消由 cancel_task 补发）
-                    task.ext_emit({"type": "done", "code": task.exit_code})
-                self._clean_ext_cookie(task)
+                if task.cancel_requested:
+                    if task.ext_emit:
+                        # 运行中被取消：给扩展镜像补发 done（排队中取消由 cancel_task 补发）
+                        task.ext_emit({"type": "done", "code": task.exit_code})
+                    self._clean_ext_cookie(task)
+                # 暂停不删临时 Cookie：继续下载还要用它（done/failed/取消/退出才清）
                 return
             if code is None:
                 self._task_log(task, "启动失败\n", "err")
@@ -381,7 +416,10 @@ class Host:
                    "elapsed": round(elapsed, 1)})
 
     def _clean_ext_cookie(self, task):
-        """临时嗅探 Cookie 文件按任务清理（done/暂停/取消早退都走这里）。"""
+        """临时嗅探 Cookie 文件按任务清理：done/failed、取消、退出停止时才删。
+
+        暂停必须保留：继续下载要用同一个 jar 才能带上登录态。
+        """
         if task.ext_cookie_file and os.path.isfile(task.ext_cookie_file):
             try:
                 os.remove(task.ext_cookie_file)
@@ -441,6 +479,10 @@ class Host:
         spec = self._ext_spec(task)
         if spec is None:
             return None
+        for u in spec["urls"]:
+            if self._active_task_has(u, spec["outdir"]):
+                self._log("[提示] 跳过重复提交（相同链接已在队列中下载）：%s\n" % u, "warn")
+                return None
         try:
             tid = self.queue.submit(spec, self._exec_download)
         except ytdlp_queue.QueueFull:
@@ -537,7 +579,14 @@ class Host:
             if task is None or task.state not in ("running", "paused"):
                 continue
             self._record_task_history(task, "stopped")
+        active = [row["id"] for row in self.queue.snapshot()["tasks"]
+                  if row["state"] in ("running", "paused", "queued")]
         n = self.queue.stop_all(purge=False)
+        # 退出后不留明文 jar：被停/被清的任务（运行中、暂停、排队）都要删临时 Cookie
+        for tid in active:
+            task = self.queue.get(tid)
+            if task is not None:
+                self._clean_ext_cookie(task)
         return {"ok": True, "stopped": n}
 
     def _log_diag(self):
@@ -1059,9 +1108,12 @@ class Host:
             os.makedirs(outdir, exist_ok=True)
         except Exception as e:
             return {"ok": False, "error": "无法创建输出目录：%s" % e}
-        ids = []
+        ids, skipped = [], 0
         try:
             for it in items:
+                if self._active_task_has(it.get("url"), outdir):
+                    skipped += 1
+                    continue
                 c = dict(cfg)
                 if len(items) == 1:
                     if it.get("referer") or it.get("page_url"):
@@ -1076,6 +1128,11 @@ class Host:
                 ids.append(self.queue.submit(spec, self._exec_download))
         except ytdlp_queue.QueueFull as e:
             return {"ok": False, "error": str(e)}
+        if skipped:
+            self._log("[提示] 已跳过 %d 个重复链接（相同链接已在队列中下载）\n"
+                      % skipped, "warn")
+        if not ids:
+            return {"ok": False, "error": "这些链接已在队列中下载"}
         self._put({"type": "sniff_started"})
         return {"ok": True, "task_ids": ids}
 

@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import ytdlp_queue as q
@@ -244,6 +245,56 @@ class TestPauseResumeCancel(unittest.TestCase):
         while time.time() < end and self.mgr.any_active():
             time.sleep(0.02)
         self.assertFalse(self.mgr.any_active())
+
+
+class TestSchedulerRobustness(unittest.TestCase):
+    """调度线程不能被 emit 回调异常或线程创建失败打死。"""
+
+    def _wait(self, pred, timeout=3):
+        end = time.time() + timeout
+        while time.time() < end:
+            if pred():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_raising_emit_callback_keeps_scheduler_alive(self):
+        def picky(ev):
+            if ev.get("type") == "queue" and ev.get("action") == "state":
+                raise RuntimeError("emit 炸了")
+
+        mgr = q.QueueManager(max_concurrent=1, emit=picky)
+        exe = FakeExec()
+        try:
+            a = mgr.submit(spec("http://e/a"), exe)
+            self.assertTrue(self._wait(lambda: a in list(exe.running)))
+            exe.release()
+            self.assertTrue(self._wait(lambda: mgr.get(a).state == "done"))
+            # 调度器如果被 emit 异常打死，第二个任务永远不会开跑
+            b = mgr.submit(spec("http://e/b"), exe)
+            self.assertTrue(self._wait(lambda: b in list(exe.running)))
+        finally:
+            exe.release()
+            mgr.close()
+
+    def test_worker_thread_start_failure_fails_task_without_leaking_slot(self):
+        mgr = q.QueueManager(max_concurrent=1)
+        exe = FakeExec()
+        try:
+            with mock.patch.object(q.threading, "Thread",
+                                   side_effect=RuntimeError("线程起不来")):
+                a = mgr.submit(spec("http://e/a"), exe)
+                self.assertTrue(self._wait(lambda: mgr.get(a).state == "failed"))
+            self.assertEqual(mgr.get(a).exit_code, -1)
+            self.assertEqual(mgr.snapshot()["running"], 0)   # 槽位不泄漏
+            self.assertFalse(mgr.any_active())
+            b = mgr.submit(spec("http://e/b"), exe)          # 调度器还活着
+            self.assertTrue(self._wait(lambda: b in list(exe.running)))
+            exe.release()
+            self.assertTrue(self._wait(lambda: mgr.get(b).state == "done"))
+        finally:
+            exe.release()
+            mgr.close()
 
 
 class TestRunProcess(unittest.TestCase):

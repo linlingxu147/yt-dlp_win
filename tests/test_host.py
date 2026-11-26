@@ -234,6 +234,59 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual(r["task_ids"], [1])
         self.assertIn("已加入 1 个任务", r["error"])
 
+    def test_duplicate_urls_in_one_call_create_one_task(self):
+        """同一批里重复的链接只入队一次（并发写同名文件会互相覆盖）。"""
+        with mock.patch.object(self.mod.core, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod.core, "iter_lines_watch", fake_iter([])):
+            r = self.host.start_download(["https://x/v", "https://x/v"], self.cfg)
+            self.assertTrue(r["ok"], r)
+            self.assertEqual(len(r["task_ids"]), 1)
+            self._wait_task(r["task_ids"][0])
+        tasks = self.host.queue.snapshot()["tasks"]
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["urls"], ["https://x/v"])
+
+    def test_url_already_downloading_is_skipped(self):
+        """活动任务已占用同链接+同目录：再次提交被跳过；换目录不算重复。"""
+        started, release = threading.Event(), threading.Event()
+
+        def blocking_iter(proc, abort=None, keepalive=None, **kw):
+            started.set()
+            release.wait(5)
+            yield "[download] Destination: v.mp4"
+
+        with mock.patch.object(self.mod.core, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod.core, "iter_lines_watch", blocking_iter):
+            r = self.host.start_download(["https://x/v"], self.cfg)
+            self.assertTrue(r["ok"], r)
+            self.assertTrue(started.wait(5))
+            again = self.host.start_download(["https://x/v"], self.cfg)
+            self.assertFalse(again["ok"])
+            self.assertIn("队列中", again["error"])
+            other = dict(self.cfg, outdir=os.path.join(self.tmp.name, "out2"))
+            elsewhere = self.host.start_download(["https://x/v"], other)
+            self.assertTrue(elsewhere["ok"], elsewhere)
+            release.set()
+            self._wait_task(r["task_ids"][0])
+            self._wait_task(elsewhere["task_ids"][0])
+
+    def test_submit_server_task_skips_active_duplicate(self):
+        gate = threading.Event()
+
+        def exe(task):
+            gate.wait(5)
+            task.exit_code = 0
+
+        tid = self.host.queue.submit(
+            {"urls": ["https://x/v"], "cfg": dict(self.cfg),
+             "outdir": self.cfg["outdir"], "source": "ext"}, exe)
+        try:
+            self.assertFalse(self.host.submit_server_task(
+                {"url": "https://x/v", "cfg": dict(self.cfg)}))
+        finally:
+            gate.set()
+            self._wait_task(tid)
+
     def test_net_heal_retries_within_same_task(self):
         calls = []
         def spawn2(cmd, cwd=None):
@@ -643,6 +696,30 @@ class SniffServiceTest(unittest.TestCase):
         self.assertEqual(len(r["task_ids"]), 2)
         self.assertEqual([c["urls"] for c in captured],
                          [["https://cdn/a"], ["https://cdn/b"]])
+
+    def test_sniff_download_skips_active_duplicate(self):
+        """嗅探下载同样去重：活动任务已占用同链接+同目录时拒绝再入队。"""
+        outdir = os.path.join(self.tmp.name, "out")
+        self.host.cfg["outdir"] = outdir
+        gate = threading.Event()
+
+        def exe(task):
+            gate.wait(5)
+            task.exit_code = 0
+
+        tid = self.host.queue.submit(
+            {"urls": ["https://cdn/x"], "cfg": dict(self.host.cfg),
+             "outdir": outdir, "source": "gui"}, exe)
+        try:
+            r = self.host.sniff_download([{"url": "https://cdn/x"}])
+            self.assertFalse(r["ok"])
+            self.assertIn("队列中", r["error"])
+        finally:
+            gate.set()
+            end = time.time() + 5
+            while time.time() < end and self.host.queue.get(tid).state not in (
+                    "done", "failed"):
+                time.sleep(0.02)
 
     def test_sniff_download_blocked_while_updating(self):
         self.host.updating = True
