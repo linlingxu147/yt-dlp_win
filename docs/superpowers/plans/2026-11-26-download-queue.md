@@ -772,10 +772,9 @@ Expected: FAIL（start_download 仍返回旧结构 / 无 queue）
 
 - [ ] **Step 3: 实现 host 改造**
 
-`__init__` 末尾新增（保留旧字段供辅助操作过渡，下载相关字段移入 Task）：
+host.py 模块顶层（`import ytdlp_core as core` 之后）新增 `import ytdlp_queue`（**必须模块级**，`start_download` 会引用 `ytdlp_queue.QueueFull`）。`__init__` 末尾新增（保留旧字段供辅助操作过渡，下载相关字段移入 Task）：
 
 ```python
-        import ytdlp_queue
         self.queue = ytdlp_queue.QueueManager(
             max_concurrent=int(str(self.cfg.get("queue_n") or "2")),
             emit=self._put)
@@ -1630,7 +1629,7 @@ Expected: 全绿。
 2. 暂停一个任务 ≥5 分钟后继续：`.part`/`.aria2` 续传成功
 3. 扩展连提 2 个任务：被接收（运行或排队）而非 409；扩展「停止」不影响 GUI 任务
 4. 下载中点「更新 yt-dlp」被拒；探测/格式表可并行
-5. 单任务边下边播不回归；退出确认显示「N 下载中 / M 排队」
+5. （2026-11-26 修订：当前分支无播放态实现，跳过边下边播项）退出确认显示「N 下载中 / M 排队」
 6. 取消任务后 `.part` 被清理；历史出现 canceled 记录
 
 - [ ] **Step 4: 提醒用户重载**
