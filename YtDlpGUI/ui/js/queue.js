@@ -10,6 +10,7 @@ let cache = [];
 let selected = null;
 let follow = true;   // 默认跟随最新运行中任务；用户点行/看辅助日志后停用
 let busy = false;    // 辅助操作/更新占闸时，不用队列计数覆盖状态栏
+let reqSeq = 0;      // 连发快照请求时只认最新一次，避免旧结果盖掉新状态
 let onSelect = () => {};
 
 function detailText(t) {
@@ -114,8 +115,10 @@ function adopt(r) {
 }
 
 async function refresh() {
+  const my = ++reqSeq;
   try {
     const r = await call('queue_snapshot');
+    if (my !== reqSeq) return;   // 已有更新的快照在途
     adopt(r);
   } catch {
     /* 窗口收尾阶段取不到快照：保持现有列表 */
