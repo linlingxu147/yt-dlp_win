@@ -354,8 +354,9 @@ async function cookieJarFor(url) {
 // 提交成功后的面板文案：服务端排队时回 queue_position（1 起；0 = 立即开始），
 // 旧版服务没有该字段，沿用原提示。task_id 原样透传备用。
 function submitStatusMessage(resp) {
-    const pos = resp && resp.queue_position;
-    return pos ? `已加入队列，第 ${pos} 位` : "已交给 yt-dlp，开始下载…";
+    // 按数值判定：字符串 "0" 也是「不排队」，不能被非空字符串的真值骗过去
+    const pos = Number(resp && resp.queue_position);
+    return pos > 0 ? `已加入队列，第 ${pos} 位` : "已交给 yt-dlp，开始下载…";
 }
 
 async function submit(msg) {

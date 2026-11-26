@@ -230,7 +230,32 @@ function fire(listeners, name, ...args) {
   await sleep(80);
   assert.ok(oresp && oresp.ok && !/队列/.test(oresp.message || '')
             && /开始下载/.test(oresp.message || ''), '旧版服务（无 queue_position）沿用原提示');
-  log('8) 排队提示 / 未排队回退:', qresp.message, '|', nresp.message, '|', oresp.message);
+
+  // queue_position 按数值判定：字符串 "0" 不能因为非空字符串而被当成排队
+  storage.local = {};
+  let zresp = null;
+  w = loadWorker(storage, calls,
+                 sniffFetch({ ok: true, busy: false, url: 'x', task_id: 14, queue_position: '0' }));
+  fire(w.listeners, 'onMessage', { type: 'submit', url: 'https://cdn.example.com/t.mp4',
+                                   kind: 'media', referer: '', ua: 'UA' },
+       { tab: { id: 12 }, frameId: 0 }, (r) => { zresp = r; });
+  await sleep(80);
+  assert.ok(zresp && zresp.ok && !/队列/.test(zresp.message || '') && /开始下载/.test(zresp.message || ''),
+            '字符串 "0" 不算排队');
+
+  // 字符串数字仍按数值处理（服务端字段类型变化时不丢提示）
+  storage.local = {};
+  let sresp = null;
+  w = loadWorker(storage, calls,
+                 sniffFetch({ ok: true, busy: false, url: 'x', task_id: 15, queue_position: '2' }));
+  fire(w.listeners, 'onMessage', { type: 'submit', url: 'https://cdn.example.com/u.mp4',
+                                   kind: 'media', referer: '', ua: 'UA' },
+       { tab: { id: 13 }, frameId: 0 }, (r) => { sresp = r; });
+  await sleep(80);
+  assert.ok(sresp && sresp.ok && /队列/.test(sresp.message || '') && /2/.test(sresp.message || ''),
+            '字符串 "2" 仍提示排队第 2 位');
+  log('8) 排队提示 / 未排队回退:', qresp.message, '|', nresp.message, '|', oresp.message,
+      '|', zresp.message, '|', sresp.message);
 
   console.log('\nOK  扩展冒烟全部通过（8 项）');
   process.exit(0);
