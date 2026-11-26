@@ -674,7 +674,7 @@ BROWSER_NATIVE_EXT = (".mp4", ".m4v", ".webm", ".m4a", ".mp3", ".ogg", ".oga", "
 
 
 def stream_http_headers(cfg):
-    """把 UA / Referer / Cookie 拼成 ffmpeg、ffprobe 的 -headers 值。
+    """把 UA / Referer / Cookie 拼成 ffmpeg 的 -headers 值。
 
     直链站点多半靠 Referer 防盗链：不带它，服务器回 403 或一段错误页，
     ffmpeg 就会「读到了但不是视频」。
@@ -693,19 +693,21 @@ def stream_http_headers(cfg):
 
 
 def _run_stream_tool(cmd, timeout):
-    """跑一次 ffmpeg/ffprobe，返回 (是否成功, 合并输出)。
+    """跑一次 ffmpeg，返回 (是否成功, 合并输出)。
 
+    ffmpeg -i 的 Duration 打在 stderr 上、stdout 基本为空，两者都要收；
+    读头时故意不带输出文件，退出码必为 1，成功与否由调用方看输出判断。
     超时必须 kill_tree：ffmpeg 会挂住等切片的子请求，terminate 常常杀不干净。
     """
     try:
         proc = spawn(cmd)
     except FileNotFoundError:
-        return False, "找不到 ffmpeg / ffprobe"
+        return False, "找不到 ffmpeg"
     except Exception as e:
         return False, str(e)
     try:
-        out, _ = proc.communicate(timeout=timeout)
-        return proc.returncode == 0, (out or "")
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode == 0, decode_bytes((out or b"") + (err or b""))
     except subprocess.TimeoutExpired:
         kill_tree(proc)
         try:
@@ -742,26 +744,27 @@ def browser_can_play_url(url):
     return os.path.splitext(path)[1] in BROWSER_NATIVE_EXT
 
 
+_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
+
+
+def _parse_duration_text(text):
+    """从 ffmpeg 日志里抠出时长（秒）；直播流的 Duration: N/A 自然落空。"""
+    m = _DURATION_RE.search(text or "")
+    if not m:
+        return None
+    h, mnt, sec = m.groups()
+    return int(h) * 3600 + int(mnt) * 60 + float(sec)
+
+
 def stream_duration(url, cfg=None, timeout=20):
     """问一下流有多长（秒）；问不出来返回 None（m3u8 直播流就会是 None）。"""
     h = stream_http_headers(cfg)
-    cmd = [find_tool("ffprobe.exe"), "-v", "error",
-           "-show_entries", "format=duration", "-of", "csv=p=0"]
+    cmd = [find_tool("ffmpeg.exe"), "-hide_banner"]
     if h:
         cmd += ["-headers", h]
     cmd += ["-i", url]
-    ok, out = _run_stream_tool(cmd, timeout)
-    if not ok:
-        return None
-    for line in out.splitlines():
-        line = line.strip()
-        if not line or line == "N/A":
-            continue
-        try:
-            return float(line)
-        except ValueError:
-            continue
-    return None
+    _ok, out = _run_stream_tool(cmd, timeout)
+    return _parse_duration_text(out)
 
 
 def grab_stream_frame(url, cfg, out_path, at=1.0, timeout=SNIFF_FRAME_TIMEOUT):
@@ -802,32 +805,23 @@ def grab_stream_clip(url, cfg, out_path, seconds=SNIFF_CLIP_SECONDS,
 
 
 def probe_playable(path, timeout=6):
-    """让 ffprobe 读正在增长的文件，读得到流才算能播。只读不转码。"""
+    """让 ffmpeg 读正在增长的文件，读得到时长才算能播。只读不转码。"""
     if not os.path.isfile(path):
         return {"ok": False, "reason": "文件还没写出来"}
-    cmd = [find_tool("ffprobe.exe"), "-v", "error", "-show_entries", "format=duration",
-           "-of", "default=nw=1:nk=1", path]
-    kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
-    if hasattr(subprocess, "STARTUPINFO"):      # 与 spawn/kill_tree 同口径，非 Windows 也不炸
-        kwargs["creationflags"] = CREATE_NO_WINDOW
-    try:
-        proc = subprocess.Popen(cmd, **kwargs)
-    except OSError as e:
-        return {"ok": False, "reason": f"ffprobe 不可用：{e}"}
-    try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_tree(proc)
-        try:
-            proc.communicate(timeout=5)
-        except Exception:
-            pass
-        return {"ok": False, "reason": "ffprobe 超时"}
-    text = decode_bytes(out or b"").strip()
-    if proc.returncode != 0 or not text:
-        lines = decode_bytes(err or b"").strip().splitlines()
-        return {"ok": False, "reason": lines[0] if lines else "读不到媒体信息"}
-    return {"ok": True, "reason": ""}
+    ok, out = _run_stream_tool(
+        [find_tool("ffmpeg.exe"), "-hide_banner", "-i", path], timeout)
+    if _parse_duration_text(out) is not None:
+        return {"ok": True, "reason": ""}
+    if out == "超时":
+        return {"ok": False, "reason": "ffmpeg 超时"}
+    if out.startswith("找不到 ffmpeg"):
+        return {"ok": False, "reason": out}
+    lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    for ln in lines:
+        low = ln.lower()
+        if any(k in low for k in ("error", "invalid", "moov", "failed", "could not")):
+            return {"ok": False, "reason": ln}
+    return {"ok": False, "reason": "读不到媒体时长"}
 
 
 def make_preview_link(real_path, outdir):

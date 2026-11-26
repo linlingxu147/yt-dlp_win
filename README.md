@@ -58,7 +58,7 @@
 cookie 会写成临时文件传给 yt-dlp，任务结束即删除。
 
 每条结果现在带**缩略图、时长、试播**：直链没有封面元数据，缩略图和时长是让本机
-ffmpeg/ffprobe 现场截一帧、读一次头拿到的（mp4 等浏览器原生能解的容器直接在面板里
+ffmpeg 现场截一帧、读一次头拿到的（mp4 等浏览器原生能解的容器直接在面板里
 播放原地址；m3u8/mpd 先抓 6 秒片段再播）。截图与片段走本机服务缓存，同一条第二次几乎
 瞬时。**下载途中**列表上方还会出现「边下边播」，用系统播放器打开正在增长的文件。
 
@@ -94,7 +94,7 @@ webRequest 全都能看见——以前它们会挤满列表，几千个条目谁
 
 - 音视频分离的源（YouTube 高清等，`bv*+ba/b`）——两个 `.part` 都不是完整片子；
 - 开了 aria2c 外部下载器——文件布局不可控；
-- ffprobe 读不到流——例如渐进式 mp4 的索引在文件末尾，要下完才能播。
+- ffmpeg 读不到时长——例如渐进式 mp4 的索引在文件末尾，要下完才能播。
 
 这个开关**不改任何下载参数**：HLS 的 `.part` 本来就是 mpegts（下载途中就能播），
 收尾仍由 yt-dlp 自己的 `FixupM3u8` 修回 mp4。实测开关开/关的最终文件 sha256 相同。
@@ -108,8 +108,7 @@ webRequest 全都能看见——以前它们会挤满列表，几千个条目谁
 yt-dlp_win\
 ├─ yt-dlp.exe                  # 上游发行版（onedir 打包），升级见下文
 ├─ _internal\                  # yt-dlp.exe 的依赖目录（勿删）
-├─ ffmpeg.exe                  # 合并音视频 / 转码用
-├─ ffprobe.exe                 # 元数据探测（yt-dlp 部分功能会调用）
+├─ ffmpeg.exe                  # 自编译裁剪版：合并 / 转码 / 截帧 / mp3 提取
 ├─ ytdlp_core.py               # ★ 共享核心：命令构建、配置读写、诊断规则、进度解析
 ├─ YtDlpGUI\                   # 桌面版（pywebview + Web 前端）
 │   ├─ main.py                 # 薄入口：建窗、装配 host/api、内嵌扩展服务
@@ -136,6 +135,7 @@ yt-dlp_win\
 │   ├─ test_server.py          # 服务端接口与并发闸门
 │   ├─ test_host.py            # 桌面宿主：事件泵/历史/流水线/预览播放/嗅探
 │   ├─ test_api.py             # js_api 方法面与输入校验
+│   ├─ fixtures\               # 探针测试用的 3 秒小样片（mkv/webm/ts/mp4）
 │   └─ extension_smoke.js      # 扩展后台冒烟（Node + 假 chrome API）
 └─ downloads\                  # 默认下载目录
 ```
@@ -269,6 +269,8 @@ node tests\extension_smoke.js
 
 ## 目录维护记录
 
+- `2026-11-26`：`ffprobe.exe` 退役、`ffmpeg.exe` 换为自编译裁剪版；原全量构建移到
+  `..\yt-dlp_removed_20261126\`。
 - 已移出发布目录（保留在 `..\yt-dlp_removed_20261104\`）：`ffplay.exe`、`ffmpeg-master-latest-win64-lgpl\`
   （上游文档目录，本项目代码零引用）。
 - 开发备忘与 Playwright 测试脚手架已移到 `..\yt-dlp_win_dev_notes\`（`2026-11-01` / `2026-11-04` 备忘、nettest）。
@@ -281,7 +283,7 @@ node tests\extension_smoke.js
 | 组件 | 说明 |
 | --- | --- |
 | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Unlicense；本目录为官方 Windows onedir 发行包 |
-| [FFmpeg](https://ffmpeg.org/) | LGPL/GPL 视具体构建；随包分发请遵守其许可 |
+| [FFmpeg](https://ffmpeg.org/) | LGPL；本项目自编译裁剪版（静态链接 LAME / libxml2 / zlib） |
 | [pywebview](https://pywebview.flowrl.com/) | BSD-3；桌面窗口承载 Web 界面（首次启动自动安装，依赖系统 WebView2） |
 | `curl_cffi` / `websockets` / `pycryptodome` / `certifi` | 见 `_internal\THIRD_PARTY_LICENSES.txt` |
 

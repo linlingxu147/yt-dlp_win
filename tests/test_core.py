@@ -909,8 +909,8 @@ class TestPreviewFields(unittest.TestCase):
 
 
 FFMPEG = os.path.join(ROOT, "ffmpeg.exe")
-FFPROBE = os.path.join(ROOT, "ffprobe.exe")
-HAS_FFMPEG = os.path.isfile(FFMPEG) and os.path.isfile(FFPROBE)
+FIXTURES = os.path.join(ROOT, "tests", "fixtures")
+HAS_FFMPEG = os.path.isfile(FFMPEG)
 
 
 class TestPlayHelpers(unittest.TestCase):
@@ -987,21 +987,16 @@ class TestPlayHelpers(unittest.TestCase):
         core.clear_preview_links("Z:/definitely/not/here")
 
 
-@unittest.skipUnless(HAS_FFMPEG, "需要随包 ffmpeg/ffprobe")
+@unittest.skipUnless(HAS_FFMPEG, "需要随包 ffmpeg")
 class TestProbePlayableReal(unittest.TestCase):
     """把设计阶段的探针固化成测试：截断的 mkv/webm/ts 可读，mp4 不可读。"""
 
-    def _make(self, d, name, extra):
-        out = os.path.join(d, name)
-        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error",
-               "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10",
-               "-f", "lavfi", "-i", "sine=frequency=440", "-t", "6"] + extra + ["-y", out]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                       creationflags=core.CREATE_NO_WINDOW, timeout=120)
-        return out
-
-    def _truncate(self, src, pct):
-        dst = src + ".partial"
+    def _truncate(self, name, pct=40):
+        if not hasattr(self, "_tmp"):
+            self._tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(self._tmp.cleanup)
+        src = os.path.join(FIXTURES, name)
+        dst = os.path.join(self._tmp.name, name + ".partial")
         with open(src, "rb") as f:
             data = f.read()
         with open(dst, "wb") as f:
@@ -1009,26 +1004,18 @@ class TestProbePlayableReal(unittest.TestCase):
         return dst
 
     def test_mkv_partial_is_playable(self):
-        with tempfile.TemporaryDirectory() as d:
-            src = self._make(d, "a.mkv", ["-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac"])
-            self.assertTrue(core.probe_playable(self._truncate(src, 40))["ok"])
+        self.assertTrue(core.probe_playable(self._truncate("probe.mkv"))["ok"])
 
     def test_webm_partial_is_playable(self):
-        with tempfile.TemporaryDirectory() as d:
-            src = self._make(d, "a.webm", ["-c:v", "libvpx", "-b:v", "200k", "-c:a", "libopus"])
-            self.assertTrue(core.probe_playable(self._truncate(src, 40))["ok"])
+        self.assertTrue(core.probe_playable(self._truncate("probe.webm"))["ok"])
 
     def test_mpegts_partial_is_playable(self):
-        with tempfile.TemporaryDirectory() as d:
-            src = self._make(d, "a.ts", ["-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac", "-f", "mpegts"])
-            self.assertTrue(core.probe_playable(self._truncate(src, 40))["ok"])
+        self.assertTrue(core.probe_playable(self._truncate("probe.ts"))["ok"])
 
     def test_mp4_partial_is_not_playable(self):
-        with tempfile.TemporaryDirectory() as d:
-            src = self._make(d, "a.mp4", ["-c:v", "mpeg4", "-q:v", "5", "-c:a", "aac"])
-            v = core.probe_playable(self._truncate(src, 40))
-            self.assertFalse(v["ok"])
-            self.assertTrue(v["reason"])
+        v = core.probe_playable(self._truncate("probe.mp4"))
+        self.assertFalse(v["ok"])
+        self.assertTrue(v["reason"])
 
 
 class TestPlayWhileCmd(unittest.TestCase):

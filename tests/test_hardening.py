@@ -240,15 +240,16 @@ def _write(path, data):
 class _FakeProc(object):
     """替身进程：communicate() 直接回预置输出，可选在「跑」的时候造个文件。"""
 
-    def __init__(self, out=b"", rc=0, side=None):
+    def __init__(self, out=b"", err=b"", rc=0, side=None):
         self._out = out
+        self._err = err
         self.returncode = rc
         self._side = side
 
     def communicate(self, timeout=None):
         if self._side:
             self._side()
-        return self._out, b""
+        return self._out, self._err
 
 
 class TestStreamPreviewHelpers(unittest.TestCase):
@@ -281,15 +282,44 @@ class TestStreamPreviewHelpers(unittest.TestCase):
                     "https://cdn/stream", "not a url"):
             self.assertFalse(core.browser_can_play_url(url), url)
 
-    def test_duration_is_parsed_from_ffprobe_csv(self):
-        with mock.patch.object(core, "spawn", return_value=_FakeProc(b"1800.00059\n")):
-            self.assertAlmostEqual(core.stream_duration("https://cdn/a.m3u8"), 1800.00059)
+    def test_duration_is_parsed_from_ffmpeg_stderr(self):
+        out = b"  Duration: 00:30:00.00, start: 0.000000, bitrate: 123 kb/s\n"
+        with mock.patch.object(core, "spawn", return_value=_FakeProc(err=out)) as sp:
+            self.assertAlmostEqual(core.stream_duration("https://cdn/a.m3u8"), 1800.0)
+        self.assertIn("ffmpeg.exe", sp.call_args[0][0][0])
+        self.assertNotIn("ffprobe", " ".join(sp.call_args[0][0]))
+
+    def test_duration_supports_fractional_seconds(self):
+        out = b"  Duration: 00:00:01.50, start: 0.000000, bitrate: 1 kb/s\n"
+        with mock.patch.object(core, "spawn", return_value=_FakeProc(err=out)):
+            self.assertAlmostEqual(core.stream_duration("https://cdn/a.m3u8"), 1.5)
 
     def test_duration_is_none_for_live_streams(self):
-        with mock.patch.object(core, "spawn", return_value=_FakeProc(b"N/A\n")):
+        live = b"  Duration: N/A, start: 0.000000, bitrate: N/A\n"
+        with mock.patch.object(core, "spawn", return_value=_FakeProc(err=live, rc=1)):
             self.assertIsNone(core.stream_duration("https://cdn/a.m3u8"))
-        with mock.patch.object(core, "spawn", return_value=_FakeProc(b"", rc=1)):
+        with mock.patch.object(core, "spawn", return_value=_FakeProc(rc=1)):
             self.assertIsNone(core.stream_duration("https://cdn/a.m3u8"))
+
+    def _dummy_media(self, name):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, name)
+        with open(p, "wb") as f:
+            f.write(b"x")
+        return p
+
+    def test_probe_playable_accepts_ffmpeg_duration(self):
+        out = b"  Duration: 00:00:03.00, start: 0.000000, bitrate: 1 kb/s\n"
+        with mock.patch.object(core, "spawn", return_value=_FakeProc(err=out)) as sp:
+            self.assertTrue(core.probe_playable(self._dummy_media("a.mkv"))["ok"])
+        self.assertIn("ffmpeg.exe", sp.call_args[0][0][0])
+
+    def test_probe_playable_reports_ffmpeg_error(self):
+        err = b"[mov,mp4,m4a,3gp,3g2,mj2 @ 0] moov atom not found\n"
+        with mock.patch.object(core, "spawn", return_value=_FakeProc(err=err, rc=1)):
+            v = core.probe_playable(self._dummy_media("a.mp4"))
+        self.assertFalse(v["ok"])
+        self.assertIn("moov", v["reason"])
 
     def test_frame_requires_a_non_empty_file(self):
         d = tempfile.mkdtemp()
