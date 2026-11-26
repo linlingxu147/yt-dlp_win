@@ -1,6 +1,6 @@
 import { call, on } from './bridge.js';
 
-const STATUS = { ok: '成功', failed: '失败', stopped: '已停止' };
+const STATUS = { ok: '成功', failed: '失败', stopped: '已停止', canceled: '已取消' };
 const SOURCE = { gui: '桌面', ext: '扩展', sniff: '嗅探页' };
 
 async function refresh() {
@@ -24,11 +24,14 @@ async function refresh() {
       tr.appendChild(td);
     }
     const tdOp = document.createElement('td');
+    // failed/stopped 的 .part 还在：同一入口续传（yt-dlp 自动复用 .part）
+    const resumable = rec.status === 'failed' || rec.status === 'stopped';
     const re = document.createElement('button');
-    re.textContent = '重新下载';
+    re.textContent = resumable ? '继续下载' : '重新下载';
     re.addEventListener('click', async () => {
       const res = await call('history_redownload', i);
-      if (!res.ok) window.__toast(res.error || '无法重下', 'err');
+      if (!res.ok) window.__toast(res.error || '无法下载', 'err');
+      else window.__toast(`已加入 ${(res.task_ids || []).length} 个任务`);
     });
     const open = document.createElement('button');
     open.textContent = '打开目录';

@@ -79,7 +79,30 @@ button:disabled { opacity: .5; cursor: default; }
 #status[data-tone="warn"] { color: var(--warn); }
 
 progress { flex: 1; block-size: 14px; }
-#prog-pct { font-weight: 600; min-inline-size: 48px; text-align: end; }
+
+/* 任务队列：行内 标题/徽标/进度/速度/操作；选中行边框高亮 */
+#queue-list { display: grid; gap: 4px; max-block-size: 240px; overflow: auto; }
+.task-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); cursor: pointer;
+}
+.task-row.selected { border-color: var(--accent); }
+.task-row .ellipsis {
+  flex: 1; min-inline-size: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.task-row progress { flex: 0 0 120px; }
+.task-row .hint { flex: 0 1 auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-row button { padding: 2px 8px; font-size: 12px; }
+.badge {
+  font-size: 12px; padding: 0 8px; border-radius: 10px; white-space: nowrap;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.badge.running { color: var(--accent); border-color: var(--accent); }
+.badge.paused { color: var(--warn); border-color: var(--warn); }
+.badge.done { color: var(--ok); border-color: var(--ok); }
+.badge.failed { color: var(--err); border-color: var(--err); }
 
 /* 表格：语义 table + sticky 表头；wrapper 键盘可滚 */
 .table-wrapper {

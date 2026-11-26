@@ -258,6 +258,11 @@ class Host:
                         "no_playlist": no_playlist, "source": "gui"}
                 ids.append(self.queue.submit(spec, self._exec_download))
         except ytdlp_queue.QueueFull as e:
+            # 部分入队：已加入的任务留在队列里照常执行，只把剩余未加入的情况报给界面
+            if ids:
+                return {"ok": False, "task_ids": ids,
+                        "error": "队列已满：已加入 %d 个任务，其余未加入（%s）"
+                                 % (len(ids), e)}
             return {"ok": False, "error": str(e)}
         return {"ok": True, "task_ids": ids}
 
@@ -521,12 +526,15 @@ class Host:
         return self.cancel_task(tid)
 
     def stop_all_downloads(self):
-        """全部停止/退出：运行中记 stopped 并保留部分下载；排队直接丢弃（spec §4）。"""
+        """全部停止/退出：运行中与已暂停记 stopped 并保留部分下载；排队直接丢弃（spec §4）。
+
+        暂停任务已有 .part，必须记一条 stopped 历史，否则退出后无法从历史「继续下载」。
+        """
         for row in self.queue.snapshot()["tasks"]:
-            if row["state"] != "running":
+            if row["state"] not in ("running", "paused"):
                 continue
             task = self.queue.get(row["id"])
-            if task is None or task.state != "running":
+            if task is None or task.state not in ("running", "paused"):
                 continue
             self._record_task_history(task, "stopped")
         n = self.queue.stop_all(purge=False)

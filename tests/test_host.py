@@ -230,6 +230,9 @@ class DownloadTest(unittest.TestCase):
         r = self.host.start_download(["https://x/a", "https://x/b"], self.cfg)
         self.assertFalse(r["ok"])
         self.assertIn("队列已满", r["error"])
+        # 部分入队：已排上的任务保留，提示里带数量（前端 toast 直接显示）
+        self.assertEqual(r["task_ids"], [1])
+        self.assertIn("已加入 1 个任务", r["error"])
 
     def test_net_heal_retries_within_same_task(self):
         calls = []

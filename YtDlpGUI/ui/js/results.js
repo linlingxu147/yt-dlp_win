@@ -125,6 +125,7 @@ export function initResults({ download, dialogs }) {
     if (!urls.length) { dialogs.toast('请至少勾选一个条目', 'err'); return; }
     const r = await call('start_download', urls, download.collectCfg(), true);
     if (!r.ok) dialogs.toast(r.error || '无法开始下载', 'err');
+    else dialogs.toast(`已加入 ${(r.task_ids || []).length} 个任务`);
   });
   document.getElementById('btn-pv-open').addEventListener('click', () =>
     call('open_url', previewUrl));

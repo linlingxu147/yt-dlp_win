@@ -7,6 +7,7 @@ import { initResults } from './results.js';
 import { initDialogs } from './dialogs.js';
 import { initSniff } from './sniff.js';
 import { initHistory } from './history.js';
+import { initQueue } from './queue.js';
 
 await ready;
 initTheme();
@@ -16,43 +17,29 @@ const download = initDownload({ dialogs, results: {}, tabs });
 window.__collectCfg = download.collectCfg;
 const results = initResults({ download, dialogs });
 initLog();
+const queue = initQueue({ dialogs });
 
 const r = await call('get_config');
 download.applyConfig(r.cfg, r);
 
-on('progress', ev => {
-  document.getElementById('prog-bar').value = ev.pct;
-  document.getElementById('prog-pct').textContent = Math.round(ev.pct) + '%';
-  document.getElementById('prog-file').textContent = '正在下载：' + (ev.file || '');
-  const bits = [];
-  if (ev.speed) bits.push('速度 ' + ev.speed);
-  if (ev.eta) bits.push('剩余 ' + ev.eta);
-  if (ev.size) bits.push('大小 ' + ev.size);
-  if (ev.item_total) bits.push(`第 ${Math.max(ev.item_i, 1)}/${ev.item_total} 个`);
-  if (ev.done_count) bits.push(`已完成 ${ev.done_count} 个文件`);
-  document.getElementById('prog-detail').textContent = bits.join('   ·   ') || '—';
-});
+// 辅助操作（探测/排障/格式）的输出是公共日志：切到公共视图再发起
+function showAuxLog() { queue.select(null); }
+
 on('status', ev => {
   const el = document.getElementById('status');
   el.textContent = ev.text;
   el.dataset.tone = ev.tone;
 });
 on('task', ev => {
-  document.getElementById('btn-start').disabled = ev.busy;
+  document.getElementById('btn-start').disabled = ev.kind === 'update';
   document.getElementById('btn-detect').disabled = ev.busy;
   document.getElementById('btn-trouble').disabled = ev.busy;
-  document.getElementById('btn-update').disabled = ev.busy;
   document.getElementById('btn-formats').disabled = ev.busy;
-  document.getElementById('btn-stop').disabled = !ev.busy;
+  document.getElementById('btn-update').disabled = ev.busy || ev.downloading;
+  document.getElementById('btn-stop').disabled = !ev.downloading;
 });
 on('done', ev => {
-  if (ev.code === 0) {
-    document.getElementById('prog-bar').value = 100;
-    document.getElementById('prog-pct').textContent = '100%';
-    document.getElementById('prog-file').textContent = '全部完成';
-  } else {
-    document.getElementById('prog-file').textContent = '出错或中断 — 见日志中的原因与建议';
-  }
+  if (ev.code !== 0) dialogs.toast('任务 ' + (ev.task_id ?? '') + ' 失败或中断，见日志', 'err');
 });
 
 // ---------------- 工具栏 ----------------
@@ -76,19 +63,25 @@ document.getElementById('btn-start').addEventListener('click', async () => {
     if (!ok) return;
   }
   const res = await call('start_download', urls, cfg);
-  if (!res.ok) dialogs.toast(res.error || '无法开始下载', 'err');
+  if (!res.ok) { dialogs.toast(res.error || '无法开始下载', 'err'); return; }
+  dialogs.toast(`已加入 ${(res.task_ids || []).length} 个任务`);
 });
 document.getElementById('btn-detect').addEventListener('click', async () => {
   const urls = urlsOrToast();
   if (!urls) return;
   results.clear();
+  showAuxLog();
   const res = await call('detect', urls, download.collectCfg());
   if (!res.ok) dialogs.toast(res.error || '无法探测', 'err');
 });
-document.getElementById('btn-stop').addEventListener('click', () => call('stop'));
+document.getElementById('btn-stop').addEventListener('click', async () => {
+  const res = await call('stop_all');
+  if (!res.ok) dialogs.toast(res.error || '停止失败', 'err');
+});
 document.getElementById('btn-trouble').addEventListener('click', async () => {
   const urls = urlsOrToast();
   if (!urls) return;
+  showAuxLog();
   const res = await call('troubleshoot', urls, download.collectCfg());
   if (!res.ok) dialogs.toast(res.error || '无法排障', 'err');
 });
@@ -121,6 +114,7 @@ document.getElementById('btn-formats').addEventListener('click', async () => {
     document.getElementById('fmt').value = fid;
     dialogs.toast('已选择格式：' + fid);
   });
+  showAuxLog();
   const res = await call('fetch_formats', urls[0], download.collectCfg());
   if (!res.ok) dialogs.toast(res.error || '无法读取格式', 'err');
 });

@@ -60,8 +60,13 @@ export function initDialogs() {
     tail.textContent = ev.code !== 0 ? '（读取失败）' : `共 ${ev.lines.length} 行`;
     ftext.appendChild(tail);
   });
-  on('exit_confirm', async () => {
-    const ok = await confirm('退出', '仍有任务在进行，确定退出吗？', '退出');
+  on('exit_confirm', async (ev) => {
+    // 后端只在「有活跃任务」时发；纯辅助操作（探测/更新）时计数为 0，用通用文案
+    let text = (ev && ev.text) || '';
+    if (!text || /^0 个下载中 \/ 0 个排队/.test(text)) {
+      text = '有任务正在进行，退出将停止。';
+    }
+    const ok = await confirm('退出', text, '退出');
     if (ok) window.pywebview.api.exit();
   });
   return { toast, confirm, openFormats };

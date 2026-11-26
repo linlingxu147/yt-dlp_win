@@ -815,6 +815,25 @@ class TestTaskControls(unittest.TestCase):
             self.assertEqual(h.queue.get(tid2).state, "canceled")
             self.assertFalse(any(r.get("task_id") == tid2 for r in h.history))
 
+    def test_shutdown_records_stopped_for_paused_and_keeps_partials(self):
+        """暂停任务也有 .part：退出要记 stopped 供历史续传，不能悄悄丢弃。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            mod, h = self.make_host(tmp)
+            part = os.path.join(tmp, "v.mp4.part")
+            _write(part, b"x")
+            started = threading.Event()
+            tid = self._submit(h, tmp, exe=self._blocking_exec(started=started))
+            self.assertTrue(started.wait(5))
+            self.assertTrue(h.queue.pause(tid))
+            self._wait_state(h, tid, ("paused",))
+            h.shutdown()
+            self._wait_state(h, tid, ("canceled",))
+            self.assertTrue(os.path.isfile(part))           # 退出保留 .part
+            recs = [r for r in h.history if r.get("task_id") == tid]
+            self.assertEqual(len(recs), 1)
+            self.assertEqual(recs[0]["status"], "stopped")
+            self.assertEqual(recs[0]["urls"], ["http://e/a"])
+
     def test_api_cancel_purges_partials_and_records_canceled(self):
         import importlib
         api_mod = importlib.import_module("api")

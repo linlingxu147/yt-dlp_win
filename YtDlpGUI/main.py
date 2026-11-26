@@ -129,7 +129,9 @@ def main():
 
     def on_closing():
         snap = host.queue.snapshot()
-        if host.aux_kind or host.updating or snap["running"] or snap["queued"]:
+        # 暂停任务也算活跃（有 .part、退出要记 stopped），不能悄悄关掉
+        if (host.aux_kind or host.updating or snap["running"] or snap["queued"]
+                or snap["paused"]):
             host._put({"type": "exit_confirm",
                        "text": "%d 个下载中 / %d 个排队，退出将停止全部任务。"
                                % (snap["running"], snap["queued"])})

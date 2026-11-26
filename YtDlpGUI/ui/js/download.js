@@ -14,6 +14,7 @@ const FIELDS = {
   thumb: ['thumb', 'bool'], meta: ['meta', 'bool'],
   rate: ['rate', 'text'], proxy: ['proxy', 'text'], update_mirror: ['update_mirror', 'text'],
   cookie: ['cookie', 'text'],
+  queue_n: ['queue_n', 'text'],
   conc: ['conc', 'bool'], conc_n: ['conc_n', 'text'],
   aria: ['aria', 'bool'], aria_args: ['aria_args', 'text'],
   flat: ['flat', 'bool'], extra: ['extra', 'text'], ext_service: ['ext_service', 'bool'],

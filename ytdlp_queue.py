@@ -89,8 +89,9 @@ class QueueManager:
                      if i in self._tasks]
             running = sum(1 for t in self._tasks.values() if t.state == "running")
             queued = sum(1 for t in self._tasks.values() if t.state == "queued")
+            paused = sum(1 for t in self._tasks.values() if t.state == "paused")
             return {"tasks": tasks, "running": running, "queued": queued,
-                    "max": self._max}
+                    "paused": paused, "max": self._max}
 
     def set_max(self, n):
         with self._cv:

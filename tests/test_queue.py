@@ -210,6 +210,8 @@ class TestPauseResumeCancel(unittest.TestCase):
         self.mgr.pause(a)
         self.assertTrue(self.wait_state(a, "paused"))
         self.assertTrue(self.wait_state(b, "running"))
+        # 退出确认要能看到暂停也算活跃：snapshot 必须有 paused 计数
+        self.assertEqual(self.mgr.snapshot()["paused"], 1)
 
     def test_resume_goes_to_front(self):
         a = self.mgr.submit(spec("http://e/a"), self.exe)
