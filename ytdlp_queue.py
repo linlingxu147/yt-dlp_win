@@ -164,10 +164,86 @@ class QueueManager:
             else:
                 task.state = "failed"
             task.ended_at = time.time()
+            canceled = task.state == "canceled"
             self._trim_finished()
             self._cv.notify_all()
+        if canceled:
+            purge_partials(task)
         self._emit({"type": "queue", "action": "state", "task": task.snapshot()})
         self._emit_changed()
+
+    # ---- 暂停 / 继续 / 取消 ----
+    def pause(self, tid):
+        with self._cv:
+            t = self._tasks.get(tid)
+            if not t or t.state not in ("queued", "running"):
+                return False
+            t.pause_requested = True
+            if t.state == "queued":
+                t.state = "paused"
+                t.ended_at = time.time()
+                self._cv.notify_all()
+                paused_now = True
+            else:
+                paused_now = False
+            proc = t.proc
+        if proc is not None:
+            core.kill_tree(proc)
+        if paused_now:
+            self._emit({"type": "queue", "action": "state", "task": t.snapshot()})
+            self._emit_changed()
+        return True
+
+    def resume(self, tid):
+        with self._cv:
+            t = self._tasks.get(tid)
+            if not t or t.state != "paused":
+                return False
+            t.pause_requested = False
+            t.cancel_requested = False
+            t.net_tried = set()
+            t.net_name = "normal"
+            t.exit_code = None
+            t.state = "queued"
+            if tid in self._order:
+                self._order.remove(tid)
+            self._order.insert(0, tid)
+            self._cv.notify_all()
+        self._emit({"type": "queue", "action": "state", "task": t.snapshot()})
+        self._emit_changed()
+        return True
+
+    def cancel(self, tid):
+        with self._cv:
+            t = self._tasks.get(tid)
+            if not t or t.state not in ACTIVE:
+                return False
+            t.cancel_requested = True
+            direct = t.state in ("queued", "paused")
+            if direct:
+                if t.state == "running":
+                    self._running = max(0, self._running - 1)
+                t.state = "canceled"
+                t.ended_at = time.time()
+                self._trim_finished()
+                self._cv.notify_all()
+            proc = t.proc
+        if proc is not None:
+            core.kill_tree(proc)
+        if direct:
+            purge_partials(t)
+            self._emit({"type": "queue", "action": "state", "task": t.snapshot()})
+            self._emit_changed()
+        return True
+
+    def stop_all(self):
+        with self._cv:
+            ids = [i for i, t in self._tasks.items() if t.state in ACTIVE]
+        n = 0
+        for i in ids:
+            if self.cancel(i):
+                n += 1
+        return n
 
     def _trim_finished(self):
         finished = [i for i in self._order
@@ -185,3 +261,27 @@ class QueueManager:
         with self._cv:
             self._closed = True
             self._cv.notify_all()
+
+
+def purge_partials(task):
+    """取消时清理该任务的 .part / .aria2 残留（按已知输出路径，避免误删他人文件）。"""
+    removed = []
+    bases = set()
+    raw = task.pstate.get("raw_path") or ""
+    if raw:
+        bases.add(raw)
+    f = task.pstate.get("file") or ""
+    if f:
+        bases.add(os.path.join(task.outdir, f))
+    for d in task.pstate.get("done") or ():
+        bases.add(str(d))
+    for b in bases:
+        for suffix in (".part", ".aria2"):
+            p = b + suffix
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+                    removed.append(p)
+            except OSError:
+                pass
+    return removed

@@ -16,24 +16,40 @@ def spec(url="http://example.com/a", **kw):
 
 
 class FakeExec:
-    """可控 executor：block 直到 release()，记录运行中的任务。"""
+    """可控 executor：每次调用 block 直到 release() 或 pause/cancel 请求。
+
+    模拟真实 run_process 的行为：轮询 pause_requested/cancel_requested 提前返回；
+    门闸按调用隔离，release() 只放行当时在等的调用（不影响之后启动的任务）。
+    """
     def __init__(self):
         self.running = []
         self.finished = []
-        self._gate = threading.Event()
+        self._gate = threading.Event()  # 兼容 SecondGateExec 的首个门闸
+        self._gates = {}
         self.lock = threading.Lock()
 
     def __call__(self, task):
+        gate = threading.Event()
         with self.lock:
             self.running.append(task.id)
-        self._gate.wait(5)
+            self._gates[task.id] = gate
+        end = time.time() + 5
+        while not gate.wait(0.02):
+            if task.pause_requested or task.cancel_requested:
+                break
+            if time.time() >= end:
+                break
         with self.lock:
             self.running.remove(task.id)
             self.finished.append(task.id)
+            self._gates.pop(task.id, None)
         task.exit_code = 0
 
     def release(self):
         self._gate.set()
+        with self.lock:
+            for g in self._gates.values():
+                g.set()
 
 
 class TestAdmission(unittest.TestCase):
@@ -165,4 +181,63 @@ class TestSlotRecycle(unittest.TestCase):
         self.assertTrue(self.wait_until(
             lambda: self.mgr.snapshot()["running"] == 0))
         self.assertEqual(self.mgr.snapshot()["queued"], 0)
+        self.assertFalse(self.mgr.any_active())
+
+
+class TestPauseResumeCancel(unittest.TestCase):
+    def setUp(self):
+        self.mgr = q.QueueManager(max_concurrent=1)
+        self.exe = FakeExec()
+
+    def tearDown(self):
+        self.exe.release()
+        self.mgr.close()
+
+    def wait_state(self, tid, state, timeout=3):
+        end = time.time() + timeout
+        while time.time() < end:
+            t = self.mgr.get(tid)
+            if t and t.state == state:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_pause_running_frees_slot(self):
+        a = self.mgr.submit(spec("http://e/a"), self.exe)
+        b = self.mgr.submit(spec("http://e/b"), self.exe)
+        self.assertTrue(self.wait_state(a, "running"))
+        self.mgr.pause(a)
+        self.assertTrue(self.wait_state(a, "paused"))
+        self.assertTrue(self.wait_state(b, "running"))
+
+    def test_resume_goes_to_front(self):
+        a = self.mgr.submit(spec("http://e/a"), self.exe)
+        b = self.mgr.submit(spec("http://e/b"), self.exe)
+        c = self.mgr.submit(spec("http://e/c"), self.exe)
+        self.assertTrue(self.wait_state(a, "running"))
+        self.mgr.pause(a)
+        self.assertTrue(self.wait_state(a, "paused"))
+        self.assertTrue(self.wait_state(b, "running"))
+        self.mgr.resume(a)
+        self.exe.release()
+        self.assertTrue(self.wait_state(b, "done"))
+        # a 插队首，应先于 c 运行
+        self.assertTrue(self.wait_state(a, "running"))
+        self.assertEqual(self.mgr.get(c).state, "queued")
+
+    def test_cancel_queued(self):
+        a = self.mgr.submit(spec("http://e/a"), self.exe)
+        b = self.mgr.submit(spec("http://e/b"), self.exe)
+        self.assertTrue(self.wait_state(a, "running"))
+        self.mgr.cancel(b)
+        self.assertTrue(self.wait_state(b, "canceled"))
+
+    def test_stop_all(self):
+        for i in range(3):
+            self.mgr.submit(spec("http://e/%d" % i), self.exe)
+        n = self.mgr.stop_all()
+        self.assertGreaterEqual(n, 1)
+        end = time.time() + 3
+        while time.time() < end and self.mgr.any_active():
+            time.sleep(0.02)
         self.assertFalse(self.mgr.any_active())
