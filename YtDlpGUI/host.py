@@ -273,7 +273,7 @@ class Host:
             self._release_runner()
             self.task_kind = None
             return
-        outdir = cfg.get("outdir") or os.path.join(core.BASE_DIR, "downloads")
+        outdir = cfg.get("outdir") or core.DOWNLOAD_DIR
         try:
             os.makedirs(outdir, exist_ok=True)
         except Exception as e:
@@ -396,7 +396,7 @@ class Host:
     def on_done(self, code):
         base = self._task_cfg()
         was_ext = self.ext_cfg is not None
-        clear_preview_links(base.get("outdir") or os.path.join(core.BASE_DIR, "downloads"))
+        clear_preview_links(base.get("outdir") or core.DOWNLOAD_DIR)
         self._play_raw = ""
         self._set_playable(False, "还没有开始下载")
         self.running = False
@@ -558,7 +558,7 @@ class Host:
         if not self._play_ok:
             return {"ok": False, "error": "此源不支持边下边播"}
         cfg = self._task_cfg()
-        outdir = cfg.get("outdir") or os.path.join(core.BASE_DIR, "downloads")
+        outdir = cfg.get("outdir") or core.DOWNLOAD_DIR
         real = real_download_path(self._play_raw)
         if not real:
             return {"ok": False, "error": "文件还没写出来，稍等再试"}
@@ -1007,7 +1007,7 @@ class Host:
         self.close_embedded_browser()
         self.stop_ext_service()
         try:
-            clear_preview_links(self.cfg.get("outdir") or os.path.join(core.BASE_DIR, "downloads"))
+            clear_preview_links(self.cfg.get("outdir") or core.DOWNLOAD_DIR)
         except Exception:
             pass
         self._stop_flag = True

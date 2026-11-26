@@ -1,7 +1,7 @@
 # yt-dlp 便携版工具箱（Windows）
 
-一个开箱即用的视频下载工具包：内置 `yt-dlp.exe` 与 `ffmpeg.exe`，并提供两种用法——
-**桌面窗口版**（主入口，自带扩展服务与「扩展嗅探」页签）、**浏览器嗅探扩展**。
+一个开箱即用的视频下载工具包：便携运行文件（`yt-dlp.exe`、`ffmpeg.exe` 等）统一放在 `runtime\`，
+并提供两种用法——**桌面窗口版**（主入口，自带扩展服务与「扩展嗅探」页签）、**浏览器嗅探扩展**。
 
 同一套核心逻辑放在 `ytdlp_core.py` 里，桌面窗口与扩展面板都只是薄薄的界面层。
 
@@ -13,6 +13,7 @@
 
 双击 `YtDlpGUI\启动.bat`。
 
+下载/合并所需的运行文件在 `runtime\`（源码仓库不含 exe；目录结构见下文）。
 需要本机装有 Python 3.9+（脚本会自动探测 `pyw -3` / `pythonw` / `python` / `py -3`）。
 界面用 **pywebview** 承载原生 HTML/CSS/JS（WebView2 / Evergreen Edge 内核）：
 首次启动脚本会自动 `pip install pywebview`；若窗口打不开并提示缺少 WebView2，
@@ -52,7 +53,7 @@
 2. 打开 `chrome://extensions`（Edge 为 `edge://extensions`），开启「开发者模式」。
 3. 「加载已解压的扩展程序」→ 选择本目录下的 `sniffer_extension`。
 4. 打开要下载的网页并刷新一次，右下角会出现「▶ 嗅探 (N)」浮条。
-5. 点浮条展开列表 → 点某一项「下载」→ 文件落到 `downloads\`。
+5. 点浮条展开列表 → 点某一项「下载」→ 文件落到 `runtime\downloads\`。
 
 扩展会自动带上当前页面的 **Referer / UA / Cookie（含 httpOnly）**，
 cookie 会写成临时文件传给 yt-dlp，任务结束即删除。
@@ -136,10 +137,13 @@ DOM、日志、任务状态都保留，返回即恢复；浏览器页面也保�
 
 ```
 yt-dlp_win\
-├─ yt-dlp.exe                  # 上游发行版（onedir 打包），升级见下文
-├─ _internal\                  # yt-dlp.exe 的依赖目录（勿删）
-├─ ffmpeg.exe                  # 自编译裁剪版：合并 / 转码 / 截帧 / mp3 提取
-├─ ffprobe.exe                 # 自编译裁剪版：yt-dlp 的元数据/音频探测（核心代码不调用）
+├─ runtime\                    # 便携运行文件（不入库，仅 README 入库）
+│   ├─ yt-dlp.exe              # 上游发行版（onedir 打包），升级见下文
+│   ├─ _internal\              # yt-dlp.exe 的依赖目录（勿删）
+│   ├─ ffmpeg.exe              # 自编译裁剪版：合并 / 转码 / 截帧 / mp3 提取
+│   ├─ ffprobe.exe             # 自编译裁剪版：yt-dlp 的元数据/音频探测（核心代码不调用）
+│   ├─ downloads\              # 默认下载目录
+│   └─ README.md               # 运行目录说明（入库）
 ├─ ytdlp_core.py               # ★ 共享核心：命令构建、配置读写、诊断规则、进度解析
 ├─ sniff_rules.py              # Python 侧嗅探判定：读 sniffer_extension/sniff_rules.js 的同一份规则表
 ├─ YtDlpGUI\                   # 桌面版（pywebview + Web 前端）
@@ -177,12 +181,11 @@ yt-dlp_win\
 │   ├─ test_embedded.py        # 内嵌浏览器/共享嗅探规则/合批与生命周期
 │   ├─ fixtures\               # 探针测试用的 3 秒小样片（mkv/webm/ts/mp4）
 │   └─ extension_smoke.js      # 扩展后台冒烟（Node + 假 chrome API）
-├─ _local\                     # 本机杂物（不入库：vc140.pdb、待完成.txt 等）
-└─ downloads\                  # 默认下载目录
+└─ _local\                     # 本机杂物（不入库：vc140.pdb、待完成.txt 等）
 ```
 
-> `_local/`、`.workbuddy/`、`downloads/`、`config.json`、`history.json`、`__pycache__/`
-> 都是本机文件，已在 `.gitignore` 中排除，不随仓库发布。
+> `runtime/` 里的 exe、`_internal/`、`downloads/`，以及 `_local/`、`.workbuddy/`、`config.json`、
+> `history.json`、`__pycache__/` 都是本机文件，已在 `.gitignore` 中排除，不随仓库发布。
 
 ---
 
@@ -291,7 +294,8 @@ node tests\extension_smoke.js
 ## 升级 yt-dlp
 
 - 桌面版：窗口里有「更新 yt-dlp」按钮（等价于 `yt-dlp -U`）。
-- 手动方式：把新的 `yt-dlp.exe`（onedir 发行包需连同 `_internal\`）覆盖进来即可。
+- 手动方式：把新的 `yt-dlp.exe`（onedir 发行包需连同 `_internal\`）放进/覆盖 `runtime\`
+  （即 `runtime\yt-dlp.exe` 与 `runtime\_internal\`）。
 
 ---
 
@@ -312,8 +316,8 @@ pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-nasm mingw-w64-x86_64-lame \
 FFMPEG_BUILD_DIR=/e/envir/build/ffmpeg-min ./tools/build_ffmpeg_min.sh
 ```
 
-脚本固定了源码版本、SHA-256 与 configure 参数，产物直接覆盖根目录的
-`ffmpeg.exe` / `ffprobe.exe`。需要新增能力（例如某个站点的特殊编码）时，往脚本的
+脚本固定了源码版本、SHA-256 与 configure 参数，产物直接写入 `runtime\`
+（`runtime\ffmpeg.exe` / `runtime\ffprobe.exe`）。需要新增能力（例如某个站点的特殊编码）时，往脚本的
 `--enable-decoder` / `--enable-demuxer` 列表里加一项再重建即可。
 
 ---
@@ -339,6 +343,8 @@ FFMPEG_BUILD_DIR=/e/envir/build/ffmpeg-min ./tools/build_ffmpeg_min.sh
 
 ## 目录维护记录
 
+- `2026-11-26`：运行文件分离到 `runtime\`（`yt-dlp.exe`、`_internal\`、`ffmpeg.exe`、`ffprobe.exe`、
+  `downloads\`），源码目录只保留代码/测试/文档；旧布局的根目录 exe 仍兼容查找。
 - `2026-11-26`：`ffmpeg.exe` / `ffprobe.exe` 换为同源自编译裁剪版（静态，合计约 19 MB）；
   原全量构建移到 `..\yt-dlp_removed_20261126\`。
 - 已移出发布目录（保留在 `..\yt-dlp_removed_20261104\`）：`ffplay.exe`、`ffmpeg-master-latest-win64-lgpl\`
@@ -352,9 +358,9 @@ FFMPEG_BUILD_DIR=/e/envir/build/ffmpeg-min ./tools/build_ffmpeg_min.sh
 
 | 组件 | 说明 |
 | --- | --- |
-| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Unlicense；本目录为官方 Windows onedir 发行包 |
+| [yt-dlp](https://github.com/yt-dlp/yt-dlp) | Unlicense；`runtime/` 为官方 Windows onedir 发行包 |
 | [FFmpeg](https://ffmpeg.org/) | LGPL；本项目自编译裁剪版（静态链接 LAME / libxml2 / zlib） |
 | [pywebview](https://pywebview.flowrl.com/) | BSD-3；桌面窗口承载 Web 界面（首次启动自动安装，依赖系统 WebView2） |
-| `curl_cffi` / `websockets` / `pycryptodome` / `certifi` | 见 `_internal\THIRD_PARTY_LICENSES.txt` |
+| `curl_cffi` / `websockets` / `pycryptodome` / `certifi` | 见 `runtime\_internal\THIRD_PARTY_LICENSES.txt` |
 
 本仓库自身的界面与嗅探代码仅为个人自用工具，请遵守目标站点的服务条款与版权规定。

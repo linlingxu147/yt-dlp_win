@@ -908,9 +908,35 @@ class TestPreviewFields(unittest.TestCase):
         self.assertEqual(p["raw"], "")
 
 
-FFMPEG = os.path.join(ROOT, "ffmpeg.exe")
+FFMPEG = core.which_tool("ffmpeg.exe")
 FIXTURES = os.path.join(ROOT, "tests", "fixtures")
-HAS_FFMPEG = os.path.isfile(FFMPEG)
+HAS_FFMPEG = bool(FFMPEG)
+
+
+class TestRuntimeLayout(unittest.TestCase):
+    def test_default_outdir_is_runtime_downloads(self):
+        self.assertEqual(os.path.normcase(core.DEFAULT_CONFIG["outdir"]),
+                         os.path.normcase(os.path.join(core.RUNTIME_DIR, "downloads")))
+
+    def test_find_tool_prefers_runtime(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "fake-tool.exe")
+            with open(p, "wb") as f:
+                f.write(b"x")
+            with mock.patch.object(core, "RUNTIME_DIR", d):
+                self.assertEqual(core.find_tool("fake-tool.exe"), p)
+                self.assertEqual(core.which_tool("fake-tool.exe"), p)
+
+    def test_download_cmd_ffmpeg_location_uses_tool_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            ff = os.path.join(d, "ffmpeg.exe")
+            with open(ff, "wb") as f:
+                f.write(b"x")
+            cfg = dict(core.DEFAULT_CONFIG, yt_dlp_path="yt-dlp.exe", outdir=d)
+            with mock.patch.object(core, "find_tool", return_value=ff):
+                cmd = core.build_download_cmd(cfg, ["https://example.com/v"])
+            self.assertIn("--ffmpeg-location", cmd)
+            self.assertEqual(cmd[cmd.index("--ffmpeg-location") + 1], d)
 
 
 class TestPlayHelpers(unittest.TestCase):

@@ -31,8 +31,11 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 
-# 本文件就在项目根目录：yt-dlp.exe / ffmpeg.exe / downloads 都相对它定位
+# 本文件在项目根目录；便携运行文件统一放在 runtime/（exe / _internal / ffmpeg / downloads），
+# 源码目录保持干净。旧布局的根目录 exe 仍然兼容。
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+RUNTIME_DIR = os.path.join(BASE_DIR, "runtime")
+DOWNLOAD_DIR = os.path.join(RUNTIME_DIR, "downloads")
 CREATE_NO_WINDOW = 0x08000000
 PORT_RANGE = range(8765, 8776)
 
@@ -176,7 +179,7 @@ DIAG_RULES = [
      {"fmt": True}),
     (r"(?i)ffmpeg|merger|post[- ]process|转换失败|合并失败",
      "ffmpeg", "后处理（合并 / 转码）失败",
-     ["确认 ffmpeg.exe 与本程序在同一目录",
+     ["确认 ffmpeg.exe 在 runtime 目录（或程序目录 / PATH）",
       "或把「合并容器」改成「不转换」"],
      {}),
     (r"(?i)video unavailable|视频不存在|已删除|\bremoved\b|deleted|does not exist|http error 404",
@@ -237,10 +240,18 @@ PROG_MARK = "PROG|"
 _NA_VALUES = ("", "NA", "None", "none", "null", "N/A")
 
 
+def _tool_dirs():
+    """运行文件查找顺序：runtime/ 优先，其次兼容旧布局的项目根。"""
+    return (RUNTIME_DIR, BASE_DIR)
+
+
 def find_tool(name):
-    """优先使用项目根目录里的 exe，找不到就交给 PATH。"""
-    p = os.path.join(BASE_DIR, name)
-    return p if os.path.isfile(p) else name
+    """优先使用 runtime/ 里的 exe，其次旧布局的根目录，找不到就交给 PATH。"""
+    for d in _tool_dirs():
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
+    return name
 
 
 def which_tool(name):
@@ -249,9 +260,10 @@ def which_tool(name):
     find_tool 找不到时会原样返回名字（让 yt-dlp 自己报错），适合「交给 PATH」；
     但 aria2c 这种可选外部程序必须先确认存在，否则命令行一定失败。
     """
-    p = os.path.join(BASE_DIR, name)
-    if os.path.isfile(p):
-        return p
+    for d in _tool_dirs():
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            return p
     stem = os.path.splitext(name)[0]
     return shutil.which(stem) or shutil.which(name) or ""
 
@@ -969,7 +981,7 @@ def command_text(cmd):
 CONFIG_SCHEMA_VERSION = 3
 
 DEFAULT_CONFIG = {
-    "outdir": os.path.join(BASE_DIR, "downloads"),
+    "outdir": DOWNLOAD_DIR,
     "mode": "best",
     "merge": "mp4",
     "fmt": "",
@@ -1346,8 +1358,9 @@ def _exe(cfg):
 
 def build_download_cmd(cfg, urls, no_playlist=False, warn=None):
     cmd = [_exe(cfg), "--newline", "--progress-template", PROGRESS_TEMPLATE]
-    if os.path.isfile(os.path.join(BASE_DIR, "ffmpeg.exe")):
-        cmd += ["--ffmpeg-location", BASE_DIR]
+    ffmpeg = find_tool("ffmpeg.exe")
+    if os.path.isfile(ffmpeg):
+        cmd += ["--ffmpeg-location", os.path.dirname(os.path.abspath(ffmpeg))]
     if cfg.get("outdir"):
         cmd += ["-P", str(cfg["outdir"])]
     if cfg.get("tpl"):

@@ -361,6 +361,7 @@ class TestStreamPreviewHelpers(unittest.TestCase):
 class TestToolProbe(unittest.TestCase):
     """find_tool 找不到时原样返回名字，曾被当成「装好了」用；which_tool 才是可判定的。"""
 
+    @unittest.skipUnless(core.which_tool("ffmpeg.exe"), "需要随包 ffmpeg（runtime/）")
     def test_which_tool_finds_bundled_binary(self):
         self.assertTrue(core.which_tool("ffmpeg.exe"))
 

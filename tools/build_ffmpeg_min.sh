@@ -65,9 +65,11 @@ make distclean >/dev/null 2>&1 || true
 
 make -j"$JOBS"
 strip -s ffmpeg.exe ffprobe.exe
-cp -f ffmpeg.exe ffprobe.exe "$REPO_ROOT/"
+RUNTIME_DIR="$REPO_ROOT/runtime"
+mkdir -p "$RUNTIME_DIR"
+cp -f ffmpeg.exe ffprobe.exe "$RUNTIME_DIR/"
 
 echo "---"
-"$REPO_ROOT/ffmpeg.exe" -version | head -1
-"$REPO_ROOT/ffprobe.exe" -version | head -1
-ls -l "$REPO_ROOT/ffmpeg.exe" "$REPO_ROOT/ffprobe.exe"
+"$RUNTIME_DIR/ffmpeg.exe" -version | head -1
+"$RUNTIME_DIR/ffprobe.exe" -version | head -1
+ls -l "$RUNTIME_DIR/ffmpeg.exe" "$RUNTIME_DIR/ffprobe.exe"

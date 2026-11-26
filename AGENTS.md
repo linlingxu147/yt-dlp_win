@@ -13,6 +13,12 @@
 为唯一真源（桌面 `sniff_rules.py` 读同一份规则表），服务端只加字段并保持向后兼容。
 扩展集成经 `TASK_SINK`/`RUNNER` 单任务闸门，桌面与扩展共用一个任务槽。
 
+## 运行目录
+
+便携运行文件统一放在 `runtime\`（`yt-dlp.exe`、`_internal\`、`ffmpeg.exe`、`ffprobe.exe`、
+`downloads\`），源码目录不放二进制；`ytdlp_core.find_tool` / `which_tool` 按
+`runtime/` → 项目根（旧布局兼容）→ PATH 查找。`runtime/` 内容不入库，只保留说明文件。
+
 ## 测试
 
 - `py -3 -m unittest discover -s tests -v`（标准库 unittest，无第三方测试依赖）

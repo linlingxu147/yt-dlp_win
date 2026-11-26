@@ -30,3 +30,7 @@ _local/
 
 # WorkBuddy 本地记忆/缓存
 .workbuddy/
+
+# 运行时目录：exe / _internal / ffmpeg / downloads 留在本机，仅说明入库
+runtime/*
+!runtime/README.md

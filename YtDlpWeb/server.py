@@ -16,7 +16,7 @@ yt-dlp 下载器 · 浏览器扩展服务（无网页界面）
   1. 单任务队列：同一时间只运行一个探测/下载任务，避免日志与进度混淆。
   2. 仅本机使用：只监听 127.0.0.1，并校验 Host / Origin / Content-Type，
      阻断网页跨站提交与 DNS rebinding。
-  3. 输出目录默认为上级目录的 downloads，首次运行时自动创建。
+  3. 输出目录默认为 runtime/downloads，首次运行时自动创建。
   4. 默认「最佳画质 + 自动合并为 mp4」，并嵌入封面与元数据。
 """
 
@@ -236,7 +236,7 @@ def watch_note(why):
 
 
 def run_download(cfg, urls, emit, no_playlist=False, abort=None, keepalive=None):
-    outdir = cfg.get("outdir") or os.path.join(BASE_DIR, "downloads")
+    outdir = cfg.get("outdir") or core.DOWNLOAD_DIR
     try:
         os.makedirs(outdir, exist_ok=True)
     except Exception as e:
