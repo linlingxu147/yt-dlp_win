@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 setlocal
-title yt-dlp GUI
+title 鱿鱼浏览器工具包
 cd /d "%~dp0"
 
 set "PYW="

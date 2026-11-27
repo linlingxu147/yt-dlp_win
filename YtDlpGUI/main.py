@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""yt-dlp 桌面版入口（pywebview + Web 前端）。"""
+"""鱿鱼浏览器工具包桌面版入口（pywebview + Web 前端）。"""
 import ctypes
 import json
 import os
@@ -18,7 +18,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 WEBVIEW2_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
 
 
-def msgbox(text, title="yt-dlp 下载器"):
+def msgbox(text, title="鱿鱼浏览器工具包"):
     ctypes.windll.user32.MessageBoxW(0, text, title, 0x40)
 
 
@@ -109,7 +109,7 @@ def main():
     api = Api(host)
     try:
         window = webview.create_window(
-            "yt-dlp 下载器   ·   可视化界面",
+            "鱿鱼浏览器工具包   ·   可视化界面",
             url=os.path.join(APP_DIR, "ui", "index.html"),
             js_api=api, width=1100, height=900, min_size=(920, 700))
     except Exception as e:

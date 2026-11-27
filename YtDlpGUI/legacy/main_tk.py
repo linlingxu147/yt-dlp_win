@@ -84,7 +84,7 @@ TROUBLE_LABELS = {
 class App:
     def __init__(self, root, ext_service=True):
         self.root = root
-        self.root.title("yt-dlp 下载器   ·   可视化界面")
+        self.root.title("鱿鱼浏览器工具包   ·   可视化界面")
         self.root.geometry("1010x1000")
         self.root.minsize(920, 800)
 
@@ -189,7 +189,7 @@ class App:
         # 顶部
         top = ttk.Frame(self.dl_inner)
         top.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
-        ttk.Label(top, text="yt-dlp 下载器", font=("Microsoft YaHei UI", 13, "bold")).pack(side="left")
+        ttk.Label(top, text="鱿鱼浏览器工具包", font=("Microsoft YaHei UI", 13, "bold")).pack(side="left")
         ttk.Label(top, text=f"  yt-dlp: {self.cfg.get('yt_dlp_path') or find_tool('yt-dlp.exe')}",
                   foreground="#8c959f", font=FONT_S).pack(side="left", padx=(10, 0), pady=(4, 0))
         self.lbl_env = ttk.Label(top, text="", font=FONT_S)

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""组装发布包：桌面端 zip + 浏览器扩展 zip。
+"""组装「鱿鱼浏览器工具包」桌面端与浏览器扩展发布包。
 
 用法：
     py -3 tools\\build_release.py [--out DIR]
@@ -254,7 +254,7 @@ def build_zip(root, files, out_path, prefix, extra_dirs=()):
 
 def main(argv=None, root=None):
     root = os.path.abspath(root or ROOT)
-    parser = argparse.ArgumentParser(description="组装 yt-dlp 桌面端与浏览器扩展发布包")
+    parser = argparse.ArgumentParser(description="组装鱿鱼浏览器工具包桌面端与浏览器扩展发布包")
     parser.add_argument("--out", default=None,
                         help="输出目录（默认：<仓库>/dist）")
     args = parser.parse_args(argv)
@@ -283,13 +283,13 @@ def main(argv=None, root=None):
 
     desktop_zip = build_zip(
         root, desktop_files,
-        os.path.join(out_dir, "yt-dlp_win-%s-desktop.zip" % version),
-        "yt-dlp_win-%s" % version,
+        os.path.join(out_dir, "squidkit-%s-desktop.zip" % version),
+        "squidkit-%s" % version,
         extra_dirs=("runtime/downloads",))
     extension_zip = build_zip(
         os.path.join(root, "sniffer_extension"), extension_arcs,
-        os.path.join(out_dir, "yt-dlp_win-%s-extension.zip" % version),
-        "sniffer_extension-%s" % version)
+        os.path.join(out_dir, "squidkit-%s-extension.zip" % version),
+        "squidkit-extension-%s" % version)
 
     for label, path, count in (
             ("桌面端", desktop_zip, len(desktop_files)),

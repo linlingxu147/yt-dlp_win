@@ -198,14 +198,14 @@ class BuildReleaseTest(unittest.TestCase):
         out = os.path.join(self.root, "dist", "desktop.zip")
 
         self.builder.build_zip(
-            self.root, ["README.md"], out, "yt-dlp_win-1.2.3",
+            self.root, ["README.md"], out, "squidkit-1.2.3",
             extra_dirs=("runtime/downloads",))
 
         with zipfile.ZipFile(out) as zf:
             names = zf.namelist()
-            self.assertIn("yt-dlp_win-1.2.3/README.md", names)
-            self.assertIn("yt-dlp_win-1.2.3/runtime/downloads/", names)
-            self.assertEqual(zf.read("yt-dlp_win-1.2.3/README.md"), b"hello")
+            self.assertIn("squidkit-1.2.3/README.md", names)
+            self.assertIn("squidkit-1.2.3/runtime/downloads/", names)
+            self.assertEqual(zf.read("squidkit-1.2.3/README.md"), b"hello")
 
     def test_main_builds_both_zips_with_expected_contents(self):
         self._make_valid_tree()
@@ -216,14 +216,14 @@ class BuildReleaseTest(unittest.TestCase):
             code = self.builder.main(["--out", out_dir], root=self.root)
 
         self.assertEqual(code, 0)
-        desktop = os.path.join(out_dir, "yt-dlp_win-%s-desktop.zip" % VERSION)
-        extension = os.path.join(out_dir, "yt-dlp_win-%s-extension.zip" % VERSION)
+        desktop = os.path.join(out_dir, "squidkit-%s-desktop.zip" % VERSION)
+        extension = os.path.join(out_dir, "squidkit-%s-extension.zip" % VERSION)
         self.assertTrue(os.path.isfile(desktop))
         self.assertTrue(os.path.isfile(extension))
 
         with zipfile.ZipFile(desktop) as zf:
             names = zf.namelist()
-            prefix = "yt-dlp_win-%s/" % VERSION
+            prefix = "squidkit-%s/" % VERSION
             self.assertIn(prefix + "README.md", names)
             self.assertIn(prefix + "YtDlpGUI/main.py", names)
             self.assertIn(prefix + "YtDlpWeb/server.py", names)
@@ -238,7 +238,7 @@ class BuildReleaseTest(unittest.TestCase):
 
         with zipfile.ZipFile(extension) as zf:
             names = zf.namelist()
-            prefix = "sniffer_extension-%s/" % VERSION
+            prefix = "squidkit-extension-%s/" % VERSION
             self.assertIn(prefix + "manifest.json", names)
             self.assertIn(prefix + "dom_scan.js", names)
             self.assertIn(prefix + "sniff_rules.js", names)

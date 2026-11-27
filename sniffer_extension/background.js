@@ -3,7 +3,7 @@
 //   1) webRequest 被动嗅探所有网络响应（content-type / URL 后缀）
 //   2) 发现疑似媒体就记到对应标签页的名下，通知页面悬浮条
 //   3) 用户点「下载」时带上该域 Cookie / 页面 Referer / UA，
-//      POST 到本机 yt-dlp Web 服务（127.0.0.1:8765-8775 端口自动发现）
+//      POST 到本机扩展服务（127.0.0.1:8765-8775 端口自动发现）
 "use strict";
 
 // 嗅探判定只有一份：sniffer_extension/sniff_rules.js（桌面内嵌浏览器共用）。
@@ -213,7 +213,7 @@ function serviceMissingHint() {
         return "本机服务在跑，但拒绝了本扩展（HTTP 403）：扩展 ID 与服务端白名单不一致。"
             + "请到扩展页确认加载的是本目录的 sniffer_extension，并点「重新加载」，然后刷新页面。";
     }
-    return "找不到 yt-dlp 服务：请先开着桌面版（YtDlpGUI\\启动.bat，右上角应显示 127.0.0.1:8765），"
+    return "找不到鱿鱼工具包服务：请先开着桌面版（YtDlpGUI\\启动.bat，右上角应显示 127.0.0.1:8765），"
         + "或运行 YtDlpWeb\\启动.bat。";
 }
 
@@ -240,7 +240,7 @@ async function serverPost(path, body) {
     } catch (e) {
         // 端口记录可能过期，清掉让下次重新发现
         chrome.storage.local.remove("server_port");
-        return { ok: false, error: "无法连接 yt-dlp 服务：" + (e && e.message) };
+        return { ok: false, error: "无法连接鱿鱼工具包服务：" + (e && e.message) };
     }
 }
 

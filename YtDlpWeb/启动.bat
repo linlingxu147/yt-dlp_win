@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
 setlocal
-title yt-dlp 扩展服务
+title 鱿鱼浏览器工具包 · 扩展服务
 cd /d "%~dp0"
 
 rem 依次探测可用的 Python：不再写死 E:\python 这类个人机器上的路径。

@@ -4,11 +4,11 @@
 //   2) 接收后台 webRequest 嗅探到的网络条目（net_items）
 //   3) 扫描页面 <video>/<audio> 元素
 //   4) 顶层框架渲染悬浮条（Shadow DOM 隔离，防站点 CSS 干扰），
-//      点「下载」把地址交给后台 → 本机 yt-dlp 服务
+//      点「下载」把地址交给后台 → 本机扩展服务
 "use strict";
 
 (function () {
-    // 只跳过 yt-dlp 自己的 Web 界面，其余本地页面照常显示
+    // 只跳过本机服务端点，其余本地页面照常显示
     function isOwnWebUI() {
         var h = location.hostname;
         var loop = /^(localhost|127(\.\d+){3}|\[::1\])$/i.test(h);
