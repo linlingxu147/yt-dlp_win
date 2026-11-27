@@ -82,6 +82,12 @@ class Api:
     def cancel_task(self, tid):
         return self._guard(lambda: {"ok": self.host.cancel_task(tid)})
 
+    def remove_task(self, tid):
+        return self._guard(lambda: {"ok": self.host.remove_task(tid)})
+
+    def remove_finished(self):
+        return self._guard(self.host.remove_finished_tasks)
+
     def stop_all(self):
         return self._guard(self.host.stop_all_downloads)
 

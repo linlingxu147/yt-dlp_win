@@ -41,7 +41,10 @@ SEGMENT_RE = re.compile(SOURCES["segment"], re.I)
 AUDIO_EXT_RE = re.compile(SOURCES["audioExt"], re.I)
 BILI_AUDIO_RE = re.compile(SOURCES["biliAudio"], re.I)
 IMAGE_EXT_RE = re.compile(SOURCES["imageExt"], re.I)
+OPAQUE_MIME_RE = re.compile(SOURCES["opaqueMime"], re.I)
+STATIC_EXT_RE = re.compile(SOURCES["staticExt"], re.I)
 MIN_MIME_BYTES = int(SOURCES.get("minMimeBytes", 204800))
+FALLBACK_BYTES = int(SOURCES.get("fallbackBytes", 1048576))
 
 try:
     from ytdlp_core import clean_media_url as _clean_media_url
@@ -94,25 +97,45 @@ def classify(url, mime):
     return "other"
 
 
-def accept(url, mime, size):
+def accept(url, mime, size, opts=None):
+    """这条响应要不要登记。
+
+    opts 是 dict（内嵌浏览器 / 扩展传入），目前只认 ``range``：响应带 Content-Range
+    时说明是分片续传，基本可判定为大媒体文件。不传 opts 时行为与旧版完全一致。
+    """
     raw = str(url or "")
     if not re.match(r"^https?://", raw, re.I):
         return False
     u = _nohash(raw)
+    path = _noquery(u)
     m = str(mime or "")
     try:
         n = int(size or 0)
     except (TypeError, ValueError):
         n = 0
+    ranged = bool(isinstance(opts, dict) and (opts.get("range") or opts.get("ranged")))
     mime_hit = bool(MIME_RE.search(m))
     ext_hit = bool(MEDIA_EXT_RE.search(u))
-    if not mime_hit and not ext_hit:
+    path_ext_hit = bool(MEDIA_EXT_RE.search(path))
+    if mime_hit or ext_hit:
+        # 非媒体 MIME 只有路径本身带媒体后缀才收：日志/埋点常把页面或媒体
+        # 地址塞进查询串，不能因为 ?url=...mp4 就当成视频。
+        if (NON_MEDIA_RE.search(m) and not MANIFEST_MIME_RE.search(m)
+                and not path_ext_hit):
+            return False
+        if mime_hit and not ext_hit and 0 < n < MIN_MIME_BYTES:
+            return False
+        return True
+    # 兜底：签名直链（无后缀 + application/octet-stream / 空 MIME）。
+    # 见 sniff_rules.js 同一段注释：只靠体积与分片信号判断，宁可多收几条。
+    if not isinstance(opts, dict) or not OPAQUE_MIME_RE.match(m.strip()):
         return False
-    if NON_MEDIA_RE.search(m) and not MANIFEST_MIME_RE.search(m) and not ext_hit:
+    # JS/CSS/字体等静态资源即便被 CDN 标成 octet-stream、体积过 1MB，也不是媒体
+    if STATIC_EXT_RE.search(path):
         return False
-    if mime_hit and not ext_hit and 0 < n < MIN_MIME_BYTES:
-        return False
-    return True
+    if ranged:
+        return True
+    return n >= FALLBACK_BYTES
 
 
 def normalize_url(url):

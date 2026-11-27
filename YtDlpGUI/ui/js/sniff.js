@@ -3,6 +3,7 @@ import { call, on } from './bridge.js';
 let items = [];
 let shown = [];
 let sig = '';
+let svcOff = false;
 const selected = new Set();
 
 function fmtSize(b) {
@@ -11,6 +12,11 @@ function fmtSize(b) {
   let i = 0;
   while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
   return b.toFixed(i ? 1 : 0) + u[i];
+}
+
+// 图片条目只来自内嵌浏览器的 DOM 补扫（网络层不收图片），默认折叠
+function isImage(r) {
+  return r.cat === 'image' || r.kind === 'image';
 }
 
 function render() {
@@ -44,23 +50,27 @@ function render() {
   });
   const fold = document.getElementById('sn-fold').checked;
   const showAudio = document.getElementById('sn-audio').checked;
+  const showImage = document.getElementById('sn-image').checked;
   const audioCount = items.filter(r => r.audio).length;
+  const imageCount = items.filter(isImage).length;
   const audioHint = audioCount ? `${showAudio ? '显示' : '隐藏'} ${audioCount} 条` : '无';
+  const imageHint = imageCount ? `${showImage ? '显示' : '隐藏'} ${imageCount} 条` : '无';
   document.getElementById('sn-count').textContent =
-    `共 ${shown.length} 条（折叠分片：${fold ? '开' : '关'}；音频流：${audioHint}）`;
+    `共 ${shown.length} 条（折叠分片：${fold ? '开' : '关'}；音频流：${audioHint}；图片：${imageHint}）`
+    + (svcOff ? '；扩展上报未启用，目前只有内嵌浏览器记录' : '');
 }
 
 async function refresh() {
   const d = await call('sniff_items');
-  if (!d.svc) {
-    document.getElementById('sn-count').textContent = '扩展服务未启用（「高级」里勾选启用浏览器扩展支持）';
-    return;
-  }
+  // svc=False 只代表扩展上报通道没开；内嵌浏览器的条目仍要照常显示
+  svcOff = !d.svc;
   items = d.items || [];
   const fold = document.getElementById('sn-fold').checked;
   const showAudio = document.getElementById('sn-audio').checked;
-  shown = items.filter(r => (r.audio ? showAudio : !(fold && r.seg)));
-  const s = JSON.stringify([fold, showAudio,
+  const showImage = document.getElementById('sn-image').checked;
+  shown = items.filter(r => (r.audio ? showAudio : !(fold && r.seg))
+                             && (showImage || !isImage(r)));
+  const s = JSON.stringify([fold, showAudio, showImage, svcOff,
     shown.map(r => [r.url, r.ts, r.size, r.entry, r.cat, r.mime])]);
   if (s === sig) return;
   sig = s;
@@ -71,6 +81,7 @@ export function initSniff({ dialogs, tabs }) {
   document.getElementById('btn-sn-refresh').addEventListener('click', refresh);
   document.getElementById('sn-fold').addEventListener('change', () => { sig = ''; refresh(); });
   document.getElementById('sn-audio').addEventListener('change', () => { sig = ''; refresh(); });
+  document.getElementById('sn-image').addEventListener('change', () => { sig = ''; refresh(); });
   document.getElementById('btn-sn-clear').addEventListener('click', async () => {
     await call('sniff_clear');
     selected.clear();

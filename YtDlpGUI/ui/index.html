@@ -73,6 +73,8 @@ try {
         <div class="row">
           <span id="queue-stat" class="hint">0 下载中 · 0 排队</span>
           <button type="button" id="btn-stop-all">全部停止</button>
+          <button type="button" id="btn-clear-finished"
+                  title="从列表移除所有已结束（完成 / 失败 / 已取消）的任务，只看列表，不动已下载的文件">清空已结束</button>
         </div>
         <div id="queue-list" role="list" aria-label="下载任务列表"></div>
       </fieldset>
@@ -172,7 +174,7 @@ try {
             <label>同时下载数 <input id="queue_n" type="number" min="1" max="5" value="2"></label>
             <label class="check"><input id="conc" type="checkbox"> 分片并发加速（-N）</label>
             <label>分片数 <input id="conc_n" type="number" min="1" max="32" size="5"></label>
-            <label class="check"><input id="aria" type="checkbox"> 外部下载器 aria2c <span id="aria-state" class="hint"></span></label>
+            <label class="check"><input id="aria" type="checkbox"> 直链 aria2c 多连接（≥8MB） <span id="aria-state" class="hint"></span></label>
             <p class="hint">更新镜像仅在官方 -U 失败时使用；会校验 SHA256，第三方镜像需自行信任。</p>
             <label>aria2c 参数 <input id="aria_args" type="text"></label>
           </fieldset>
@@ -197,9 +199,10 @@ try {
   <section role="tabpanel" id="panel-sniff" aria-labelledby="tab-sniff" tabindex="0" hidden>
     <div class="panel-body">
       <div class="toolbar">
-        <span class="hint">浏览器扩展嗅探到的媒体地址（开着扩展的页面会自动出现在这里）</span>
+        <span class="hint">内嵌浏览器与浏览器扩展嗅探到的媒体地址（打开页面后自动出现在这里）</span>
         <label class="check"><input id="sn-fold" type="checkbox" checked> 折叠分片</label>
         <label class="check"><input id="sn-audio" type="checkbox"> 显示音频流</label>
+        <label class="check"><input id="sn-image" type="checkbox"> 显示图片</label>
         <button type="button" id="btn-sn-refresh">刷新</button>
         <button type="button" id="btn-sn-clear">清空列表</button>
       </div>

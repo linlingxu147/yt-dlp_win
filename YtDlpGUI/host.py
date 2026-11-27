@@ -58,6 +58,7 @@ class Host:
         self._progress_pending = {}
         self._last_progress_ts = {}
         self._web_mod = None
+        self._web_server_mod = None      # YtDlpWeb/server.py 模块缓存（嗅探登记表不依赖 HTTP）
         self.web_svc = None
         self.diag_buf = ""
         self.cookie_warned = False
@@ -302,7 +303,11 @@ class Host:
     def _exec_download(self, task):
         cfg = task.cfg
         task._extra = {}
-        if task.source != "gui":
+        if task.source == "agent":
+            self._task_log(task, "[AI] 任务交给桌面版下载\n", "ok")
+        elif task.source == "embedded-page":
+            self._task_log(task, "[内嵌浏览器] 当前页面交给 yt-dlp 整段下载\n", "ok")
+        elif task.source != "gui":
             self._task_log(task, "[浏览器扩展] 嗅探地址交给桌面版下载\n", "ok")
         while True:
             warns = []
@@ -567,6 +572,27 @@ class Host:
             return False
         return self.cancel_task(tid)
 
+    def remove_task(self, tid):
+        """删除列表里的一条已结束任务（完成 / 失败 / 已取消）；活动任务返回 False。
+
+        只清显示列表，磁盘一律不动：失败与停止的任务还留着 .part，历史页
+        「继续下载」要用它续传，所以这里绝不能顺手 purge。临时 Cookie 罐按任务
+        清理（与取消一致，重复调用无副作用）。
+        """
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            return False
+        task = self.queue.get(tid)
+        if task is None or not self.queue.remove(tid):
+            return False
+        self._clean_ext_cookie(task)
+        return True
+
+    def remove_finished_tasks(self):
+        """清空所有已结束任务（同 remove_task：只清列表，不动文件）。"""
+        return {"ok": True, "removed": self.queue.remove_finished()}
+
     def stop_all_downloads(self):
         """全部停止/退出：运行中与已暂停记 stopped 并保留部分下载；排队直接丢弃（spec §4）。
 
@@ -603,7 +629,18 @@ class Host:
         d = (path or self.cfg.get("outdir") or "").strip()
         if not d:
             return
-        os.makedirs(d, exist_ok=True)
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            # 换机器/换盘后，历史记录里存的是上一台机器的绝对路径，建目录必然失败；
+            # 直接 return 会让「打开目录」毫无反应，退到当前下载目录并说明原因。
+            alt = os.path.abspath(self.cfg.get("outdir") or core.DOWNLOAD_DIR)
+            self._log("[目录] 无法访问 %s，改为打开 %s\n" % (d, alt), "warn")
+            try:
+                os.makedirs(alt, exist_ok=True)
+            except OSError:
+                return
+            d = alt
         try:
             os.startfile(d)
         except Exception:
@@ -997,6 +1034,13 @@ class Host:
 
     # ---------------- 内嵌扩展服务 ----------------
     def load_web_server(self):
+        """加载 YtDlpWeb/server.py 并缓存。
+
+        嗅探登记表、预览与 cookie 罐都是这个模块里的纯函数，不启动 HTTP 也能用；
+        扩展服务启用时复用同一个模块对象，两边看到的是同一份登记表。
+        """
+        if self._web_server_mod is not None:
+            return self._web_server_mod
         import importlib.util
         path = os.path.join(core.BASE_DIR, "YtDlpWeb", "server.py")
         if not os.path.isfile(path):
@@ -1005,6 +1049,7 @@ class Host:
         mod = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = mod
         spec.loader.exec_module(mod)
+        self._web_server_mod = mod
         return mod
 
     def start_ext_service(self):
@@ -1021,6 +1066,11 @@ class Host:
             # T9：扩展任务入同一队列；停止按任务作用域；状态/排队位置读 host 队列快照
             mod.set_task_sink(self.submit_server_task, stop=self.stop_ext_task,
                               queue_status=self.queue.snapshot)
+            try:
+                if hasattr(self.web_svc, "enable_agent"):
+                    self.web_svc.enable_agent(embedded=True)
+            except Exception:
+                pass
         except Exception as e:
             self.web_svc = None
             self._web_mod = None
@@ -1060,18 +1110,94 @@ class Host:
         except Exception as e:
             return {"ok": False, "error": "内嵌浏览器模块不可用：%s" % e}
         if self.embedded is None:
-            self.embedded = EmbeddedBrowser(self.register_embedded_sniff)
+            self.embedded = EmbeddedBrowser(self.register_embedded_sniff,
+                                            self.download_embedded_sniff,
+                                            self.download_embedded_page)
         return self.embedded.open(window, theme)
 
+    def _sniff_api(self):
+        """嗅探用的服务端模块：扩展服务在跑就用它，否则直接用缓存模块。
+
+        这样内嵌浏览器不装扩展、不开 8765 也能登记/预览；扩展服务启动后
+        因为共用同一个模块对象，登记表自然合并，不会出现两份列表。
+        """
+        if self._web_mod is not None:
+            return self._web_mod
+        return self.load_web_server()
+
     def register_embedded_sniff(self, items, page_url=""):
-        """内嵌浏览器合批后的条目 → 复用扩展服务的登记表（同址去重/300 条上限）。"""
-        if self._web_mod is None:
+        """内嵌浏览器合批后的条目 → 服务端登记表（同址去重/300 条上限）。"""
+        mod = self._sniff_api()
+        if mod is None:
             return False
         try:
-            self._web_mod.register_sniff_items(items, page_url)
+            mod.register_sniff_items(items, page_url)
             return True
         except Exception:
             return False
+
+    def download_embedded_sniff(self, urls, page_url=""):
+        """页面浮条点下载 → 只认登记表里真实存在的条目，再走同一条下载流水线。"""
+        mod = self._sniff_api()
+        if mod is None:
+            return {"ok": False, "error": "YtDlpWeb/server.py 不可用"}
+        try:
+            snapshot = mod.sniff_items_json().get("items") or []
+        except Exception as e:
+            return {"ok": False, "error": "读取嗅探列表失败：%s" % e}
+        wanted = set()
+        for u in urls or []:
+            u = str(u or "").strip()
+            if u:
+                wanted.add(u)
+        items = [it for it in snapshot if str(it.get("url") or "") in wanted]
+        if not items:
+            return {"ok": False, "error": "这些地址不在本机嗅探列表里"}
+        return self.sniff_download(items)
+
+    def download_embedded_page(self, page_url=""):
+        """浮条「下载本页」：按页面 URL 走 yt-dlp 的站点解析。
+
+        嗅探列表里的单条 B 站地址只是 DASH 分片（视频/音频分开），直接下
+        只能得到片段；页面级下载才能让 yt-dlp 找到完整格式并合并。
+        """
+        page = str(page_url or "").strip()
+        good, _bad = core.sanitize_urls([page])
+        if not good:
+            return {"ok": False, "error": "当前页面地址无效"}
+        page = good[0]
+        if self.updating:
+            return {"ok": False, "error": "正在更新 yt-dlp，请等待完成"}
+        cfg = dict(self.cfg)
+        # 页面级下载强制视频+音频，避免 B 站 DASH 只拿到无声视频；
+        # 这条路径不保存配置，临时 cookie 罐也不会写进 config.json。
+        cfg.pop("_sniff_cookie_file", None)
+        cfg.update({"mode": "best", "fmt": "bv*+ba/b",
+                    "thumb": False, "meta": False, "sub": False,
+                    "embedsub": False})
+        outdir = (cfg.get("outdir") or "").strip() or core.DOWNLOAD_DIR
+        try:
+            os.makedirs(outdir, exist_ok=True)
+        except Exception as e:
+            return {"ok": False, "error": "无法创建输出目录：%s" % e}
+        if self._active_task_has(page, outdir):
+            return {"ok": False, "error": "这个页面已经在下载队列里了"}
+        jar = self._embedded_cookie_file({"url": page, "page_url": page,
+                                          "referer": page})
+        if jar:
+            cfg["_sniff_cookie_file"] = jar
+        cfg["referer"] = page
+        cfg["_referer_explicit"] = True
+        spec = {"urls": [page], "cfg": cfg, "outdir": outdir,
+                "no_playlist": True, "source": "embedded-page",
+                "title": "", "ext_cookie_file": jar}
+        try:
+            tid = self.queue.submit(spec, self._exec_download)
+        except ytdlp_queue.QueueFull as e:
+            self._drop_cookie_file(jar)
+            return {"ok": False, "error": str(e)}
+        self._put({"type": "sniff_started"})
+        return {"ok": True, "task_ids": [tid]}
 
     def close_embedded_browser(self):
         b, self.embedded = self.embedded, None
@@ -1081,18 +1207,22 @@ class Host:
             except Exception:
                 pass
 
-    # ---------------- 扩展嗅探 ----------------
+    # ---------------- 嗅探列表 ----------------
     def sniff_items(self):
-        if self._web_mod is None:
+        mod = self._sniff_api()
+        if mod is None:
             return {"ok": True, "items": [],
                     "busy": bool(self.aux_kind or self.updating), "svc": False}
-        d = self._web_mod.sniff_items_json()
-        d["svc"] = True
+        d = mod.sniff_items_json()
+        # svc 只表示「扩展上报通道」是否在跑；列表本身内嵌浏览器就能填，
+        # 前端不能因为 svc=False 就不渲染。
+        d["svc"] = self._web_mod is not None
         return d
 
     def sniff_clear(self):
-        if self._web_mod is not None:
-            self._web_mod.clear_sniff_items()
+        mod = self._sniff_api()
+        if mod is not None:
+            mod.clear_sniff_items()
         return {"ok": True}
 
     def sniff_download(self, items):
@@ -1109,25 +1239,44 @@ class Host:
         except Exception as e:
             return {"ok": False, "error": "无法创建输出目录：%s" % e}
         ids, skipped = [], 0
-        try:
-            for it in items:
-                if self._active_task_has(it.get("url"), outdir):
-                    skipped += 1
-                    continue
-                c = dict(cfg)
-                if len(items) == 1:
-                    if it.get("referer") or it.get("page_url"):
-                        c["referer"] = it.get("referer") or it.get("page_url")
-                        c["_referer_explicit"] = True
-                    if it.get("ua"):
-                        c["ua"] = it["ua"]
-                spec = {"urls": [it["url"]], "cfg": c, "outdir": outdir,
-                        "no_playlist": True, "source": "sniff",
-                        "title": str(it.get("title") or ""),
-                        "ext_cookie_file": c.get("_sniff_cookie_file")}
+        for it in items:
+            if self._active_task_has(it.get("url"), outdir):
+                skipped += 1
+                continue
+            c = dict(cfg)
+            # 条目自带的源类型：直链音视频才让 build_download_cmd 上 aria2c
+            # （清单/分片/小文件交给原生下载器，HLS 提速走 -N）
+            cat = str(it.get("cat") or it.get("kind") or "").strip().lower()
+            if cat:
+                c["_sniff_cat"] = cat
+            c["_sniff_seg"] = bool(it.get("seg"))
+            c["_sniff_manifest"] = bool(it.get("manifest"))
+            try:
+                c["_sniff_size"] = int(it.get("size") or 0)
+            except (TypeError, ValueError):
+                c["_sniff_size"] = 0
+            if len(items) == 1:
+                if it.get("referer") or it.get("page_url"):
+                    c["referer"] = it.get("referer") or it.get("page_url")
+                    c["_referer_explicit"] = True
+                if it.get("ua"):
+                    c["ua"] = it["ua"]
+            # 内嵌浏览器条目：把 WebView2 会话里的 cookie 写成临时罐。
+            # 与扩展提交走同一套 _sniff_cookie_file 约定，任务结束时按任务清理。
+            jar = ""
+            if str(it.get("entry") or "").strip().lower() == "embedded":
+                jar = self._embedded_cookie_file(it)
+            if jar:
+                c["_sniff_cookie_file"] = jar
+            spec = {"urls": [it["url"]], "cfg": c, "outdir": outdir,
+                    "no_playlist": True, "source": "sniff",
+                    "title": str(it.get("title") or ""),
+                    "ext_cookie_file": c.get("_sniff_cookie_file")}
+            try:
                 ids.append(self.queue.submit(spec, self._exec_download))
-        except ytdlp_queue.QueueFull as e:
-            return {"ok": False, "error": str(e)}
+            except ytdlp_queue.QueueFull as e:
+                self._drop_cookie_file(jar)
+                return {"ok": False, "error": str(e)}
         if skipped:
             self._log("[提示] 已跳过 %d 个重复链接（相同链接已在队列中下载）\n"
                       % skipped, "warn")
@@ -1136,11 +1285,51 @@ class Host:
         self._put({"type": "sniff_started"})
         return {"ok": True, "task_ids": ids}
 
-    def sniff_preview(self, url):
-        if self._web_mod is None:
-            return {"ok": False, "error": "扩展服务未启用"}
+    def _embedded_cookie_file(self, item):
+        """内嵌浏览器条目 → 临时 cookie 罐路径；取不到就返回空串。
+
+        优先媒体地址自己的 cookie，其次页面地址（不少站点的登录态只落在页面域）。
+        视图没开时 export_cookies 直接返回空，退回原来的 --cookies-from-browser。
+        """
+        emb = self.embedded
+        web = self._sniff_api()
+        if emb is None or web is None or not hasattr(web, "write_cookie_jar"):
+            return ""
+        seen = set()
+        for u in (item.get("url"), item.get("referer"), item.get("page_url")):
+            u = str(u or "").strip()
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            try:
+                jar = emb.export_cookies(u)
+            except Exception:
+                jar = []
+            if not jar:
+                continue
+            try:
+                return str(web.write_cookie_jar(jar, item.get("url") or u) or "")
+            except Exception:
+                return ""
+        return ""
+
+    @staticmethod
+    def _drop_cookie_file(path):
+        """任务没提交成功时也要删掉刚写的临时罐，别在临时目录留明文 cookie。"""
+        if not path:
+            return
         try:
-            res = self._web_mod.build_sniff_preview(url)
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def sniff_preview(self, url):
+        mod = self._sniff_api()
+        if mod is None:
+            return {"ok": False, "error": "缺少 YtDlpWeb/server.py，无法生成预览"}
+        try:
+            res = mod.build_sniff_preview(url)
         except Exception as e:
             return {"ok": False, "error": str(e)}
         if not res.get("ok"):
@@ -1148,7 +1337,7 @@ class Host:
         out = {"ok": True, "duration": res.get("duration"),
                "thumb_data_url": "", "has_clip": False}
         if res.get("thumb"):
-            path, _ = self._web_mod.preview_token_lookup(res["thumb"], "thumb")
+            path, _ = mod.preview_token_lookup(res["thumb"], "thumb")
             if path:
                 try:
                     with open(path, "rb") as f:
@@ -1157,7 +1346,7 @@ class Host:
                 except OSError:
                     pass
         if res.get("clip"):
-            path, _ = self._web_mod.preview_token_lookup(res["clip"], "clip")
+            path, _ = mod.preview_token_lookup(res["clip"], "clip")
             self._sniff_clip = path or ""
             out["has_clip"] = bool(self._sniff_clip)
         return out

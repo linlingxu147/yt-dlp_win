@@ -19,7 +19,10 @@
         "audioExt": "\\.(m4a|mp3|aac|flac|wav|ogg|opus)$",
         "biliAudio": "[-_]302\\d{2}\\.m4s$",
         "imageExt": "\\.(png|jpe?g|gif|webp|bmp|svg|avif)(\\?|#|$)",
-        "minMimeBytes": 204800
+        "minMimeBytes": 204800,
+        "opaqueMime": "^(application/octet-stream|binary/octet-stream)?$",
+        "staticExt": "\\.(js|css|json|html?|xml|txt|map|woff2?|ttf|otf|eot|svg|ico)(\\?|#|$)",
+        "fallbackBytes": 1048576
     };
     // RULE-SOURCES-END
 
@@ -66,20 +69,33 @@
         return "other";
     }
 
-    function accept(url, mime, size) {
+    function accept(url, mime, size, opts) {
         const raw = String(url || "");
         if (!/^https?:\/\//i.test(raw)) return false;
         const u = noHash(raw);
+        const path = noQuery(u);
         const m = String(mime || "");
         const n = Number(size) || 0;
+        const ranged = !!(opts && (opts.range || opts.ranged));
         const mimeHit = R.mime.test(m);
         const extHit = R.mediaExt.test(u);
-        if (!mimeHit && !extHit) return false;
-        // text/html 之类即便后缀命中也多为伪装路由，宁可放过也不刷屏
-        if (R.nonMedia.test(m) && !R.manifestMime.test(m) && !extHit) return false;
-        // 纯靠 MIME 命中且体积太小的（封面、提示音）忽略
-        if (mimeHit && !extHit && n > 0 && n < SOURCES.minMimeBytes) return false;
-        return true;
+        const pathExtHit = R.mediaExt.test(path);
+        if (mimeHit || extHit) {
+            // 非媒体 MIME 只有路径本身带媒体后缀才收：日志/埋点常把页面或媒体
+            // 地址塞进查询串，不能因为 ?url=...mp4 就当成视频。
+            if (R.nonMedia.test(m) && !R.manifestMime.test(m) && !pathExtHit) return false;
+            // 纯靠 MIME 命中且体积太小的（封面、提示音）忽略
+            if (mimeHit && !extHit && n > 0 && n < SOURCES.minMimeBytes) return false;
+            return true;
+        }
+        // 兜底：签名直链（无后缀 + application/octet-stream / 空 MIME）。
+        // 这类地址只能靠「像不像大文件」判断：有 Content-Range（分片续传）或体积过阈值，
+        // 宁可多收几条交给面板，也不要整条漏掉。传了 opts 才启用，不传维持旧行为。
+        if (!opts || !R.opaqueMime.test(m.trim())) return false;
+        // JS/CSS/字体等静态资源即便被 CDN 标成 octet-stream、体积过 1MB，也不是媒体
+        if (R.staticExt.test(path)) return false;
+        if (ranged) return true;
+        return n >= (SOURCES.fallbackBytes || 1048576);
     }
 
     function normalizeUrl(url) {

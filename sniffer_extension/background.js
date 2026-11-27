@@ -152,13 +152,15 @@ chrome.webRequest.onHeadersReceived.addListener((details) => {
     if (details.tabId < 0) return;
     const { url, statusCode } = details;
     if (statusCode < 200 || statusCode >= 400) return;
-    let mime = "", size = 0;
+    let mime = "", size = 0, ranged = false;
     for (const h of (details.responseHeaders || [])) {
         const n = (h.name || "").toLowerCase();
         if (n === "content-type") mime = h.value || "";
         else if (n === "content-length") size = parseInt(h.value, 10) || 0;
+        // 分片续传（206）说明对面是个大文件：签名直链就靠这个信号兜底
+        else if (n === "content-range") ranged = true;
     }
-    if (!SniffRules.accept(url, mime, size)) return;
+    if (!SniffRules.accept(url, mime, size, { range: ranged })) return;
     addItem(details.tabId, url, mime, size).catch(() => void chrome.runtime.lastError);
 }, { urls: ["<all_urls>"] });
 
@@ -369,6 +371,11 @@ async function submit(msg) {
         referer: msg.referer || (kind === "page" ? url : ""),
         ua: msg.ua || navigator.userAgent,
         cookie_jar: [],
+        // 源类型线索：直链音视频（非清单/分片）才值得开 aria2c 多连接
+        cat: String(msg.cat || ""),
+        seg: !!msg.seg,
+        manifest: !!msg.manifest,
+        size: Number(msg.size) || 0,
     };
     // 直链和「下载本页」都带当前页 cookies：抖音这类站点 page 提取也需要 ttwid/msToken。
     body.cookie_jar = await cookieJarFor(url);

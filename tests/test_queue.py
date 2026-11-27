@@ -455,13 +455,79 @@ class TestPurgePartials(unittest.TestCase):
             task = q.Task(1, spec(outdir=tmp))
             raw = os.path.join(tmp, "video.mp4")
             task.pstate["raw_path"] = raw
-            for p in (raw + ".part", raw + ".aria2",
+            for p in (raw + ".part", raw + ".aria2", raw + ".part.aria2",
                       os.path.join(tmp, "other.part")):
                 with open(p, "wb") as f:
                     f.write(b"x")
             removed = q.purge_partials(task)
             self.assertFalse(os.path.exists(raw + ".part"))
             self.assertFalse(os.path.exists(raw + ".aria2"))
+            self.assertFalse(os.path.exists(raw + ".part.aria2"))
             self.assertTrue(os.path.isfile(os.path.join(tmp, "other.part")))
             self.assertEqual(sorted(removed),
-                             sorted([raw + ".part", raw + ".aria2"]))
+                             sorted([raw + ".part", raw + ".aria2", raw + ".part.aria2"]))
+
+
+class TestRemoveFinished(unittest.TestCase):
+    """删除已结束任务：只清列表、活动任务拒绝、磁盘一律不动（.part 要留给历史续传）。"""
+
+    def setUp(self):
+        self.events = []
+        self.mgr = q.QueueManager(max_concurrent=2, emit=self.events.append)
+        self.exe = FakeExec()
+
+    def tearDown(self):
+        self.exe.release()
+        self.mgr.close()
+
+    def _wait_state(self, tid, state, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end:
+            t = self.mgr.get(tid)
+            if t is not None and t.state == state:
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_remove_done_task_keeps_partials_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tid = self.mgr.submit(spec(outdir=tmp), self.exe)
+            self.assertTrue(self._wait_state(tid, "running"))
+            self.exe.release()
+            self.assertTrue(self._wait_state(tid, "done"))
+            part = os.path.join(tmp, "v.mp4.part")
+            with open(part, "wb") as f:
+                f.write(b"x")
+            self.assertTrue(self.mgr.remove(tid))
+            self.assertIsNone(self.mgr.get(tid))
+            self.assertEqual(self.mgr.snapshot()["tasks"], [])
+            # 失败/停止的任务靠这个 .part 续传，删除不能顺手清文件
+            self.assertTrue(os.path.isfile(part))
+            self.assertTrue(any(e.get("action") == "removed" for e in self.events))
+
+    def test_remove_rejects_active_and_unknown(self):
+        tid = self.mgr.submit(spec(), self.exe)
+        self.assertTrue(self._wait_state(tid, "running"))
+        self.assertFalse(self.mgr.remove(tid))          # 下载中：先取消
+        self.assertIsNotNone(self.mgr.get(tid))
+        self.assertFalse(self.mgr.remove(999))          # 不存在的任务号
+
+    def test_remove_queued_task_rejected_too(self):
+        self.mgr.set_max(1)
+        a = self.mgr.submit(spec("http://e/a"), self.exe)
+        b = self.mgr.submit(spec("http://e/b"), self.exe)
+        self.assertTrue(self._wait_state(a, "running"))
+        self.assertEqual(self.mgr.get(b).state, "queued")
+        self.assertFalse(self.mgr.remove(b))
+
+    def test_remove_finished_bulk(self):
+        a = self.mgr.submit(spec("http://e/a"), self.exe)
+        b = self.mgr.submit(spec("http://e/b"), self.exe)
+        self.assertTrue(self._wait_state(a, "running"))
+        self.assertTrue(self._wait_state(b, "running"))
+        self.exe.release()
+        self.assertTrue(self._wait_state(a, "done"))
+        self.assertTrue(self._wait_state(b, "done"))
+        self.assertEqual(self.mgr.remove_finished(), 2)
+        self.assertEqual(self.mgr.snapshot()["tasks"], [])
+        self.assertEqual(self.mgr.remove_finished(), 0)   # 再清一次没有可清的

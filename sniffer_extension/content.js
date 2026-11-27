@@ -2,7 +2,7 @@
 // 职责：
 //   1) 接收页面世界钩子抛出的 CustomEvent（injected.js）
 //   2) 接收后台 webRequest 嗅探到的网络条目（net_items）
-//   3) 扫描页面 <video>/<audio> 元素
+//   3) 扫描页面 <video>/<audio>/<img> 元素（扫描器在 dom_scan.js，与桌面共用）
 //   4) 顶层框架渲染悬浮条（Shadow DOM 隔离，防站点 CSS 干扰），
 //      点「下载」把地址交给后台 → 本机扩展服务
 "use strict";
@@ -19,10 +19,12 @@
     if (isOwnWebUI()) return;
 
     const MAX_ITEMS = 60;
+    const MAX_IMAGE_ITEMS = 24;
     const items = {};          // url -> {url, kind, size, source}
     const HOST_ID = "ytdlp-sniff-host";
     let host = null, root = null, panel = null, listEl = null, statusEl = null, badge = null, polling = null;
     let showAudio = false, audioCb = null, audioText = null;
+    let showImage = false, imageCb = null, imageText = null;
     let playerEl = null, playerTitle = null;
     const previewCache = {};     // url -> {done, ok, native, duration, thumb, clip, error}
     const thumbQueue = [];
@@ -61,18 +63,33 @@
             if (size && !items[url].size) items[url].size = size;
             return;
         }
+        const k = kind || guessKind(url);
+        if (k === "image") {
+            const n = Object.keys(items).filter((x) => items[x].image).length;
+            if (n >= MAX_IMAGE_ITEMS) return;   // 图片另设小上限，别把视频条目挤掉
+        }
         items[url] = {
             url: url,
-            kind: kind || guessKind(url),
+            kind: k,
             size: size || 0,
             source: source || "",
             audio: isAudioStream(url),
+            image: k === "image",
             ts: Date.now(),
         };
         const keys = Object.keys(items);
         if (keys.length > MAX_ITEMS) {
             keys.sort((a, b) => items[a].ts - items[b].ts);
-            for (let i = 0; i < keys.length - MAX_ITEMS; i++) delete items[keys[i]];
+            let excess = keys.length - MAX_ITEMS;
+            // 先淘汰隐藏的图片，再按时间淘汰其余
+            for (const k of keys) {
+                if (excess <= 0) break;
+                if (items[k].image && !showImage) { delete items[k]; excess--; }
+            }
+            for (const k of keys) {
+                if (excess <= 0) break;
+                if (items[k]) { delete items[k]; excess--; }
+            }
         }
         if (isTop()) markDirty();
     }
@@ -141,7 +158,7 @@
                 const url = SniffRules.normalizeUrl(it.url);
                 if (isHttpUrl(url)) {
                     netSeen.add(url);
-                    addItem(url, guessKind(url), it.size || 0,
+                    addItem(url, it.kind || guessKind(url), it.size || 0,
                             msg.type === "net_items" ? "网络响应" : "iframe");
                 }
             }
@@ -158,6 +175,12 @@
 
     // ---------------- 来源 3：页面媒体元素 ----------------
     function scanElements() {
+        const dom = window.SniffDom;
+        if (dom && typeof dom.scan === "function") {
+            for (const it of dom.scan(document)) addItem(it.url, it.kind, 0, "页面元素");
+            return;
+        }
+        // 旧路径：没有共享扫描器（dom_scan.js 未加载）时只扫 video/audio
         const nodes = document.querySelectorAll("video, audio");
         for (const el of nodes) {
             const src = el.currentSrc || el.src;
@@ -201,7 +224,7 @@
         }
         #head { display: flex; flex-wrap: wrap; gap: 4px; justify-content: space-between; align-items: center; margin: 2px 4px 6px; }
         #head b { font-size: 12px; font-weight: 600; }
-        #audioToggle { display: flex; align-items: center; gap: 3px; color: #57606a;
+        #audioToggle, #imageToggle { display: flex; align-items: center; gap: 3px; color: #57606a;
                        font-size: 11px; cursor: pointer; white-space: nowrap; }
         #pageBtn { border: 1px solid #d0d7de; background: #f6f8fa; border-radius: 6px;
                    padding: 3px 10px; cursor: pointer; font-size: 12px; color: #1f2328; }
@@ -211,6 +234,7 @@
         .tag { flex: none; background: #ddf4ff; color: #0969da; border-radius: 4px;
                padding: 0 6px; font-size: 11px; min-width: 34px; text-align: center; }
         .tag.audio { background: #fff8c5; color: #9a6700; }
+        .tag.image { background: #ffeff7; color: #bf3989; }
         .label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #1f2328; }
         .dl { flex: none; border: 1px solid #1f883d; background: #2da44e; color: #fff;
               border-radius: 6px; padding: 2px 10px; cursor: pointer; font-size: 12px; }
@@ -291,6 +315,22 @@
         audioWrap.appendChild(audioCb);
         audioWrap.appendChild(audioText);
         head.appendChild(audioWrap);
+        const imageWrap = document.createElement("label");
+        imageWrap.id = "imageToggle";
+        imageWrap.title = "默认隐藏页面图片（只收宽高都 ≥ 200 的图）；勾选后显示";
+        imageCb = document.createElement("input");
+        imageCb.type = "checkbox";
+        imageCb.checked = showImage;
+        imageCb.addEventListener("change", () => {
+            showImage = imageCb.checked;
+            try { chrome.storage.local.set({ sniff_show_image: showImage }); } catch (e) { /* ignore */ }
+            render();
+        });
+        imageText = document.createElement("span");
+        imageText.textContent = " 显示图片 (0)";
+        imageWrap.appendChild(imageCb);
+        imageWrap.appendChild(imageText);
+        head.appendChild(imageWrap);
         const pageBtn = document.createElement("button");
         pageBtn.id = "pageBtn";
         pageBtn.textContent = "下载本页（yt-dlp）";
@@ -350,9 +390,11 @@
         wrap.appendChild(panel);
         root.appendChild(wrap);
         try {
-            chrome.storage.local.get({ sniff_show_audio: false }, (r) => {
+            chrome.storage.local.get({ sniff_show_audio: false, sniff_show_image: false }, (r) => {
                 showAudio = !!(r && r.sniff_show_audio);
                 if (audioCb) audioCb.checked = showAudio;
+                showImage = !!(r && r.sniff_show_image);
+                if (imageCb) imageCb.checked = showImage;
                 render();
             });
         } catch (e) { /* ignore */ }
@@ -539,8 +581,13 @@
             const n = keys.filter((k) => items[k].audio).length;
             audioText.textContent = " 显示音频 (" + n + ")";
         }
+        if (imageText) {
+            const n = keys.filter((k) => items[k].image).length;
+            imageText.textContent = " 显示图片 (" + n + ")";
+        }
         listEl.textContent = "";
-        const visible = keys.filter((k) => showAudio || !items[k].audio);
+        const visible = keys.filter((k) => (showAudio || !items[k].audio)
+                                         && (showImage || !items[k].image));
         for (const k of visible) {
             const it = items[k];
             const row = document.createElement("div");
@@ -551,15 +598,21 @@
             // 同一条第二次几乎瞬时）。滚动到可见才取，免得一开面板就排队几十个。
             const thumb = document.createElement("div");
             thumb.className = "thumb";
-            thumb.textContent = "…";
+            if (it.image) {
+                thumb.textContent = "图";
+                thumb.title = "图片条目";
+            } else {
+                thumb.textContent = "…";
+            }
             row.appendChild(thumb);
 
             const kindTag = document.createElement("span");
             kindTag.className = "tag";
             if (it.audio) kindTag.classList.add("audio");
-            kindTag.textContent = it.audio
-                ? "音频"
-                : String(it.kind || "media").toUpperCase().slice(0, 5);
+            if (it.image) kindTag.classList.add("image");
+            kindTag.textContent = it.image
+                ? "图片"
+                : (it.audio ? "音频" : String(it.kind || "media").toUpperCase().slice(0, 5));
             row.appendChild(kindTag);
 
             const label = document.createElement("span");
@@ -573,27 +626,37 @@
             meta.textContent = it.dur ? fmtDuration(it.dur) : "";
             row.appendChild(meta);
 
-            const pv = document.createElement("button");
-            pv.className = "pv";
-            pv.textContent = "试播";
-            pv.addEventListener("click", () => previewItem(it, pv));
-            row.appendChild(pv);
+            if (!it.image) {
+                const pv = document.createElement("button");
+                pv.className = "pv";
+                pv.textContent = "试播";
+                pv.addEventListener("click", () => previewItem(it, pv));
+                row.appendChild(pv);
+            }
 
             const btn = document.createElement("button");
             btn.className = "dl";
             btn.textContent = "下载";
-            btn.addEventListener("click", () => doSubmit(it.url, "media"));
+            btn.addEventListener("click", () => doSubmit(it.url, "media", it));
             row.appendChild(btn);
 
             listEl.appendChild(row);
-            observeThumb(thumb, it);
+            if (!it.image) observeThumb(thumb, it);
         }
         if (!visible.length) {
             const empty = document.createElement("div");
             empty.id = "empty";
-            empty.textContent = keys.length && !showAudio
-                ? "只发现音频单轨（已隐藏）；勾选「显示音频」可查看"
-                : "暂未发现媒体——播放一下视频试试";
+            const hiddenAudio = keys.filter((k) => items[k].audio && !showAudio).length;
+            const hiddenImage = keys.filter((k) => items[k].image && !showImage).length;
+            if (hiddenAudio && hiddenImage) {
+                empty.textContent = "只发现音频单轨和图片（都已隐藏）；勾选「显示音频」或「显示图片」可查看";
+            } else if (hiddenAudio) {
+                empty.textContent = "只发现音频单轨（已隐藏）；勾选「显示音频」可查看";
+            } else if (hiddenImage) {
+                empty.textContent = "只发现图片（已隐藏）；勾选「显示图片」可查看";
+            } else {
+                empty.textContent = "暂未发现媒体——播放一下视频试试";
+            }
             listEl.appendChild(empty);
         }
     }
@@ -603,11 +666,27 @@
     let userStopped = false;
     let ownTask = false;      // 服务端当前任务是否由本次点击发起
 
-    function doSubmit(url, kind) {
+    function sniffMeta(it) {
+        // 交给服务端的源类型线索：build_download_cmd 据此决定直链要不要上 aria2c
+        const k = String((it && it.kind) || "");
+        let cat = k;
+        if (k === "m3u8" || k === "mpd") cat = "stream";
+        if (it && it.image) cat = "image";
+        else if (it && it.audio) cat = "audio";
+        return {
+            cat: cat,
+            seg: !!(it && SniffRules.isSegment(it.url)),
+            manifest: k === "m3u8" || k === "mpd",
+            size: Number(it && it.size) || 0,
+        };
+    }
+
+    function doSubmit(url, kind, item) {
         lastKind = kind;
         userStopped = false;
         ownTask = false;
         setStatus("提交中…", "#0969da");
+        const meta = kind === "media" ? sniffMeta(item) : {};
         chrome.runtime.sendMessage({
             type: "submit",
             url: url,
@@ -616,6 +695,10 @@
             referer: location.href,
             ua: navigator.userAgent,
             page_url: location.href,
+            cat: meta.cat || "",
+            seg: !!meta.seg,
+            manifest: !!meta.manifest,
+            size: meta.size || 0,
         }, (resp) => {
             if (chrome.runtime.lastError || !resp) {
                 setStatus("发送失败：扩展后台无响应", "#cf222e");
@@ -739,15 +822,21 @@
             markDirty();
         });
     } else {
-        // iframe 里的媒体元素交给后台转发给顶层
+        // iframe 里的媒体元素交给后台转发给顶层（扫描器与顶层同一份）
         const push = () => {
             if (document.hidden) return;
-            if (!document.querySelector("video, audio, source")) return;   // 没有媒体元素就别白扫
             const found = [];
-            document.querySelectorAll("video, audio, source").forEach((el) => {
-                const src = el.currentSrc || el.src;
-                if (src && isHttpUrl(src)) found.push({ url: src, size: 0 });
-            });
+            const dom = window.SniffDom;
+            if (dom && typeof dom.scan === "function") {
+                for (const it of dom.scan(document)) {
+                    found.push({ url: it.url, kind: it.kind, size: 0 });
+                }
+            } else {
+                document.querySelectorAll("video, audio, source").forEach((el) => {
+                    const src = el.currentSrc || el.src;
+                    if (src && isHttpUrl(src)) found.push({ url: src, size: 0 });
+                });
+            }
             if (found.length) {
                 chrome.runtime.sendMessage({ type: "query_items", items: found }, () => void chrome.runtime.lastError);
             }

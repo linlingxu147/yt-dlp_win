@@ -2,7 +2,7 @@
 """ytdlp_core 的回归测试（标准库 unittest，无第三方依赖）。
 
 运行：
-    E:\\python\\python.exe -m unittest discover -s tests -v
+    py -3 -m unittest discover -s tests -v
 """
 
 import base64
@@ -171,6 +171,35 @@ class TestProgressParsing(unittest.TestCase):
 
     def test_non_progress_line(self):
         self.assertIsNone(core.parse_progress_line("[download] Destination: C:/d/a.mp4"))
+
+    def test_aria2c_readout_line(self):
+        # 外部下载器不走 --progress-template，进度只能从 aria2c 自己的读数行来
+        p = core.parse_progress_line("[#d4498d 8.4MiB/40MiB(21%) CN:1 DL:4.0MiB ETA:7s]")
+        self.assertEqual(p["pct"], 21.0)
+        self.assertEqual(p["size"], "40.0 MB")
+        self.assertEqual(p["speed"], "4.0 MB/s")
+        self.assertEqual(p["eta"], "7s")
+        self.assertEqual(p["status"], "downloading")
+
+    def test_aria2c_readout_without_percent(self):
+        p = core.parse_progress_line("[#235216 1.0MiB/40MiB CN:1 DL:696KiB ETA:57s]")
+        self.assertEqual(p["pct"], 2.5)
+        self.assertEqual(p["size"], "40.0 MB")
+        self.assertEqual(p["eta"], "57s")
+
+    def test_aria2c_readout_zero_total(self):
+        # 刚建连时总量还是 0B：别把 "-" 当成有效体积/速度
+        p = core.parse_progress_line("[#208d9d 0B/0B CN:1 DL:0B]")
+        self.assertEqual(p["pct"], 0.0)
+        self.assertEqual(p["size"], "")
+        self.assertEqual(p["speed"], "")
+
+    def test_aria2c_readout_updates_state(self):
+        st = core.new_progress_state()
+        ev = core.progress_event(st, "[#d4498d 8.4MiB/40MiB(21%) CN:1 DL:4.0MiB ETA:7s]")
+        self.assertEqual(ev["kind"], "progress")
+        self.assertEqual(st["pct"], 21.0)
+        self.assertEqual(st["speed"], "4.0 MB/s")
 
     def test_progress_event_tracks_files(self):
         st = core.new_progress_state()

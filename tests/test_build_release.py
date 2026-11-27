@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -243,6 +244,25 @@ class BuildReleaseTest(unittest.TestCase):
             self.assertIn(prefix + "dom_scan.js", names)
             self.assertIn(prefix + "sniff_rules.js", names)
             self.assertFalse(any("YtDlpGUI/" in n for n in names), names)
+
+
+class RealVersionConsistencyTest(unittest.TestCase):
+    """真实仓库的版本号必须一致：manifest 是唯一版本源，服务端/安装包都随它走。
+
+    这条以前只靠构建脚本打印警告，容易在只跑测试时漏掉；单独钉成断言后，
+    改版本忘了同步 YtDlpWeb/server.py 会直接红。
+    """
+
+    def test_manifest_and_server_version_match(self):
+        manifest_path = os.path.join(_ROOT, "sniffer_extension", "manifest.json")
+        with open(manifest_path, encoding="utf-8") as f:
+            version = json.load(f)["version"]
+
+        with open(os.path.join(_ROOT, "YtDlpWeb", "server.py"), encoding="utf-8") as f:
+            text = f.read()
+        m = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']', text, re.M)
+        self.assertIsNotNone(m, "server.py 里找不到 APP_VERSION")
+        self.assertEqual(m.group(1), version)
 
 
 if __name__ == "__main__":

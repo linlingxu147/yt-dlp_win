@@ -23,6 +23,20 @@ function detailText(t) {
   return [t.speed, t.eta, t.size].filter(Boolean).join(' · ') || '—';
 }
 
+// 删除已结束任务：只从列表移除，磁盘文件与历史页的续传点都不动
+async function removeOne(t) {
+  const ok = await window.__confirm('删除任务',
+    '从队列列表移除这条已结束的任务？只清列表，已下载的文件不受影响。', '删除');
+  if (!ok) return;
+  const r = await call('remove_task', t.id);
+  if (!r.ok) { toast(r.error || '删除失败', 'err'); return; }
+  if (selected === t.id) {   // 选中的行没了：日志面板回到公共输出
+    selected = null;
+    onSelect(null);
+  }
+  refresh();
+}
+
 function row(t) {
   const el = document.createElement('div');
   el.className = 'task-row';
@@ -63,6 +77,8 @@ function row(t) {
       const ok = await window.__confirm('取消任务', '取消将删除已下载的部分文件，确定？', '取消任务');
       if (ok) await call('cancel_task', t.id);
     }));
+  else
+    ops.append(mk('删除', () => removeOne(t)));
   el.append(title, badge, bar, detail, ops);
   el.addEventListener('click', () => {
     follow = false;
@@ -174,6 +190,21 @@ export function initQueue({ dialogs }) {
     if (!ok) return;
     const r = await call('stop_all');
     if (!r.ok) dialogs.toast(r.error || '停止失败', 'err');
+  });
+  document.getElementById('btn-clear-finished').addEventListener('click', async () => {
+    const n = cache.filter(t => !ACTIVE.includes(t.state)).length;
+    if (!n) { dialogs.toast('没有已结束的任务'); return; }
+    const ok = await dialogs.confirm('清空已结束',
+      `从列表移除 ${n} 条已结束任务？只清列表，已下载的文件不受影响。`, '清空');
+    if (!ok) return;
+    const r = await call('remove_finished');
+    if (!r.ok) { dialogs.toast(r.error || '清空失败', 'err'); return; }
+    if (cache.some(t => t.id === selected)) {
+      selected = null;
+      onSelect(null);
+    }
+    dialogs.toast(`已清空 ${r.removed || 0} 条任务`);
+    refresh();
   });
   on('queue_changed', ev => {
     if (ev.running || ev.queued) wasActive = true;

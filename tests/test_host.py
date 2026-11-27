@@ -492,6 +492,48 @@ class DownloadTest(unittest.TestCase):
             gate.set()
             self._wait_task(gui_tid)
 
+    def test_remove_task_clears_row_but_keeps_history(self):
+        """删除已结束任务：从列表摘掉，历史记录照留（失败任务还要靠它续传）。"""
+        t = self._run_download(["[download] Destination: v.mp4"], 1)   # 失败任务
+        tid = t.id
+        self.assertEqual(t.state, "failed")
+        self.assertTrue(any(h.get("task_id") == tid for h in self.host.history))
+        self.assertTrue(self.host.remove_task(tid))
+        self.assertIsNone(self.host.queue.get(tid))
+        self.assertFalse(self.host.remove_task(tid))            # 已删过
+        self.assertFalse(self.host.remove_task("abc"))          # 非法任务号
+        self.assertTrue(any(h.get("task_id") == tid for h in self.host.history))
+
+    def test_remove_task_rejects_active(self):
+        """下载中/排队中的任务不能直接删除：先取消，否则槽位计数会对不上。"""
+        started, release = threading.Event(), threading.Event()
+
+        def blocking_iter(proc, abort=None, keepalive=None, **kw):
+            started.set()
+            release.wait(5)
+            yield "[download] Destination: v.mp4"
+
+        with mock.patch.object(self.mod.core, "spawn", return_value=FakeProc(0)), \
+             mock.patch.object(self.mod.core, "iter_lines_watch", blocking_iter):
+            r = self.host.start_download(["https://x/gui"], self.cfg)
+            tid = r["task_ids"][0]
+            self.assertTrue(started.wait(5))
+            self.assertFalse(self.host.remove_task(tid))
+            self.assertIsNotNone(self.host.queue.get(tid))
+            release.set()
+            self._wait_task(tid)
+        self.assertTrue(self.host.remove_task(tid))             # 结束后就能删
+        self.assertIsNone(self.host.queue.get(tid))
+
+    def test_remove_finished_tasks_bulk(self):
+        t = self._run_download(["[download] Destination: v.mp4"], 0)
+        out = self.host.remove_finished_tasks()
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["removed"], 1)
+        self.assertEqual(self.host.queue.snapshot()["tasks"], [])
+        self.assertEqual(self.host.remove_finished_tasks()["removed"], 0)
+        self.assertEqual(t.state, "done")   # 摘掉列表不影响任务对象本身的终态
+
 
 class DetectTroubleTest(unittest.TestCase):
     def setUp(self):
@@ -726,14 +768,23 @@ class SniffServiceTest(unittest.TestCase):
         r = self.host.sniff_download([{"url": "https://cdn/x"}])
         self.assertFalse(r["ok"])
 
-    def test_sniff_items_without_service(self):
+    def test_sniff_items_work_without_service(self):
+        self.host.sniff_clear()
+        self.host.register_embedded_sniff(
+            [{"url": "https://cdn/a.mp4", "entry": "embedded"}], "https://page")
         d = self.host.sniff_items()
-        self.assertEqual(d["items"], [])
         self.assertFalse(d["svc"])
+        self.assertEqual([it["url"] for it in d["items"]], ["https://cdn/a.mp4"])
 
-    def test_sniff_preview_requires_service(self):
+    def test_web_server_module_is_cached(self):
+        mod = self.host.load_web_server()
+        self.assertIsNotNone(mod)
+        self.assertIs(mod, self.host.load_web_server())
+
+    def test_sniff_preview_unknown_url(self):
         r = self.host.sniff_preview("https://cdn/x")
         self.assertFalse(r["ok"])
+        self.assertIn("不在本机嗅探列表", r["error"])
 
     def test_sniff_play_clip_without_clip(self):
         r = self.host.sniff_play_clip()

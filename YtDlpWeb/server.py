@@ -46,7 +46,26 @@ CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 PORT_RANGE = core.PORT_RANGE
 APP_ID = "yt-dlp-web"          # 扩展靠它确认「端口上跑的是本项目」，而不是别的服务
-APP_VERSION = "1.10.1"
+APP_VERSION = "1.13.0"
+
+# ---------------- AI Agent API ----------------
+# 独立于扩展路由：token 鉴权，只给本机 AI/脚本用；扩展的 Origin 守卫保持原样。
+AGENT_API_PREFIX = "/api/agent/v1"
+AGENT_API_VERSION = 1
+AGENT_TOKEN = secrets.token_urlsafe(32)
+AGENT_DISCOVERY_FILE = core.AGENT_DISCOVERY_FILE
+AGENT_JOBS = {}
+AGENT_LOCK = threading.Lock()
+AGENT_MAX_JOBS = 100
+AGENT_MAX_URLS = 20
+AGENT_LOG_MAX = 200
+ACTIVE_SERVICE = None
+AGENT_PRESETS = {
+    "best": {"mode": "best", "merge": "mp4", "fmt": "",
+             "description": "最佳画质，自动合并为 mp4"},
+    "audio": {"mode": "audio_mp3", "merge": "", "fmt": "",
+              "description": "只取最佳音频，转 mp3"},
+}
 
 # 唯一被放行的扩展 ID——由 sniffer_extension\manifest.json 里的 "key" 决定（打包后固定不变）。
 # 以前这里是「任何 chrome-extension:// 都放行」，等于让本机的其它扩展也能改配置、
@@ -195,7 +214,13 @@ def _queue_position(tid):
 
 
 def _mirror(task, obj):
-    """把任务事件写进 SNIFF_STATE：只镜像最近一次扩展任务（token 隔离沿用）。"""
+    """把任务事件写进 SNIFF_STATE，并转发给任务自己的事件回调（agent 任务用）。"""
+    try:
+        cb = getattr(task, "ext_emit", None)
+        if cb is not None:
+            cb(obj)
+    except Exception:
+        pass
     try:
         if task.id == LAST_EXT_TASK.get("id"):
             sniff_emit(obj, task.id)
@@ -412,6 +437,325 @@ def sniff_log_json():
                 break
         d["last_error"] = err
     return d
+
+
+# ---------------- AI Agent jobs ----------------
+def _agent_base_outdir():
+    try:
+        return load_config().get("outdir") or core.DOWNLOAD_DIR
+    except Exception:
+        return core.DOWNLOAD_DIR
+
+
+def _agent_files(outdir):
+    skip = (".part", ".ytdl", ".tmp", ".temp", ".aria2")
+    files = []
+    try:
+        for root, _dirs, names in os.walk(outdir):
+            for name in names:
+                low = name.lower()
+                if name.startswith(".") or low.endswith(skip):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    continue
+                files.append({"name": name, "path": path, "size": size})
+    except OSError:
+        pass
+    files.sort(key=lambda x: x["path"].lower())
+    return files
+
+
+def _agent_trim_locked():
+    if len(AGENT_JOBS) <= AGENT_MAX_JOBS:
+        return
+    finished = sorted((j for j in AGENT_JOBS.values() if j.get("done")),
+                      key=lambda j: j.get("created_at", 0))
+    for job in finished:
+        if len(AGENT_JOBS) <= AGENT_MAX_JOBS:
+            break
+        AGENT_JOBS.pop(job["id"], None)
+
+
+def _agent_apply_event(job, obj):
+    t = (obj or {}).get("type")
+    if t == "progress":
+        for key in ("pct", "speed", "eta", "file"):
+            if obj.get(key) not in (None, ""):
+                job[key] = obj[key]
+        if not job.get("done"):
+            job["state"] = "running"
+    elif t == "done":
+        job["done"] = True
+        job["code"] = obj.get("code")
+        job["state"] = "done" if obj.get("code") == 0 else "failed"
+        job["ended_at"] = time.time()
+    else:
+        text = str(obj.get("text") or "").strip()
+        if text:
+            job["logs"].append(text)
+            del job["logs"][:-AGENT_LOG_MAX]
+            job["last_text"] = text
+            if "ERROR" in text:
+                job["error"] = text
+
+
+def _agent_task_row(tid):
+    if tid is None:
+        return None
+    try:
+        for row in _queue_snapshot().get("tasks") or []:
+            if row.get("id") == tid:
+                return row
+    except Exception:
+        pass
+    return None
+
+
+def _agent_job_json(job):
+    with AGENT_LOCK:
+        snap = dict(job)
+        snap["logs"] = list(job["logs"])
+    tid = snap.get("task_id")
+    row = _agent_task_row(tid)
+    state = row.get("state") if row else snap.get("state")
+    if snap.get("done") and state in (None, "queued", "running"):
+        state = "done" if snap.get("code") == 0 else "failed"
+    pct = row.get("pct") if row else snap.get("pct")
+    speed = row.get("speed") if row else snap.get("speed")
+    eta = row.get("eta") if row else snap.get("eta")
+    file_name = row.get("file") if row else snap.get("file")
+    code = (row.get("exit_code") if row and row.get("exit_code") is not None
+            else snap.get("code"))
+    outdir = snap.get("outdir") or (row or {}).get("outdir") or ""
+    files = _agent_files(outdir) if state == "done" else []
+    hint = ""
+    if state in ("failed", "canceled"):
+        hint = sniff_hint(code if code is not None else -1,
+                          snap.get("last_text") or "",
+                          snap.get("logs") or [], "media")
+    return {
+        "ok": True,
+        "api_version": AGENT_API_VERSION,
+        "job_id": snap.get("id"),
+        "task_id": tid,
+        "state": state or "queued",
+        "code": code,
+        "pct": pct if pct is not None else 0.0,
+        "speed": speed or "",
+        "eta": eta or "",
+        "file": file_name or "",
+        "files": files,
+        "outdir": outdir,
+        "urls": snap.get("urls") or [],
+        "title": snap.get("title") or "",
+        "preset": snap.get("preset") or "",
+        "created_at": snap.get("created_at"),
+        "started_at": (row or {}).get("started_at") or snap.get("started_at"),
+        "ended_at": (row or {}).get("ended_at") or snap.get("ended_at"),
+        "queue_position": _queue_position(tid) if state == "queued" else 0,
+        "logs": (snap.get("logs") or [])[-80:],
+        "error": snap.get("error") or "",
+        "hint": hint,
+    }
+
+
+def _agent_submit(body):
+    raw = body.get("urls")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list) or not raw:
+        return 400, {"ok": False, "error": "urls 必须是非空数组", "code": "bad_request"}
+    if len(raw) > AGENT_MAX_URLS:
+        return 400, {"ok": False, "error": "一次最多 %d 个链接" % AGENT_MAX_URLS,
+                     "code": "bad_request"}
+    urls, bad = core.sanitize_urls([str(x) for x in raw])
+    if bad:
+        return 400, {"ok": False, "error": "有链接无法识别", "invalid": bad,
+                     "code": "bad_url"}
+    if not urls:
+        return 400, {"ok": False, "error": "没有可下载的链接", "code": "bad_url"}
+    preset_name = str(body.get("preset") or "best").strip().lower()
+    preset = AGENT_PRESETS.get(preset_name)
+    if preset is None:
+        return 400, {"ok": False, "error": "preset 只支持 %s" % ", ".join(AGENT_PRESETS),
+                     "code": "bad_preset"}
+    fmt = str(body.get("format") or "").strip()
+    if fmt and (fmt.startswith("-") or core.unsafe_arg_in(fmt)
+                or any(c in fmt for c in "\r\n;\"'")):
+        return 400, {"ok": False, "error": "format 不合法", "code": "bad_format"}
+    playlist = bool(body.get("playlist", False))
+    title = str(body.get("title") or "").strip()[:200]
+
+    cfg = load_config()
+    base = os.path.abspath(cfg.get("outdir") or core.DOWNLOAD_DIR)
+    job_id = secrets.token_hex(6)
+    while True:
+        with AGENT_LOCK:
+            taken = job_id in AGENT_JOBS
+        if not taken:
+            break
+        job_id = secrets.token_hex(6)
+    outdir = os.path.join(base, "agent", job_id)
+    try:
+        os.makedirs(outdir, exist_ok=True)
+    except OSError as e:
+        return 500, {"ok": False, "error": "无法创建输出目录：%s" % e,
+                     "code": "outdir_error"}
+
+    cfg.update({
+        "outdir": outdir,
+        "open_after": False,
+        "thumb": False, "meta": False, "sub": False, "embedsub": False,
+        "pl": playlist,
+        "mode": preset["mode"],
+        "merge": preset["merge"],
+        "fmt": fmt or preset["fmt"],
+    })
+    job = {
+        "id": job_id, "task_id": None, "created_at": time.time(),
+        "urls": urls, "title": title or (urls[0] if urls else ""),
+        "preset": preset_name, "outdir": outdir, "state": "queued",
+        "pct": 0.0, "speed": "", "eta": "", "file": "",
+        "code": None, "done": False, "started_at": None, "ended_at": None,
+        "logs": [], "last_text": "", "error": "",
+    }
+    with AGENT_LOCK:
+        AGENT_JOBS[job_id] = job
+        _agent_trim_locked()
+
+    holder = {"task_id": None, "pending": []}
+    hlock = threading.Lock()
+
+    def emit(obj):
+        with hlock:
+            if holder["task_id"] is None:
+                holder["pending"].append(obj)
+                return
+        with AGENT_LOCK:
+            _agent_apply_event(job, obj)
+
+    task = {"urls": urls, "source": "agent", "cfg": cfg, "outdir": outdir,
+            "no_playlist": not playlist, "title": job["title"], "emit": emit}
+    tid, err = None, ""
+    try:
+        if TASK_SINK is not None:
+            tid = TASK_SINK(task)
+        else:
+            tid = QUEUE.submit({"urls": urls, "cfg": cfg, "outdir": outdir,
+                                "no_playlist": not playlist, "source": "agent",
+                                "title": job["title"], "emit": emit},
+                               _server_executor)
+    except ytdlp_queue.QueueFull as e:
+        err = str(e)
+    except Exception as e:
+        err = str(e)
+    if not tid:
+        with AGENT_LOCK:
+            AGENT_JOBS.pop(job_id, None)
+        try:
+            os.rmdir(outdir)
+        except OSError:
+            pass
+        return 409, {"ok": False, "error": err or "队列繁忙或链接已在下载中，请稍后重试",
+                     "code": "busy"}
+    try:
+        tid = int(tid)
+    except (TypeError, ValueError):
+        tid = None
+    with AGENT_LOCK:
+        job["task_id"] = tid
+    with hlock:
+        holder["task_id"] = tid
+        pending, holder["pending"] = holder["pending"], []
+    for obj in pending:
+        with AGENT_LOCK:
+            _agent_apply_event(job, obj)
+    return 200, {"ok": True, "job_id": job_id, "task_id": tid,
+                 "state": "queued", "outdir": outdir, "preset": preset_name}
+
+
+def _agent_cancel(job_id):
+    with AGENT_LOCK:
+        job = AGENT_JOBS.get(job_id)
+        if job is None:
+            return 404, {"ok": False, "error": "任务不存在", "code": "not_found"}
+        tid = job.get("task_id")
+        if job.get("done"):
+            return 409, {"ok": False, "error": "任务已经结束", "code": "finished"}
+    if tid is None:
+        return 409, {"ok": False, "error": "任务还没有进入队列", "code": "busy"}
+    if TASK_SINK is not None and QUEUE_STATUS is not None and STOP_HOOK is not None:
+        ok = bool(STOP_HOOK(tid))
+    elif TASK_SINK is None:
+        ok = bool(QUEUE.cancel(tid))
+    else:
+        ok = False
+    return (200 if ok else 409), {"ok": ok, "job_id": job_id,
+                                  "state": "canceling" if ok else "not_canceled"}
+
+
+def _agent_jobs_list(limit=20):
+    try:
+        limit = max(1, min(100, int(limit)))
+    except (TypeError, ValueError):
+        limit = 20
+    with AGENT_LOCK:
+        jobs = sorted(AGENT_JOBS.values(), key=lambda j: j.get("created_at", 0),
+                      reverse=True)[:limit]
+        out = [{"job_id": j["id"], "task_id": j.get("task_id"), "state": j.get("state"),
+                "title": j.get("title") or "", "urls": j.get("urls") or [],
+                "pct": j.get("pct", 0.0), "outdir": j.get("outdir") or "",
+                "created_at": j.get("created_at"), "code": j.get("code")}
+               for j in jobs]
+    return {"ok": True, "jobs": out}
+
+
+def _agent_status_json():
+    snap = _queue_snapshot()
+    return {
+        "ok": True, "app": APP_ID, "version": APP_VERSION,
+        "api_version": AGENT_API_VERSION,
+        "queue": {"running": snap.get("running", 0), "queued": snap.get("queued", 0),
+                  "paused": snap.get("paused", 0), "max": snap.get("max", 1),
+                  "busy": bool(snap.get("running") or snap.get("queued"))},
+        "presets": [{"name": k, "description": v["description"]}
+                    for k, v in AGENT_PRESETS.items()],
+        "outdir_base": _agent_base_outdir(),
+        "discovery_file": AGENT_DISCOVERY_FILE,
+    }
+
+
+def _agent_route(path):
+    if not path.startswith(AGENT_API_PREFIX + "/"):
+        return None, None
+    rest = path[len(AGENT_API_PREFIX) + 1:]
+    if rest == "status":
+        return "status", None
+    if rest == "jobs":
+        return "jobs", None
+    if rest == "shutdown":
+        return "shutdown", None
+    m = re.match(r"^jobs/([A-Za-z0-9_-]+)$", rest)
+    if m:
+        return "job", m.group(1)
+    m = re.match(r"^jobs/([A-Za-z0-9_-]+)/cancel$", rest)
+    if m:
+        return "cancel", m.group(1)
+    return None, None
+
+
+def _agent_shutdown():
+    svc = ACTIVE_SERVICE
+    if svc is None:
+        return 404, {"ok": False, "error": "服务不存在", "code": "not_found"}
+    if getattr(svc, "agent_embedded", False):
+        return 409, {"ok": False, "error": "服务由桌面版管理，请关闭桌面版",
+                     "code": "embedded"}
+    threading.Thread(target=svc.shutdown).start()
+    return 200, {"ok": True, "state": "stopping"}
 
 
 # ---------------- 嗅探条目登记与直链预览 ----------------
@@ -753,6 +1097,44 @@ class Handler(BaseHTTPRequestHandler):
 
         return True
 
+    def _agent_auth(self):
+        raw = self.headers.get("Authorization") or ""
+        token = (raw[7:].strip() if raw.lower().startswith("bearer ")
+                 else (self.headers.get("X-Agent-Token") or "").strip())
+        if not AGENT_TOKEN or not secrets.compare_digest(token, AGENT_TOKEN):
+            self._deny("agent token 无效", 401)
+            return False
+        return True
+
+    def _agent_get(self, path):
+        name, arg = _agent_route(path)
+        if name == "status":
+            return self._json(_agent_status_json())
+        if name == "jobs":
+            qs = parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            return self._json(_agent_jobs_list((qs.get("limit") or ["20"])[0]))
+        if name == "job":
+            with AGENT_LOCK:
+                job = AGENT_JOBS.get(arg)
+            if job is None:
+                return self._json({"ok": False, "error": "任务不存在",
+                                   "code": "not_found"}, 404)
+            return self._json(_agent_job_json(job))
+        return self._json({"ok": False, "error": "not found"}, 404)
+
+    def _agent_post(self, path, body):
+        name, arg = _agent_route(path)
+        if name == "jobs":
+            code, obj = _agent_submit(body)
+            return self._json(obj, code)
+        if name == "cancel":
+            code, obj = _agent_cancel(arg)
+            return self._json(obj, code)
+        if name == "shutdown":
+            code, obj = _agent_shutdown()
+            return self._json(obj, code)
+        return self._json({"ok": False, "error": "not found"}, 404)
+
     def _drain_chunked(self, limit=MAX_BODY_BYTES):
         """消费掉分块请求体。
 
@@ -854,6 +1236,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self._guard():
             return
         p = self.path.split("?")[0]
+        if p.startswith(AGENT_API_PREFIX):
+            if not self._agent_auth():
+                return
+            return self._agent_get(p)
         if p == "/api/status":
             snap = _queue_snapshot()
             tasks = snap.get("tasks") or []
@@ -883,6 +1269,13 @@ class Handler(BaseHTTPRequestHandler):
         if not self._guard(need_json=True):
             return
         p = self.path.split("?")[0]
+        if p.startswith(AGENT_API_PREFIX):
+            if not self._agent_auth():
+                return
+            body = self._body()
+            if getattr(self, "_body_too_large", False):
+                return self._json({"error": "请求体过大"}, 413)
+            return self._agent_post(p, body)
         body = self._body()
         if getattr(self, "_body_too_large", False):
             return self._json({"error": "请求体过大"}, 413)
@@ -937,6 +1330,18 @@ class Handler(BaseHTTPRequestHandler):
             if kind == "media":
                 cfg.update({"thumb": False, "meta": False, "sub": False, "embedsub": False,
                             "fmt": "b"})
+            # 嗅探条目自带的源类型：build_download_cmd 据此决定直链要不要上
+            # aria2c（清单/分片/小文件交给原生下载器）。page 提交没有 cat，
+            # 仍按 aria 开关本身走，不拦。
+            cat = str(body.get("cat") or "").strip().lower()[:16]
+            if cat in SNIFF_CATS:
+                cfg["_sniff_cat"] = cat
+            cfg["_sniff_seg"] = bool(body.get("seg"))
+            cfg["_sniff_manifest"] = bool(body.get("manifest"))
+            try:
+                cfg["_sniff_size"] = int(body.get("size") or 0)
+            except (TypeError, ValueError):
+                cfg["_sniff_size"] = 0
             if TASK_SINK is not None:
                 # 桌面版是宿主：任务交给桌面版队列，本服务只镜像状态。
                 # sink 返回 task_id（T5），token 直接对齐 task_id；入队到回填
@@ -1069,6 +1474,41 @@ def purge_stale_thumbs():
         pass
 
 
+def _agent_discovery_write(port, embedded=False):
+    data = {
+        "app": APP_ID, "version": APP_VERSION, "api_version": AGENT_API_VERSION,
+        "port": int(port), "url": "http://127.0.0.1:%d" % int(port),
+        "token": AGENT_TOKEN, "pid": os.getpid(), "started_at": time.time(),
+        "embedded": bool(embedded),
+    }
+    path = AGENT_DISCOVERY_FILE
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return True
+    except OSError:
+        return False
+
+
+def _agent_discovery_clear(port=None):
+    path = AGENT_DISCOVERY_FILE
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("pid") == os.getpid() and (
+                port is None or int(data.get("port") or 0) == int(port)):
+            os.remove(path)
+    except (OSError, ValueError):
+        pass
+
+
 class Service:
     """一个跑在后台线程里的 HTTP 服务。
 
@@ -1082,13 +1522,27 @@ class Service:
         self.port = port
         self.thread = thread
         self._closed = False
+        self.agent_enabled = False
+        self.agent_embedded = False
         self.url = "http://%s:%d" % (LISTEN_HOST, port)
+
+    def enable_agent(self, embedded=False):
+        """宿主把 TASK_SINK 接好之后再写发现文件，避免 agent 抢跑落到独立队列。"""
+        if self.agent_enabled:
+            return True
+        self.agent_embedded = bool(embedded)
+        self.agent_enabled = _agent_discovery_write(self.port, self.agent_embedded)
+        return self.agent_enabled
 
     def shutdown(self, timeout=5.0):
         """停掉服务并释放端口。可重复调用（宿主退出与 finally 都会调）。"""
         if self._closed:
             return
         self._closed = True
+        if self.agent_enabled:
+            # 先删发现文件：即使进程随后被强杀，也不会留下带 token 的陈旧文件
+            _agent_discovery_clear(self.port)
+            self.agent_enabled = False
         try:
             self.httpd.shutdown()
         except Exception:
@@ -1101,6 +1555,9 @@ class Service:
             self.thread.join(timeout)
         except Exception:
             pass
+        global ACTIVE_SERVICE
+        if ACTIVE_SERVICE is self:
+            ACTIVE_SERVICE = None
 
 
 def _port_taken(port):
@@ -1138,10 +1595,12 @@ def pick_port(port=None):
     return None, None, skipped
 
 
-def start_service(port=None):
+def start_service(port=None, agent=False):
     """启动服务并立刻返回 Service；失败抛 OSError（端口全被占）。
 
     宿主可以完全不管标准输出：这里不 print、不开浏览器。
+    agent=True 时写 agent 发现文件（端口 + 临时 token）；桌面宿主会等
+    TASK_SINK 接好后再调 Service.enable_agent()，避免抢跑。
     """
     purge_stale_cookie_files()
     purge_stale_thumbs()
@@ -1155,6 +1614,10 @@ def start_service(port=None):
     t.start()
     svc = Service(httpd, p, t)
     svc.skipped = skipped
+    if agent:
+        svc.enable_agent(embedded=False)
+    global ACTIVE_SERVICE
+    ACTIVE_SERVICE = svc
     return svc
 
 
@@ -1168,7 +1631,7 @@ def main():
             except ValueError:
                 pass
     try:
-        svc = start_service(arg_port)
+        svc = start_service(arg_port, agent=True)
     except OSError as e:
         print(e)
         return 1

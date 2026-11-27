@@ -47,6 +47,14 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(r["queued"], 0)
         self.assertEqual(r["max"], 2)
 
+    def test_remove_task_and_finished_surface(self):
+        # 非法的任务号不能抛异常：JS 侧只看到 ok=False
+        self.assertFalse(self.api.remove_task(999)["ok"])
+        self.assertFalse(self.api.remove_task("abc")["ok"])
+        r = self.api.remove_finished()
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["removed"], 0)
+
     def test_open_url_rejects_non_http(self):
         self.assertFalse(self.api.open_url("file:///C:/x")["ok"])
         self.assertFalse(self.api.open_url("javascript:alert(1)")["ok"])

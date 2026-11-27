@@ -4,11 +4,21 @@ setlocal
 title 鱿鱼浏览器工具包 · 扩展服务
 cd /d "%~dp0"
 
-rem 依次探测可用的 Python：不再写死 E:\python 这类个人机器上的路径。
+rem 依次探测可用的 Python：便携虚拟环境 → py 启动器 → PATH → python.org 常见安装目录。
+rem 变量值里自带引号，路径带空格/中文时也能正常调用；
+rem 应用商店那份 python.exe 是跳商店的占位程序，所以先用 py 启动器，PATH 那份要真跑一次才算数。
 set "PY="
-where python.exe >nul 2>nul && set "PY=python.exe"
+for %%D in ("%~dp0..\.venv" "%~dp0.venv") do (
+    if not defined PY if exist "%%~D\Scripts\python.exe" set PY="%%~D\Scripts\python.exe"
+)
+where py.exe >nul 2>nul && set "PY=py -3"
 if not defined PY (
-    where py.exe >nul 2>nul && set "PY=py -3"
+    python.exe -c "import sys" >nul 2>nul && set "PY=python.exe"
+)
+if not defined PY (
+    for /d %%D in ("%LOCALAPPDATA%\Programs\Python\Python3*" "%ProgramFiles%\Python3*") do (
+        if not defined PY if exist "%%~D\python.exe" set PY="%%~D\python.exe"
+    )
 )
 
 if not defined PY goto nopy

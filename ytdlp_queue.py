@@ -271,6 +271,42 @@ class QueueManager:
                 n += 1
         return n
 
+    def remove(self, tid):
+        """把一条已结束的任务从列表里摘掉（完成 / 失败 / 已取消都能删）。
+
+        活动任务要先取消：还在排队或下载中的不能直接删，否则槽位计数与进程注册
+        会对不上。只动内存里的队列，不碰磁盘——失败与停止的任务留着 .part，
+        历史页「继续下载」还要靠它续传。
+        """
+        with self._cv:
+            t = self._tasks.get(tid)
+            if t is None or t.state in ACTIVE:
+                return False
+            self._tasks.pop(tid, None)
+            if tid in self._order:
+                self._order.remove(tid)
+            self._cv.notify_all()
+        self._safe_emit({"type": "queue", "action": "removed",
+                         "task": t.snapshot()})
+        self._emit_changed()
+        return True
+
+    def remove_finished(self):
+        """清空所有已结束任务，返回摘掉的条数（同 remove：只清列表，不动文件）。"""
+        with self._cv:
+            ids = [i for i in self._order
+                   if i in self._tasks and self._tasks[i].state not in ACTIVE]
+            for i in ids:
+                self._tasks.pop(i, None)
+                self._order.remove(i)
+            if ids:
+                self._cv.notify_all()
+        if ids:
+            self._safe_emit({"type": "queue", "action": "removed_finished",
+                             "count": len(ids)})
+            self._emit_changed()
+        return len(ids)
+
     def _trim_finished(self):
         finished = [i for i in self._order
                     if i in self._tasks and self._tasks[i].state not in ACTIVE]
@@ -342,7 +378,9 @@ def purge_partials(task):
     for d in task.pstate.get("done") or ():
         bases.add(str(d))
     for b in bases:
-        for suffix in (".part", ".aria2"):
+        # aria2c 的控制文件叫在 .part 后面：xxx.mp4.part.aria2，
+        # 只查 base+".aria2" 会漏掉，取消后留下几十字节的孤儿。
+        for suffix in (".part", ".aria2", ".part.aria2"):
             p = b + suffix
             try:
                 if os.path.isfile(p):

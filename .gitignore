@@ -11,6 +11,9 @@ YtDlpGUI/config.json
 YtDlpWeb/config.json
 *.bak
 
+# 本机 MCP 入口配置（写死了本机绝对路径）
+.mcp.json
+
 # 本机下载历史（含下载链接，仅存本机）
 YtDlpGUI/history.json
 
@@ -37,3 +40,6 @@ runtime/*
 
 # 发布包产物（tools/build_release.py 生成）
 dist/
+
+# 安装包构建区：PyInstaller / Inno Setup 工具链与中间产物，均不入库
+build/

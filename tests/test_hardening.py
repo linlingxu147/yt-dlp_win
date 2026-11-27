@@ -436,7 +436,38 @@ class TestAria2cFallback(unittest.TestCase):
             cmd = core.build_download_cmd(dict(core.DEFAULT_CONFIG, aria=True),
                                           ["https://x/v.mp4"], warn=warns)
         self.assertIn("--external-downloader", cmd)
+        # 协议前缀：只接管 http/https 直链，m3u8/dash 仍走内置下载器
+        self.assertEqual(cmd[cmd.index("--external-downloader") + 1], "http,https:aria2c")
         self.assertEqual(warns, [])
+
+    def _cmd(self, **cfg):
+        with mock.patch.object(core, "which_tool", return_value=r"C:\bin\aria2c.exe"):
+            return core.build_download_cmd(dict(core.DEFAULT_CONFIG, aria=True, **cfg),
+                                           ["https://x/v.mp4"])
+
+    def test_stream_items_skip_aria(self):
+        # 清单/分片：aria2c 不接管，别白拼参数
+        self.assertNotIn("--external-downloader",
+                         self._cmd(_sniff_cat="stream", _sniff_manifest=True))
+        self.assertNotIn("--external-downloader",
+                         self._cmd(_sniff_cat="video", _sniff_seg=True))
+
+    def test_small_direct_link_skips_aria(self):
+        self.assertNotIn("--external-downloader",
+                         self._cmd(_sniff_cat="video", _sniff_size=3 * 1024 * 1024))
+
+    def test_big_direct_link_uses_aria(self):
+        cmd = self._cmd(_sniff_cat="video", _sniff_size=40 * 1024 * 1024)
+        self.assertIn("--external-downloader", cmd)
+        # 体积未知（0）也放行：HEAD 常被 CDN 拒
+        self.assertIn("--external-downloader", self._cmd(_sniff_cat="video", _sniff_size=0))
+
+    def test_audio_direct_link_allowed(self):
+        self.assertIn("--external-downloader",
+                      self._cmd(_sniff_cat="audio", _sniff_size=20 * 1024 * 1024))
+
+    def test_image_and_page_items_skip_aria(self):
+        self.assertNotIn("--external-downloader", self._cmd(_sniff_cat="image"))
 
 
 class TestCookieDatabaseFallback(unittest.TestCase):

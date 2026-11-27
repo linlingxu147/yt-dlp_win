@@ -30,6 +30,9 @@
 操作按钮、进度、探测结果与日志；③ 内容与格式、④ 访问与身份、⑤ 播放列表与容错、⑥ 附加内容、
 ⑦ 网络与加速、⑧ 高级 六个分区都在「设置」页里调整（随任务启动保存）。
 Referer 留空时会按站点自动（抖音 / B站 / YouTube 等），跨站设置不会串用。
+队列里每条任务按状态给操作：下载中可「暂停」、已暂停可「继续」、还没结束可「取消」（连部分文件一起清）；
+**完成 / 失败 / 已取消的任务可以「删除」**从列表里移除，顶栏「清空已结束」一次清完——
+只清列表，磁盘上的文件与「下载历史」里那条记录（失败任务要靠它续传 `.part`）都不动。
 扩展抓到的条目会回流到「扩展嗅探」页：
 每 3 秒自动刷新（只在该页可见时）、默认折叠分片、可预览试播、勾选后「下载选中」直接进桌面版流水线。
 「下载历史」页记录每次下载（成功/失败/停止，含扩展与嗅探页发起的任务，最多 500 条，
@@ -104,7 +107,8 @@ B 站这类 DASH 站点会把音频单独做成一条 `.m4s`（流 ID 302xx）�
 ## 内嵌浏览器（阶段 P1，单窗口）
 
 主界面顶栏的「内嵌浏览器」**不另开窗口**：同一个窗口整体切到浏览器视图，带原生地址栏、
-后退 / 前进 / 刷新（加载中变为「停止」），工具栏左侧的「返回下载器」切回主界面。下载器界面只是被隐藏，
+后退 / 前进 / 刷新（加载中变为「停止」）与「下载本页」，工具栏左侧的「返回下载器」切回主界面。
+下载器界面只是被隐藏，
 DOM、日志、任务状态都保留，返回即恢复；浏览器页面也保留，可再次切回继续用。
 
 - **外观**：工具栏、地址栏与起始页跟随应用当前的浅色/深色主题（应用设置了深色而系统是浅色时也一致）；
@@ -118,21 +122,96 @@ DOM、日志、任务状态都保留，返回即恢复；浏览器页面也保�
   浏览器视图第一次打开时才创建，切回下载器时只隐藏、不销毁。
 - **安全边界**：自建浏览器不经过 pywebview，页面里不存在 `window.pywebview`（任何 Python 方法都拿不到）；
   `http/https` 之外的顶层导航（`file:` / `javascript:` / `data:` 等）一律拦截并提示；
-  站点请求新窗口时交给系统浏览器；页面直接触发的下载会被取消（下载统一走嗅探列表）。
+  站点请求新窗口时在当前视图里打开，不再跳到系统浏览器（需要外部打开时用地址栏右键菜单）；
+  页面直接触发的下载会被取消：整段视频用工具栏「下载本页」，单个直链走嗅探列表。
 - **会话**：浏览器使用独立的临时 profile（`%TEMP%\ytdlp_embedded_*`，私有模式），退出时清理。
 - **网络嗅探（P1）**：浏览器视图里的网络响应按 `sniffer_extension/sniff_rules.js` 的共享规则过滤
   （MIME / 后缀 / 清单 / 分片），后台合批登记到「扩展嗅探」页；条目带 `entry=embedded`，
   同一页出现 `.m3u8` / `.mpd` 清单后分片不再登记；与扩展抓到同一 URL 时列表只保留一条
-  （入口列显示首次抓到的来源）。条目可直接预览/下载，Referer/UA 取当前页面。
-- **当前进度**：P0′ + P1 已完成；P2（页面元素补扫、`<img>` 图片分类）尚未接入。
+  （入口列显示首次抓到的来源）。条目可直接预览/下载，Referer 优先取请求头里的 `Referer`
+  （跨域 iframe 播放时才是真实来源页），没有则用当前页面地址。
+  无后缀的签名直链（`application/octet-stream`）在体积超过 1 MB 或带 `Content-Range` 时按兜底收下；
+  但 `.js/.css/字体` 等静态资源不会被这条兜底误收，`text/plain` 日志里的 `?url=...mp4` 也不算媒体。
+- **响应正文（P2）**：清单/接口类响应另走 `WebResourceRequested` + `GetContentAsync` 读正文，
+  认 `#EXTM3U` / `<MPD` 和接口 JSON 里的直链——伪装成 `text/plain` 的清单、以及靠钩子绕不过的
+  站点也能拿到。只读「文本类 + 体积已知且 ≤ 2 MB」的响应，同时并行数封顶，拿到就解除挂起。
+- **页面元素 + 正文钩子（P2）**：DOM 补扫复用 `dom_scan.js`；正文钩子复用扩展的 `injected.js`
+  （XHR / fetch / JSON.parse，另含 `responseType=json` 的 XHR、WebSocket 下发、`performance`
+  资源时序表补扫），但**只收网络层实锤过的 URL**——同一地址必须在
+  `WebResourceResponseReceived` 里真的出现过。页面世界能伪造消息，这条校验和扩展后台
+  「必须同时被 webRequest 看到」是同一套信任模型。
+- **整页下载（工具栏「下载本页」）**：把当前页 URL 交给 yt-dlp 做站点解析——B 站这类 DASH
+  页面会解析出格式并合并视频和音频。地址取 WebView2 当前的 `Source`（站点用 `pushState`
+  换页也算），取不到才退回最近一次顶层导航记录；起始页等非 http(s) 页面按钮置灰。
+  嗅探列表里的条目常常只是分片（`-1-30011.m4s` 之类，视频与音频各一条），要整段用这个入口。
+- **页面内浮条**：顶层页面右下角显示「▶ 嗅探 N」，点开是本页媒体列表（默认折叠分片，
+  支持单条或批量下载）；「下载本页」和工具栏按钮走同一条通道，把当前页 URL 交给 yt-dlp 做
+  站点解析，B 站这类 DASH 页面会合并视频和音频，不会只落下一条分片。浮条只做展示；下载请求
+  回到 Python 后必须命中本轮页面已登记的条目才进队列，页面世界改 UI 也变不出没嗅到过的地址。
+- **无需安装扩展**：内嵌浏览器的登记表、预览与 cookie 罐直接调用 `YtDlpWeb/server.py` 的模块函数
+  （宿主缓存同一个模块对象），不开「启用浏览器扩展支持」也能嗅探、预览、下载；之后再启用服务，
+  扩展上报与内嵌条目共用同一份登记表，列表不会分裂成两份。
+- **凭据**：内嵌浏览器是私有临时 profile，与 `--cookies-from-browser` 读的浏览器库不是一份。
+  下载内嵌条目时用 `CoreWebView2CookieManager` 按条目域名导出 cookie（含 httpOnly），
+  写成临时罐交给 yt-dlp，任务结束/取消即删；取不到 cookie 时才回退原来的浏览器库路径。
+- **当前进度**：P0′ + P1 + P2 已完成；不做多标签页与下载管理器。
 - **卡死排查**：界面连续 8 秒不处理消息时，程序会把 Python 线程栈追加到
   `%TEMP%\ytdlp_gui_hang.log`；正常使用不会生成这个文件。
 - **已知限制**：浏览器视图会暂时盖住下载器界面（不是页签）；切回下载器后网页继续运行，
   但可能被 Chromium 对隐藏内容做节流，HLS 后续分片可能变慢；Google 等站点会拒绝 WebView2 登录
-  （请改用系统浏览器 + 扩展）；不做多标签页、书签与下载管理器；P2 之前页面里只有 `<video>` 元素、
-  没有网络请求的直链不会自动登记。
+  （请改用系统浏览器 + 扩展）；正文钩子只收「页面真的请求过」的地址，只在接口 JSON 里出现、
+  从未请求的地址仍收不到（与扩展一致）；没有 `Content-Length`（分块传输）的响应不读正文，
+  这类清单只能靠页面钩子认；DRM 内容不支持。
 
 ---
+
+## AI / 脚本调用（Agent）
+
+桌面版启动后会自动开启本机 agent API（复用扩展服务端口）；桌面版没开时，也可以起一个无界面的独立服务：
+
+```bat
+py -3 tools\ytdlp_agent.py service start
+py -3 tools\ytdlp_agent.py status
+py -3 tools\ytdlp_agent.py service stop
+```
+
+- 服务只监听 `127.0.0.1`；端口和临时 token 写在 `runtime\agent_service.json`（不入库）。桌面内嵌的服务拒绝 `service stop`，要停请关闭桌面版。
+- AI 任务进入**与桌面版/扩展相同的下载队列**，并发数沿用 `queue_n`；进度、日志、历史（来源 `agent`）都能在桌面版看到。
+- 输出目录固定为 `<下载目录>\agent\<job_id>\`，任务只返回这些文件；不写配置、不打开资源管理器。
+- 任务记录在服务进程内存里，服务重启后查询不到（输出文件保留）。桌面版关闭会中断内嵌服务上的 AI 任务；需要跨桌面运行，用 `service start` 的独立服务。
+- 桌面版关闭了「启用浏览器扩展支持」时，内嵌的 agent 服务也不可用，请用 `service start`。
+
+### CLI（纯 JSON）
+
+```bat
+py -3 tools\ytdlp_agent.py download "https://www.bilibili.com/video/BV..." --preset best --wait
+py -3 tools\ytdlp_agent.py job <job_id>
+py -3 tools\ytdlp_agent.py jobs --limit 10
+py -3 tools\ytdlp_agent.py cancel <job_id>
+```
+
+- `--preset best|audio`；`--format 137+140` 可覆盖格式；`--playlist` 才允许整列表；`--wait` 等到结束（可用 `--timeout` 秒）。
+- 输出任务 JSON：`state`、`pct`、`speed`、`eta`、`files[].path`、`logs`、`error`、`hint`；退出码 0=完成，1=失败/取消，2=调用错误，3=等待超时。
+- 没有服务时可用 `--ensure-service` 自动后台启动独立服务；也可用 `--url/--token` 覆盖发现文件。
+
+### MCP（支持 MCP 的 AI 客户端）
+
+在客户端注册 stdio 服务（把路径换成你的实际目录）：
+
+```json
+{
+  "mcpServers": {
+    "yt-dlp": {
+      "command": "py",
+      "args": ["-3", "E:\\path\\to\\yt-dlp_win\\tools\\ytdlp_mcp.py"]
+    }
+  }
+}
+```
+
+工具：`download_video`（立即返回 `job_id`）、`job_status`、`wait_for_job`、`cancel_job`、`list_jobs`、`service_status`、`start_service`、`stop_service`。长任务不要同步等待，提交后用 `wait_for_job`/`job_status`；桌面版没开时先调 `start_service`。
+
+安全：agent 路由需要每进程随机 token，只监听本机；扩展的 Origin 守卫不变；不需要视觉、不弹窗；AI 只能取消自己提交的任务。
 
 ## 目录结构
 
@@ -160,8 +239,15 @@ yt-dlp_win\
 │   └─ 启动.bat
 ├─ YtDlpWeb\                   # 扩展服务（无网页界面）
 │   ├─ server.py               # 纯标准库 HTTP 服务（也能被桌面版当模块内嵌）
+│   ├─ agent_client.py         # AI/脚本客户端：发现端口/token、提交/查询任务
 │   ├─ config.json             # 独立模式配置（与桌面版键名一致）
 │   └─ 启动.bat
+├─ tools\                      # 独立脚本入口
+│   ├─ ytdlp_agent.py          # AI/脚本 CLI：下载、状态、等待、取消、服务启停
+│   ├─ ytdlp_mcp.py            # MCP stdio 工具层（给支持 MCP 的 AI 客户端）
+│   ├─ build_ffmpeg_min.sh     # 最小 ffmpeg 构建脚本
+│   └─ build_release.py        # 发布打包：桌面端 + 扩展 zip
+├─ installer\                   # 安装版构建：冻结入口 / 路径解析 / Inno 模板
 ├─ sniffer_extension\          # Chrome/Edge MV3 扩展
 │   ├─ manifest.json
 │   ├─ sniff_rules.js          # ★ 嗅探判定唯一真源（MIME/后缀/分片/清单/音频），桌面内嵌共用
@@ -180,8 +266,10 @@ yt-dlp_win\
 │   ├─ test_server.py          # 服务端接口、条目字段与并发闸门
 │   ├─ test_host.py            # 桌面宿主：事件泵/历史/流水线/预览播放/嗅探
 │   ├─ test_api.py             # js_api 方法面与输入校验
+│   ├─ test_agent.py           # agent API/CLI/MCP：token、任务、取消、发现文件
 │   ├─ test_embedded.py        # 内嵌浏览器/共享嗅探规则/合批与生命周期
 │   ├─ test_updater.py         # 镜像更新：URL/校验/替换回滚/下载
+│   ├─ test_portable.py        # 便携性：@{APP} 标记往返、换机后的失效路径提示
 │   ├─ fixtures\               # 探针测试用的 3 秒小样片（mkv/webm/ts/mp4）
 │   └─ extension_smoke.js      # 扩展后台冒烟（Node + 假 chrome API）
 └─ _local\                     # 本机杂物（不入库：vc140.pdb、待完成.txt 等）
@@ -200,7 +288,8 @@ yt-dlp_win\
 
 - 写入是**原子**的（临时文件 + `os.replace`，并留一份 `.bak`），断电不会写坏；
 - 加载时会做类型/取值校验并给出警告，坏值回退默认值而不是崩掉整个界面；
-- `headers` 字段会被规范化：拆分粘连的 `abcOrigin:`、去掉零宽字符/多余空白、剔除非法行、同名头去重。
+- `headers` 字段会被规范化：拆分粘连的 `abcOrigin:`、去掉零宽字符/多余空白、剔除非法行、同名头去重；
+- 落在程序目录内的路径以 `@{APP}/…` 标记落盘（见下节「可移植性」），换盘换机器后自动指向新位置。
 
 常用键：`outdir` `mode` `fmt` `merge` `tpl` `sublang` `thumb` `meta` `pl` `open_after`
 `browser` `browser_profile` `ua` `referer` `headers` `cookie`
@@ -212,12 +301,39 @@ yt-dlp_win\
 `-N 1` 4.88 MiB/s、`-N 4` 6.36、`-N 8` 6.09、`-N 32` 5.54——甜点在 4，再往上多半只是
 给自己添 403。它只对 HLS/DASH 这类分片流有效，**单个文件的直链（.mp4 一条）加多少并发
 都没用**，那种情况得靠 aria2c 多连接分段。
-`aria` 勾选会用 aria2c 下载；程序目录和 PATH 里都找不到 `aria2c.exe` 时不会拼一个必然
-失败的参数，而是自动退回 yt-dlp 自带下载器并在日志里提示（桌面版开始前会再问一次）。
+`aria` 勾选后不再「一刀切」：只有**直链音视频**（嗅探条目里 `cat=video/audio`、不是
+`.m3u8`/`.mpd` 清单、也不是分片、体积 ≥ 8MB 或未知）才交给 aria2c 多连接分段；清单/分片
+照旧走内置下载器（那里靠 `-N`），小文件也不折腾 16 连接。命令固定写成
+`--external-downloader "http,https:aria2c"`，把多连接限定在直链协议上，就算判断失误，
+m3u8/dash 也不会落到外部下载器。aria2c 的控制台读数（`[#xxxx 8.4MiB/40MiB(21%) CN:1
+DL:4.0MiB ETA:7s]`）会被解析成进度，面板不再全程 0%。程序目录和 PATH 里都找不到
+`aria2c.exe` 时不会拼一个必然失败的参数，而是自动退回 yt-dlp 自带下载器并在日志里提示
+（桌面版开始前会再问一次）。
 `net_hard` 是自动重试阶梯的总开关，桌面版有勾选框，默认开着。
 
 > `extra`（附加参数）和 `aria_args` 都经过危险参数黑名单过滤，
 > 形如 `--exec` / `--config-location` / `--downloader` / `--cookies-from-browser` 等的会被直接拒绝。
+
+### 可移植性（换盘 / 换机器）
+
+便携包的全部状态都按**当前程序目录**推导，不看盘符、不看用户名，所以整个文件夹可以随意搬家：
+
+- **配置里的应用内路径写标记**：`outdir`、`yt_dlp_path`、`cookie` 只要落在程序目录内，
+  落盘时压成 `@{APP}/runtime/downloads` 这类标记，加载时再换回当前目录的绝对路径。
+  拷到 `D:\工具\yt-dlp_win` 或 `C:\Users\别人\yt-dlp_win` 都照样能用，不用改配置；
+  程序目录以外的路径（例如 `D:\视频`）原样保留，那本来就是用户自己选的位置。
+- **路径失效不静默**：`yt_dlp_path` 指向的文件不存在时回退到 `runtime/` 或 PATH 里那份并记一条日志；
+  `outdir` 所在磁盘不存在时只提示、不擅自改（可能只是移动硬盘没插）。
+- **启动脚本不写死解释器**：`启动.bat` 依次找 便携虚拟环境（`.venv`）→ `py` 启动器 → PATH 里的
+  `python.exe`（会先真跑一次，挡掉应用商店的占位程序）→ `%LOCALAPPDATA%\Programs\Python\Python3*`
+  / `%ProgramFiles%\Python3*`；覆盖了「装 Python 时没勾 Add to PATH」这种最常见的开箱失败。
+  路径含空格/中文也安全。
+- **运行文件查找**：`runtime/` → 项目根（旧布局）→ PATH；换机器只补 `runtime\` 即可。
+- **构建机无关**：`tools/build_installer.py` 找 Inno Setup 时会看 `SQUIDKIT_ISCC` 环境变量、
+  `%LOCALAPPDATA%\Programs\Inno Setup 6|7` 和 PATH，不再只认 `C:\Program Files`。
+
+跨机器**不**保证的部分：`YtDlpGUI\history.json` 里的历史下载目录、以及浏览器 Profile 的名字。
+前者打不开时「打开目录」会退回当前下载目录并提示；后者换机器后需要重新选一次。
 
 ---
 
@@ -368,3 +484,59 @@ FFMPEG_BUILD_DIR=/e/envir/build/ffmpeg-min ./tools/build_ffmpeg_min.sh
 | `curl_cffi` / `websockets` / `pycryptodome` / `certifi` | 见 `runtime\_internal\THIRD_PARTY_LICENSES.txt` |
 
 本仓库自身的界面与嗅探代码仅为个人自用工具，请遵守目标站点的服务条款与版权规定。
+
+---
+
+## 安装版（Windows 安装包）
+
+除 zip 便携包外，还可以构建成常规 Windows 应用：双击 `squidkit-<版本>-setup.exe` 安装，
+出现在「已安装的应用」里，有开始菜单 / 桌面快捷方式、卸载入口、独立图标与版本信息，
+任务栏不再显示成 Python 进程。
+
+### 与便携包的区别
+
+| | 便携包（zip） | 安装版（setup.exe） |
+| --- | --- | --- |
+| 启动 | `YtDlpGUI\启动.bat`，需本机 Python 3.9+ | `squidkit.exe`，自带 Python 运行时，不要求装 Python |
+| 身份 | 进程是 `pythonw.exe`，任务栏沿用 Python 图标 | 独立 exe，设了 `AppUserModelID`，任务栏 / Alt-Tab 认得本应用 |
+| 配置与历史 | 写在 `YtDlpGUI\` | `%APPDATA%\SquidKit\`（首次启动会从旧位置迁移一次） |
+| 默认下载目录 | `runtime\downloads\` | 「下载」`\SquidKit\` |
+| 系统登记 | 无 | HKCU 卸载项、注册表安装路径、可选开机自启 |
+| 升级 | 覆盖解压 | 重新运行同版本或新版本安装包（AppId 相同，自动升级并保留用户数据） |
+
+安装目录默认是 `%LOCALAPPDATA%\Programs\SquidKit`，`PrivilegesRequired=lowest`，不需要管理员权限；
+`runtime\` 随程序放在该可写目录，因此内置的 yt-dlp 自动更新照常可用。
+
+**WebView2**：窗口依赖 Evergreen WebView2 运行时。Win11 与正常 Win10 自带；安装器会查
+HKLM（32/64 位视图）与 HKCU 三处登记，缺失时用内置的微软官方引导器
+（`MicrosoftEdgeWebview2Setup.exe /silent /install`，需联网）静默补装，补装失败则首次启动的弹窗
+会给出下载地址。引导器在构建时自动下载到 `build\tools\webview2\`（不入库，也不随安装包常驻磁盘：
+装到 `{tmp}` 用完即删）。
+
+安装包**未做代码签名**，来自网络的副本会触发 SmartScreen「未知发布者」，需要用户点
+「更多信息 → 仍要运行」；企业 AppLocker / 只允许签名程序的环境会直接拦截。要消除提示需自备
+代码签名证书并在 ISCC 里加 `SignTool`。
+
+### 构建
+
+```bat
+py -3 -m pip install --target build\tools\pyinstaller "pyinstaller==6.22.3"
+:: Inno Setup 7 的 ISCC.exe 放到 build\tools\inno7\，或直接用系统安装版 / PATH 中的 ISCC
+py -3 tools\build_installer.py
+```
+
+产物在 `dist\squidkit-<版本>-setup.exe`。脚本依次完成：生成多尺寸图标与 exe 版本资源 →
+PyInstaller 冻结 `squidkit.exe` → 组装 `{app}\src`（源码 + `runtime\`）→ 冻结产物无界面冒烟
+（校验 `BASE_DIR` 指向安装目录、yt-dlp / ffmpeg 能被找到）→ Inno Setup 编译安装包。
+
+调试用参数：`--skip-freeze`（复用上次冻结结果）、`--skip-selftest`、`--skip-inno`
+（只产出 `build\installer\payload\squidkit\` 与渲染好的 `squidkit.iss`）、
+`--version X.Y.Z`、`--out DIR`。
+
+构建工具与中间产物都在 `build\`（不入库）。源码 `installer\` 下的
+`squidkit_paths.py`（路径 / 身份 / 旧配置迁移）、`squidkit_launcher.py`（冻结入口）、
+`make_icon.py`（图标）、`squidkit.iss.tpl`（安装包模板）可单独单测，见 `tests\test_installer.py`。
+
+应用本体的更新靠重新运行安装包；yt-dlp 内核仍用界面里内置的更新功能（替换 `runtime\yt-dlp.exe`）。
+卸载时会询问是否一并删除 `%APPDATA%\SquidKit` 的用户数据，默认保留；下载文件不在安装目录内，
+卸载不会动它们。

@@ -6,17 +6,18 @@
 
 | FileCentipede | 本项目 |
 |---|---|
-| 扩展 content_injected.js（页面钩子） | `injected.js`（XHR / fetch / JSON.parse 钩子） |
+| 扩展 content_injected.js（页面钩子） | `injected.js`（XHR / fetch / JSON.parse / WebSocket / 资源时序表钩子） |
 | 扩展 background.js（webRequest 嗅探） | `background.js`（webRequest 嗅探 + 端口发现 + 提交） |
 | 悬浮视频条（content_medias.js） | `content.js`（聚合去重 + 悬浮条 UI） |
 | ws://127.0.0.1:10111/gloryhole | `POST http://127.0.0.1:8765-8775/api/sniff` |
 | filec.exe 下载核心 | `server.py` + `yt-dlp.exe` |
 
-## 嗅探的三个来源
+## 嗅探的四个来源
 
-1. **网络响应**（后台 webRequest）：状态码 200/206 且 `content-type` 为 `video/*`、`audio/*`、HLS/DASH 清单，或 URL 后缀为 mp4/m3u8/ts/m4s/flv/mpd 等
-2. **页面请求钩子**（注入页面世界）：拦截 XHR / fetch 响应正文识别 `#EXTM3U`（HLS）与 `<MPD`（DASH），钩住 `JSON.parse` 挖接口返回里的媒体地址
+1. **网络响应**（后台 webRequest）：状态码 200/206 且 `content-type` 为 `video/*`、`audio/*`、HLS/DASH 清单，或 URL 后缀为 mp4/m3u8/ts/m4s/flv/mpd 等；无后缀的签名直链（`application/octet-stream`）在带 `Content-Range` 或体积超过 1 MB 时兜底收下
+2. **页面请求钩子**（`injected.js` 注入页面世界）：拦截 XHR（含 `responseType=json`）/ fetch 响应正文识别 `#EXTM3U`（HLS）与 `<MPD`（DASH），钩住 `JSON.parse` 挖接口返回里的媒体地址；另有 WebSocket `message` 钩子与 `performance.getEntriesByType('resource')` 定时补扫（能捡回注入之前、或绕过钩子的请求，不扫 `.ts/.m4s` 分片）。桌面内嵌浏览器复用同一份脚本，但 Python 侧要求该 URL 在网络层真的出现过才收（`_net_seen` 实锤）。
 3. **页面元素**：扫描 `<video>/<audio>` 的 src 与 `<source>`（含 iframe 内的元素，转发到顶层汇总）
+4. **响应正文**（仅桌面内嵌浏览器）：`WebResourceRequested` + `GetContentAsync` 读清单/接口类响应正文，只有「文本类 + 体积已知且 ≤ 2 MB」的响应才读，读完立刻 Complete deferral
 
 ## 共享嗅探规则
 
@@ -131,6 +132,9 @@ B 站等 DASH 站点会把音频单独做成一条 `.m4s`（流 ID `302xx`），
 
 ## 版本
 
+- **v1.13.0**：提交下载时携带 `cat` / `seg` / `manifest` / `size` 四个源类型字段；
+  桌面版据此只给「直链音视频、非清单/分片、体积 ≥ 8MB」的任务上 aria2c，
+  清单与分片继续走内置下载器（那里靠 `-N`），小文件不再为 16 连接折腾
 - **v1.11.0**：提交成功按服务端回的 `queue_position` 提示「已加入队列，第 N 位」，立即开始
   （`0`）或旧版服务（无该字段）仍显示原提示；`task_id` 透传备用
 - **v1.10.2**：移除「边下边播」（浮动条按钮、扩展后台调用与服务端 `/api/play` 一并删除）；
@@ -169,5 +173,5 @@ B 站等 DASH 站点会把音频单独做成一条 `.m4s`（流 ID `302xx`），
 
 ## 服务端接口（server.py 新增）
 
-- `POST /api/sniff`：`{url, kind: media|page, referer, ua, cookie_jar, title}` → 启动下载线程
+- `POST /api/sniff`：`{url, kind: media|page, referer, ua, cookie_jar, title, cat, seg, manifest, size}` → 启动下载线程；`cat/seg/manifest/size` 是可选的源类型线索，决定该任务值不值得交给 aria2c
 - `GET /api/sniff/log`：`{busy, done, code, prog, last_text, kind, hint, lines}` → 扩展每 1.5 秒轮询显示进度；`hint` 是失败时服务端翻译的中文提示

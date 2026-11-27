@@ -14,7 +14,7 @@ import ytdlp_core as core  # noqa: E402
 from host import Host  # noqa: E402
 from api import Api  # noqa: E402
 
-CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+CONFIG_FILE = os.environ.get("SQUIDKIT_CONFIG_FILE") or os.path.join(APP_DIR, "config.json")
 WEBVIEW2_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
 
 

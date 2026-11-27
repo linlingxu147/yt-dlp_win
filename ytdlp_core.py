@@ -36,6 +36,8 @@ from urllib.parse import parse_qs, urlsplit
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 RUNTIME_DIR = os.path.join(BASE_DIR, "runtime")
 DOWNLOAD_DIR = os.path.join(RUNTIME_DIR, "downloads")
+# 本地服务的 agent 发现文件（端口 + 临时 token）；只在启动服务时写入
+AGENT_DISCOVERY_FILE = os.path.join(RUNTIME_DIR, "agent_service.json")
 CREATE_NO_WINDOW = 0x08000000
 PORT_RANGE = range(8765, 8776)
 
@@ -223,6 +225,14 @@ PROG_RE = re.compile(
     r"(?:\s+at\s+(?P<speed>[\d.]+\s*\S+/s))?(?:\s+ETA\s+(?P<eta>\S+))?",
 )
 FILE_RE = re.compile(r"^\[download\]\s+Destination:\s*(?P<path>.+)$")
+# aria2c 的控制台读数：外部下载器不走 --progress-template，只有这一种进度源。
+#   [#d4498d 8.4MiB/40MiB(21%) CN:1 DL:4.0MiB ETA:7s]
+# 刚开始时可能没有百分号/ETA，总量也可能还是 0B。
+ARIA_RE = re.compile(
+    r"\[#(?P<id>[0-9a-zA-Z]+)\s+(?P<dl>[^\s/]+)/(?P<total>[^\s(]+)"
+    r"(?:\((?P<pct>\d+(?:\.\d+)?)%)?(?P<rest>[^\]]*)\]"
+)
+_ARIA_FACTORS = {"B": 1, "KB": 1 << 10, "MB": 1 << 20, "GB": 1 << 30, "TB": 1 << 40}
 ITEM_RE = re.compile(r"Downloading\s+(?:item|video|playlist\s+entry)?\s*(\d+)\s+of\s+(\d+)", re.I)
 # 去掉中间格式标记，例如 xxx.f137.mp4 -> xxx.mp4
 FRAG_RE = re.compile(r"\.[fF]\d+\.(?=[^.]+$)")
@@ -299,6 +309,20 @@ def fmt_size(b):
         if b < 1024:
             return f"{b:.1f} {unit}"
     return f"{b:.1f} TB"
+
+
+def _aria_bytes(text):
+    """aria2c 的 '8.4MiB' / '125KiB' / '0B' → 字节数；认不出返回 0。"""
+    m = re.match(r"(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[KMGTP]?i?B)?",
+                 str(text or "").strip(), re.I)
+    if not m:
+        return 0
+    try:
+        num = float(m.group("num"))
+    except (TypeError, ValueError):
+        return 0
+    unit = (m.group("unit") or "B").upper().replace("I", "")
+    return int(num * _ARIA_FACTORS.get(unit, 1))
 
 
 def info_from_json(d):
@@ -431,6 +455,65 @@ def path_inside(path, root):
         return p.startswith(r)
     except Exception:
         return False
+
+
+# ---------------- 路径可移植性 ----------------
+# 便携包会被人换个盘、换台机器、换个用户名继续用。配置里只要写着
+# E:\smallUsefulTools\... 这种本机绝对路径，拷过去就指向不存在的目录。
+# 所以落在程序目录内的路径统一存成 @{APP}/runtime/downloads 这种标记，
+# 读的时候再按「当前程序目录」还原。目录外的路径（用户的 D:\视频 之类）原样保留：
+# 那是用户选的，跨机器本来就没有对应位置。
+APP_PATH_TOKEN = "@{APP}/"
+# 需要做标记化的配置键：只列路径语义的键，不碰 extra / aria_args 这类命令行文本
+PATH_KEYS = ("outdir", "yt_dlp_path", "cookie")
+
+
+def portable_encode(path):
+    """程序目录内的绝对路径 → @{APP}/ 相对标记；其余原样返回（幂等）。"""
+    s = str(path or "").strip()
+    if not s or s.startswith(APP_PATH_TOKEN) or not os.path.isabs(s):
+        return s
+    try:
+        if not path_inside(s, BASE_DIR):
+            return s
+        rel = os.path.relpath(os.path.abspath(s), BASE_DIR)
+    except Exception:
+        return s
+    if rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        return s
+    return APP_PATH_TOKEN + rel.replace(os.sep, "/")
+
+
+def portable_decode(path):
+    """@{APP}/ 标记 → 当前程序目录下的绝对路径；其余原样返回。"""
+    s = str(path or "")
+    if not s.startswith(APP_PATH_TOKEN):
+        return s
+    rel = s[len(APP_PATH_TOKEN):].replace("/", os.sep)
+    return os.path.normpath(os.path.join(BASE_DIR, rel)) if rel else BASE_DIR
+
+
+def _heal_config_paths(cfg, say):
+    """解码标记路径，并给「磁盘不存在」的老绝对路径一个明确提示。
+
+    只提示不擅自改：用户手填的 D:\\视频 可能只是暂时没插盘，悄悄换掉更气人。
+    唯一自动回退的是 yt_dlp_path——它不属于用户偏好，程序目录/PATH 里有一份就该用那份。
+    """
+    for key, value in list(cfg.items()):
+        if isinstance(value, str) and value.startswith(APP_PATH_TOKEN):
+            cfg[key] = portable_decode(value)
+    yt = str(cfg.get("yt_dlp_path") or "").strip()
+    if yt and os.path.isabs(yt) and not os.path.isfile(yt):
+        found = find_tool("yt-dlp.exe")
+        say(f"配置里的 yt-dlp 路径不存在（{yt}），已改用 {found}")
+        cfg["yt_dlp_path"] = found
+    out = str(cfg.get("outdir") or "").strip()
+    if out and os.path.isabs(out):
+        drive = os.path.splitdrive(out)[0]
+        # 只对 X:\ 这种本地盘符做检查：UNC（\\nas\share）离线与否不能靠 exists 判断，
+        # 误报「磁盘不存在」比不报更烦人。
+        if os.name == "nt" and len(drive) == 2 and drive[1] == ":" and not os.path.exists(drive + os.sep):
+            say(f"下载目录所在磁盘不存在（{out}），请在设置里改成可用的目录")
 
 
 _ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"), None)
@@ -1179,7 +1262,10 @@ def load_config(path, defaults=None, warn=None):
         cfg, warnings = coerce_config(data, base)
     except Exception as e:      # 校正逻辑自身的意外不能连累启动
         cfg, warnings = dict(base), [f"配置校正失败（{e}），已改用默认设置"]
-    for w in warnings:
+    # 便携标记还原 + 失效路径提示（换机器/换盘后最常见的那两个坑）
+    healed = []
+    _heal_config_paths(cfg, healed.append)
+    for w in list(warnings) + healed:
         if warn:
             warn(w)
     return cfg
@@ -1289,6 +1375,10 @@ def save_config(path, cfg, warn=None):
         if warn:
             warn(w)
     data["headers"] = normalize_headers(data.get("headers"))
+    # 落盘前把程序目录内的路径压成 @{APP}/ 标记：配置文件跟着便携包走，换盘换机器都能用
+    for key in PATH_KEYS:
+        if isinstance(data.get(key), str):
+            data[key] = portable_encode(data[key])
     try:
         atomic_write_text(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
         return True
@@ -1363,6 +1453,35 @@ def _exe(cfg):
     return cfg.get("yt_dlp_path") or find_tool("yt-dlp.exe")
 
 
+# 直链多连接的经验门槛：小于这个体积时，aria2c 建连/分段的固定开销
+# 比多连接省下的时间还多（一个 3MB 的 mp4 用 16 连接通常反而更慢）。
+ARIA_MIN_BYTES = 8 * 1024 * 1024
+
+
+def aria_worth_it(cfg):
+    """这个任务值不值得交给 aria2c。
+
+    cfg 带嗅探元数据（``_sniff_cat`` / ``_sniff_seg`` / ``_sniff_manifest`` /
+    ``_sniff_size``）时按源类型判断：只有「直链音视频、不是清单/分片、体积过门槛」
+    才开多连接。手工粘贴、历史重下、AI 任务没有元数据，沿用 aria 开关本身。
+    """
+    if not cfg.get("aria"):
+        return False
+    cat = str(cfg.get("_sniff_cat") or "").strip().lower()
+    if not cat:
+        return True
+    if cat not in ("video", "audio"):
+        return False
+    if cfg.get("_sniff_seg") or cfg.get("_sniff_manifest"):
+        return False
+    try:
+        size = int(cfg.get("_sniff_size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    # 体积未知（0）也放行：HEAD 常被 CDN 拒，不能因此把可能的大文件一律降级
+    return size == 0 or size >= ARIA_MIN_BYTES
+
+
 def build_download_cmd(cfg, urls, no_playlist=False, warn=None):
     cmd = [_exe(cfg), "--newline", "--progress-template", PROGRESS_TEMPLATE]
     ffmpeg = find_tool("ffmpeg.exe")
@@ -1409,10 +1528,12 @@ def build_download_cmd(cfg, urls, no_playlist=False, warn=None):
         except ValueError:
             n = 8
         cmd += ["-N", str(n)]
-    if cfg.get("aria"):
-        # 没装 aria2c 还硬加这个参数，yt-dlp 会直接退出：确认存在再加
+    if aria_worth_it(cfg):
+        # 没装 aria2c 还硬加这个参数，yt-dlp 会直接退出：确认存在再加。
+        # 协议前缀让 yt-dlp 只在 http/https 直链上用 aria2c：m3u8/dash 这类
+        # 分片流仍走内置下载器（那里提速靠 -N，不是多连接）。
         if which_tool("aria2c.exe"):
-            cmd += ["--external-downloader", "aria2c"]
+            cmd += ["--external-downloader", "http,https:aria2c"]
             if cfg.get("aria_args") and not unsafe_arg_in(cfg["aria_args"]):
                 cmd += ["--external-downloader-args", str(cfg["aria_args"])]
         elif isinstance(warn, list):
@@ -1504,6 +1625,31 @@ def parse_progress_line(line):
             name = FRAG_RE.sub(".", os.path.basename(fname.strip()))
         return {"status": status, "pct": max(0.0, min(100.0, pct)), "size": size,
                 "speed": spd, "eta": _clean_num(eta), "file": name, "raw": fname.strip()}
+    m = ARIA_RE.search(s)
+    if m:
+        total = _aria_bytes(m.group("total"))
+        rest = m.group("rest") or ""
+        raw_pct = m.group("pct")
+        if raw_pct is None:
+            # 没有百分号时按「已下/总量」估；总量还没出来就保持 0
+            try:
+                raw_pct = min(100.0, _aria_bytes(m.group("dl")) * 100.0 / total) if total else 0
+            except (TypeError, ValueError):
+                raw_pct = 0
+        spd = 0
+        sm = re.search(r"DL:(?P<v>\S+)", rest)
+        if sm:
+            spd = _aria_bytes(sm.group("v"))
+        em = re.search(r"ETA:(?P<v>\S+)", rest)
+        try:
+            pct = float(raw_pct)
+        except (TypeError, ValueError):
+            pct = 0.0
+        return {"status": "downloading", "pct": max(0.0, min(100.0, pct)),
+                "size": fmt_size(total) if total else "",
+                "speed": (fmt_size(spd) + "/s") if spd else "",
+                "eta": _clean_num(em.group("v")) if em else "",
+                "file": "", "raw": ""}
     m = PROG_RE.search(s)
     if m:
         return {"status": "downloading", "pct": float(m.group("pct")),
