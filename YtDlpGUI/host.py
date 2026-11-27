@@ -11,6 +11,7 @@ import queue
 import sys
 import threading
 import time
+from urllib.parse import urlsplit
 
 import ytdlp_core as core
 import ytdlp_queue
@@ -36,6 +37,74 @@ PROGRESS_HZ = 5
 GUI_STALL_SECONDS = 300
 TASK_LABELS = {"download": "下载", "detect": "探测资源", "trouble": "自动排障",
                "update": "更新 yt-dlp", "formats": "读取格式表"}
+# 整段媒体的常见容器后缀：条目既没有 cat=video、kind/mime 里也没有 "video" 时的兜底
+FULL_MEDIA_EXT = (".mp4", ".m4v", ".webm", ".mkv", ".mov", ".flv")
+
+
+def same_page(a, b):
+    """两条 URL 是不是同一个页面：完全相同，或同源同路径（忽略查询串差异）。
+
+    站点常用 pushState 追加 `?spm_id_from=...` 之类的参数，嗅探条目记的页面
+    与点「下载本页」时读到的地址可能只差查询串。
+    """
+    a, b = str(a or "").strip(), str(b or "").strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        x, y = urlsplit(a), urlsplit(b)
+    except ValueError:
+        return False
+    return (x.scheme, x.netloc, x.path.rstrip("/")) == (y.scheme, y.netloc, y.path.rstrip("/"))
+
+
+def site_of(url):
+    """URL 的站点名：netloc 去端口、去 www.（`https://www.douyin.com/x` → `douyin.com`）。"""
+    try:
+        host = (urlsplit(str(url or "").strip()).netloc or "").split("@")[-1]
+    except ValueError:
+        return ""
+    host = host.split(":")[0].lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def same_site(a, b):
+    """两条 URL 是不是同一个站点（含子域）。
+
+    抖音把视频放在信息流弹层里播：媒体响应登记时的顶层地址是 `https://www.douyin.com/`，
+    而「下载本页」拿到的是 `https://www.douyin.com/video/<id>` —— 同一个站点，但不是同
+    一个页面，兜底时要把这种条目也算进来。
+    """
+    ha, hb = site_of(a), site_of(b)
+    if not ha or not hb:
+        return False
+    return ha == hb or ha.endswith("." + hb) or hb.endswith("." + ha)
+
+
+def full_media_item(it):
+    """条目看起来是「整段媒体」，而不是分片 / 清单 / 纯音频 / 图片。
+
+    登记时服务端已经算好 `seg` / `manifest` / `audio` / `cat`；抖音那种
+    `kind=type=video/mp4` 的条目 mime 判不出 cat=video，这里再看 kind/mime 文本。
+    """
+    url = str(it.get("url") or "")
+    if not url or it.get("seg") or it.get("manifest") or it.get("audio"):
+        return False
+    cat = str(it.get("cat") or "").strip().lower()
+    if cat == "video":
+        return True
+    blob = " ".join(str(it.get(k) or "") for k in ("mime", "kind", "type")).lower()
+    if "video" in blob:
+        return True
+    if cat in ("audio", "image", "other"):
+        return False
+    return url.split("?", 1)[0].lower().endswith(FULL_MEDIA_EXT)
+
+
+def short_url(url, limit=80):
+    u = str(url or "")
+    return u if len(u) <= limit else u[:limit - 1] + "…"
 
 
 class Host:
@@ -417,6 +486,7 @@ class Host:
         else:
             self._task_log(task, "=== 结束，退出码 %s ===\n" % code, "err")
             self._task_diag(task)
+            self._page_fallback(task)
         self._put({"type": "done", "code": code, "task_id": task.id,
                    "elapsed": round(elapsed, 1)})
 
@@ -1198,6 +1268,70 @@ class Host:
             return {"ok": False, "error": str(e)}
         self._put({"type": "sniff_started"})
         return {"ok": True, "task_ids": [tid]}
+
+    def _page_media_items(self, page):
+        """兜底候选：先本页、后同站点嗅探到的整段媒体，各按体积从大到小。
+
+        分片 / 清单 / 纯音频在登记时已经标好，这里只挑整段的，而且**必须有已知体积**。
+        抖音页会先加载自己的静态视频素材（`douyinstatic.com/.../uuu_265.mp4`，几百 KB），
+        它同样长得像整段 MP4；真正的视频流（`douyinvod.com/.../media-video-*`）体积明确
+        更大。没有体积就是没有证据：宁可不兜底，也不给用户下个几百 KB 的占位文件。
+
+        返回 `(条目列表, 是否有本页条目)`；同站点条目排在本页条目之后（信息流弹层里
+        播的视频，登记的页面是站点首页）。
+        """
+        mod = self._sniff_api()
+        if mod is None or not page:
+            return [], False
+        try:
+            items = mod.sniff_items_json().get("items") or []
+        except Exception:
+            return [], False
+        exact, sibling = [], []
+        for it in items:
+            if not full_media_item(it):
+                continue
+            try:
+                size = int(it.get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            if size <= 0:
+                continue
+            if same_page(it.get("page_url"), page):
+                exact.append((size, it))
+            elif same_site(it.get("page_url"), page):
+                sibling.append((size, it))
+        exact.sort(key=lambda pair: pair[0], reverse=True)
+        sibling.sort(key=lambda pair: pair[0], reverse=True)
+        return ([it for _, it in exact] + [it for _, it in sibling], bool(exact))
+
+    def _page_fallback(self, task):
+        """页面级下载失败后的兜底：改用本页嗅探到的整段媒体再下一次。
+
+        抖音这类站点会挡住 yt-dlp 的页面解析（web detail JSON 返回 403），但页面
+        自己请求过的整段 MP4 已经在嗅探列表里，直接下它反而拿得到带音轨的完整视频。
+        只兜一次：兜底任务本身 source=sniff，不会再走回这里。
+        """
+        if task.source != "embedded-page" or task.cancel_requested or task.pause_requested:
+            return False
+        if getattr(task, "fallback_tried", False):
+            return False
+        task.fallback_tried = True
+        page = str(task.urls[0] if task.urls else "").strip()
+        items, exact = self._page_media_items(page)
+        if not items:
+            self._task_log(task, "[回退] 本页嗅探列表里没有可用的整段媒体，无法回退\n", "warn")
+            return False
+        item = items[0]
+        self._task_log(task, "[回退] 页面解析失败，改用%s嗅探到的整段媒体：%s\n"
+                       % ("本页" if exact else "同站点",
+                          short_url(item.get("url"))), "warn")
+        r = self.sniff_download([item])
+        if not r.get("ok"):
+            self._task_log(task, "[回退] 未能加入下载队列：%s\n"
+                           % (r.get("error") or "未知原因"), "err")
+            return False
+        return True
 
     def close_embedded_browser(self):
         b, self.embedded = self.embedded, None

@@ -907,6 +907,200 @@ class TestCookies(unittest.TestCase):
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0]["expirationDate"], 0)
 
+    def test_datetime_expiry_is_converted(self):
+        """新 SDK 的 Expires 是 DateTime（老的是 unix 秒），都要能落成时间戳。"""
+        class _When:
+            def ToFileTimeUtc(self):
+                # 2026-01-01 00:00:00 UTC = 1767225600（.NET 文件时间 = 100ns 计数）
+                return int((1767225600 + 11644473600) * 1e7)
+
+        class _NoMethod:
+            pass
+
+        got = embedded.cookies_from_webview2([
+            _Cookie(expires=_When()),
+            _Cookie(expires=_NoMethod()),
+        ])
+        self.assertEqual(got[0]["expirationDate"], 1767225600)
+        self.assertEqual(got[1]["expirationDate"], 0)
+
+
+class _NamedCookie:
+    """记录「字段是在哪个线程上读的」，用来验证读字段确实排在 UI 线程。"""
+
+    Value = "v"
+    Domain = ".example.com"
+    Path = "/"
+    IsSecure = True
+    IsHttpOnly = False
+    Expires = 0
+    IsSession = True
+
+    def __init__(self, name="sid"):
+        self._name = name
+        self.read_on = []
+
+    @property
+    def Name(self):
+        self.read_on.append(threading.current_thread().name)
+        return self._name
+
+
+class _FakeCookieTask:
+    def __init__(self, cookies, completed=True):
+        self.Result = list(cookies)
+        self.IsCompleted = completed
+
+
+class _FakeCookieManager:
+    def __init__(self, task):
+        self.task = task
+        self.calls = []
+
+    def GetCookiesAsync(self, url):
+        self.calls.append(url)
+        return self.task
+
+
+class _FakeForm:
+    """假 WinForms 窗体：委托交给一个具名线程跑，模拟 UI 线程。"""
+
+    def __init__(self, inline=False, begin_fails=False, thread_name="fake-ui"):
+        self.InvokeRequired = not inline
+        self.begin_fails = begin_fails
+        self.thread_name = thread_name
+        self.invoked = 0
+
+    def BeginInvoke(self, action):
+        if self.begin_fails:
+            raise RuntimeError("BeginInvoke 不可用")
+        t = threading.Thread(target=action, name=self.thread_name)
+        t.start()
+        t.join(timeout=2.0)
+
+    def Invoke(self, action):
+        self.invoked += 1
+        action()
+
+
+class _SystemActionStub:
+    """测试进程里没有 pythonnet：给 `from System import Action` 一个替身。
+
+    `_ui` / `_post_ui` 都靠 `System.Action` 编组委托，没它就整段被吞掉。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._saved_system = sys.modules.get("System", None)
+        stub = type(sys)("System")
+        stub.Action = lambda fn: fn
+        sys.modules["System"] = stub
+
+    def tearDown(self):
+        if self._saved_system is None:
+            sys.modules.pop("System", None)
+        else:
+            sys.modules["System"] = self._saved_system
+        super().tearDown()
+
+
+class TestExportCookies(_SystemActionStub, unittest.TestCase):
+    """export_cookies：内核对象（cookie 字段）只能在 UI 线程读。
+
+    从 worker 线程读 CoreWebView2Cookie 的字段会抛 NotImplementedException
+    （COM 接口转换失败），把整罐静默丢光；个别时候还会把窗口挂死。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.b = embedded.EmbeddedBrowser()
+        self.cookie = _NamedCookie()
+        self.mgr = _FakeCookieManager(_FakeCookieTask([self.cookie]))
+
+        class _Core:
+            def __init__(self, mgr):
+                self.CookieManager = mgr
+
+        class _Webv:
+            def __init__(self, core):
+                self.CoreWebView2 = core
+
+        self.b._webv = _Webv(_Core(self.mgr))
+        self.b._form = _FakeForm()
+        self.b._core_ready = True
+
+    def test_reads_fields_on_ui_thread(self):
+        got = self.b.export_cookies("https://www.douyin.com/video/1", timeout=2.0)
+        self.assertEqual([c["name"] for c in got], ["sid"])
+        self.assertEqual(got[0]["domain"], ".example.com")
+        self.assertEqual(self.mgr.calls, ["https://www.douyin.com/video/1"])
+        self.assertEqual(self.cookie.read_on, ["fake-ui"])
+
+    def test_refused_when_view_not_ready(self):
+        self.b._core_ready = False
+        self.assertEqual(self.b.export_cookies("https://a/"), [])
+        self.b._core_ready = True
+        self.b._form = None
+        self.assertEqual(self.b.export_cookies("https://a/"), [])
+        self.b._form = _FakeForm()
+        self.b._webv = None
+        self.assertEqual(self.b.export_cookies("https://a/"), [])
+
+    def test_only_http_urls(self):
+        self.assertEqual(self.b.export_cookies("about:blank"), [])
+        self.assertEqual(self.mgr.calls, [])
+
+    def test_inline_ui_thread_refuses_to_wait(self):
+        """已经在 UI 线程上时不能等结果，直接返回空（旧行为保持）。"""
+        self.b._form = _FakeForm(inline=True)
+        self.assertEqual(self.b.export_cookies("https://a/"), [])
+
+    def test_timeout_returns_empty_and_is_bounded(self):
+        self.mgr.task = _FakeCookieTask([self.cookie], completed=False)
+        t0 = time.time()
+        got = self.b.export_cookies("https://a/", timeout=0.2)
+        self.assertEqual(got, [])
+        self.assertLess(time.time() - t0, 3.0)
+
+    def test_channel_failure_returns_empty(self):
+        self.b._post_ui = lambda fn: False
+        self.assertEqual(self.b.export_cookies("https://a/"), [])
+
+    def test_begin_invoke_failure_falls_back_to_invoke(self):
+        self.b._form = _FakeForm(begin_fails=True)
+        got = self.b.export_cookies("https://a/", timeout=2.0)
+        self.assertEqual([c["name"] for c in got], ["sid"])
+        self.assertEqual(self.b._form.invoked, 2)      # kick + convert 各一次
+
+
+class TestPostUi(_SystemActionStub, unittest.TestCase):
+    """_post_ui：投递到 UI 线程执行、立刻返回；不可用时退回同步 Invoke。"""
+
+    def setUp(self):
+        super().setUp()
+        self.b = embedded.EmbeddedBrowser()
+
+    def test_no_form_is_false(self):
+        self.assertFalse(self.b._post_ui(lambda: None))
+
+    def test_runs_inline_when_already_on_ui_thread(self):
+        self.b._form = _FakeForm(inline=True)
+        seen = []
+        self.assertTrue(self.b._post_ui(lambda: seen.append(1)))
+        self.assertEqual(seen, [1])
+
+    def test_posts_with_begin_invoke(self):
+        self.b._form = _FakeForm()
+        seen = []
+        self.assertTrue(self.b._post_ui(lambda: seen.append(threading.current_thread().name)))
+        self.assertEqual(seen, ["fake-ui"])
+
+    def test_falls_back_to_invoke(self):
+        self.b._form = _FakeForm(begin_fails=True)
+        seen = []
+        self.assertTrue(self.b._post_ui(lambda: seen.append(1)))
+        self.assertEqual(seen, [1])
+
 
 class TestHostSniffSink(unittest.TestCase):
     def setUp(self):

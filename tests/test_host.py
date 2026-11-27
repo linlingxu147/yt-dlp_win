@@ -820,6 +820,188 @@ class SniffServiceTest(unittest.TestCase):
         self.assertIsNone(captured["queue_status"])
 
 
+class PageFallbackTest(unittest.TestCase):
+    """页面解析失败后的兜底：改用本页嗅探到的整段媒体（Host._page_fallback）。"""
+
+    PAGE = "https://www.douyin.com/video/7679426956026187035"
+    MEDIA = "https://v26-web.douyinvod.com/abc/media-video-avc1/"
+    PAGE_ERR = ["ERROR: [Douyin] 7679426956026187035: Fresh cookies "
+                "(not necessarily logged in) are needed"]
+
+    def setUp(self):
+        self.mod = load_host()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.events = []
+        self.host = self.mod.Host(os.path.join(self.tmp.name, "config.json"),
+                                  emit=self.events.append)
+        self.host.mark_ready()
+        self.host.sniff_clear()
+        # download_embedded_page 只认 self.cfg，测试把输出目录挪到临时目录、别弹资源管理器
+        self.host.cfg.update({"outdir": os.path.join(self.tmp.name, "out"),
+                              "open_after": False})
+
+    def tearDown(self):
+        self.host.sniff_clear()
+        self.host.queue.close()
+        self.tmp.cleanup()
+
+    def _register(self, items, page=None):
+        self.assertTrue(self.host.register_embedded_sniff(items, page or self.PAGE))
+
+    def _patched(self, codes):
+        """spawn 按 codes 依次返回退出码（不够就 0），行输出固定为抖音那条报错。"""
+        seq = list(codes)
+
+        def spawn(cmd, cwd=None):
+            return FakeProc(seq.pop(0) if seq else 0)
+        return mock.patch.object(self.mod.core, "spawn", side_effect=spawn), \
+            mock.patch.object(self.mod.core, "iter_lines_watch", fake_iter(self.PAGE_ERR))
+
+    def _settled(self, tid, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end:
+            t = self.host.queue.get(tid)
+            if t is not None and t.state not in ("queued", "running"):
+                return t
+            time.sleep(0.02)
+        self.fail("任务 %s 未在超时内结束" % tid)
+
+    def _wait_count(self, n, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end:
+            tasks = self.host.queue.snapshot()["tasks"]
+            if len(tasks) >= n:
+                return tasks
+            time.sleep(0.02)
+        self.fail("队列里没出现第 %d 个任务" % n)
+
+    def _log_text(self, tid):
+        t = self.host.queue.get(tid)
+        return "".join(str(i.get("text") or "") for i in (t.log_ring if t else []))
+
+    def test_media_item_helper(self):
+        self.assertTrue(self.mod.full_media_item(
+            {"url": "https://cdn/a.mp4", "cat": "video"}))
+        self.assertTrue(self.mod.full_media_item(
+            {"url": "https://cdn/x/", "kind": "type=video/mp4"}))
+        self.assertFalse(self.mod.full_media_item(
+            {"url": "https://cdn/a-1-30011.m4s", "seg": True}))
+        self.assertFalse(self.mod.full_media_item(
+            {"url": "https://cdn/a.m4s", "audio": True}))
+        self.assertFalse(self.mod.full_media_item(
+            {"url": "https://cdn/a.jpg", "cat": "image"}))
+        self.assertTrue(self.mod.same_page("https://a/v/1", "https://a/v/1?spm=1"))
+        self.assertFalse(self.mod.same_page("https://a/v/1", "https://a/v/2"))
+        self.assertFalse(self.mod.same_page("", "https://a/v/1"))
+        self.assertEqual(self.mod.site_of("https://www.douyin.com/video/1?a=1"), "douyin.com")
+        self.assertEqual(self.mod.site_of("https://v26-web.douyinvod.com/x"), "v26-web.douyinvod.com")
+        self.assertTrue(self.mod.same_site("https://www.douyin.com/video/1", "https://www.douyin.com/"))
+        self.assertTrue(self.mod.same_site("https://a.b.example/x", "https://example/y"))
+        self.assertFalse(self.mod.same_site("https://www.douyin.com/video/1", "https://other.example/1"))
+
+    def test_failed_page_download_falls_back_to_page_media(self):
+        self._register([{"url": self.MEDIA, "kind": "type=video/mp4",
+                         "mime": "type=video/mp4", "entry": "embedded",
+                         "size": 1336658}])
+        p1, p2 = self._patched([1, 0])
+        with p1, p2:
+            r = self.host.download_embedded_page(self.PAGE)
+            self.assertTrue(r["ok"], r)
+            t1 = self._settled(r["task_ids"][0])
+            tasks = self._wait_count(2)
+            fb = [t for t in tasks if t["id"] != t1.id][0]
+            self._settled(fb["id"])
+        self.assertEqual(t1.state, "failed")
+        self.assertEqual(t1.source, "embedded-page")
+        self.assertEqual(fb["urls"], [self.MEDIA])
+        self.assertEqual(fb["source"], "sniff")
+        self.assertIn("[回退]", self._log_text(t1.id))
+        self.assertEqual(fb["state"], "done")
+        # 失败的那条照旧进历史；兜底任务自己也记一条
+        self.assertEqual([h["status"] for h in self.host.history], ["failed", "ok"])
+
+    def test_page_match_ignores_query_string(self):
+        self._register([{"url": self.MEDIA, "kind": "type=video/mp4", "size": 1336658,
+                         "page_url": self.PAGE + "?spm_id_from=333.999.0.0"}],
+                       page="")
+        p1, p2 = self._patched([1, 0])
+        with p1, p2:
+            r = self.host.download_embedded_page(self.PAGE)
+            t1 = self._settled(r["task_ids"][0])
+            self._wait_count(2)
+        self.assertIn("[回退]", self._log_text(t1.id))
+
+    def test_page_fallback_prefers_biggest_over_static_asset(self):
+        # 抖音页自己的静态素材（`uuu_265.mp4`）也是整段 MP4，体积小得多
+        self._register([{"url": "https://lf-douyin-pc-web.douyinstatic.com/obj/uuu_265.mp4",
+                         "cat": "video", "size": 194560},
+                        {"url": self.MEDIA, "kind": "type=video/mp4", "size": 1336658}])
+        p1, p2 = self._patched([1, 0])
+        with p1, p2:
+            r = self.host.download_embedded_page(self.PAGE)
+            t1 = self._settled(r["task_ids"][0])
+            tasks = self._wait_count(2)
+            fb = [t for t in tasks if t["id"] != t1.id][0]
+        self.assertEqual(fb["urls"], [self.MEDIA])
+
+    def test_page_fallback_needs_known_size(self):
+        # 体积未知就是没有证据：宁可不下，也不给个几百 KB 的占位素材
+        self._register([{"url": "https://lf-douyin-pc-web.douyinstatic.com/obj/uuu_265.mp4",
+                         "cat": "video"}])
+        p1, p2 = self._patched([1, 0])
+        with p1, p2:
+            r = self.host.download_embedded_page(self.PAGE)
+            t1 = self._settled(r["task_ids"][0])
+        self.assertEqual(len(self.host.queue.snapshot()["tasks"]), 1)
+        self.assertIn("没有可用的整段媒体", self._log_text(t1.id))
+
+    def test_page_fallback_skips_segments_and_audio(self):
+        self._register([{"url": "https://cdn/a-1-30011.m4s", "mime": "video/mp4"},
+                        {"url": "https://cdn/a-1-30280.m4s", "mime": "audio/mp4"}])
+        p1, p2 = self._patched([1, 0])
+        with p1, p2:
+            r = self.host.download_embedded_page(self.PAGE)
+            t1 = self._settled(r["task_ids"][0])
+        self.assertEqual(t1.state, "failed")
+        self.assertEqual(len(self.host.queue.snapshot()["tasks"]), 1)
+        self.assertNotIn("改用本页嗅探到的整段媒体", self._log_text(t1.id))
+
+    def test_page_fallback_uses_same_site_item(self):
+        # 抖音把视频放在信息流弹层里播：媒体登记的页面是 https://www.douyin.com/
+        self._register([{"url": self.MEDIA, "kind": "type=video/mp4", "size": 1068455}],
+                       page="https://www.douyin.com/")
+        p1, p2 = self._patched([1, 0])
+        with p1, p2:
+            r = self.host.download_embedded_page(self.PAGE)
+            t1 = self._settled(r["task_ids"][0])
+            tasks = self._wait_count(2)
+            fb = [t for t in tasks if t["id"] != t1.id][0]
+        self.assertEqual(fb["urls"], [self.MEDIA])
+        self.assertIn("同站点", self._log_text(t1.id))
+
+    def test_page_fallback_ignores_other_pages(self):
+        self._register([{"url": self.MEDIA, "kind": "type=video/mp4", "size": 1336658}],
+                       page="https://other.example/video/1")
+        p1, p2 = self._patched([1, 0])
+        with p1, p2:
+            r = self.host.download_embedded_page(self.PAGE)
+            t1 = self._settled(r["task_ids"][0])
+        self.assertEqual(len(self.host.queue.snapshot()["tasks"]), 1)
+        self.assertIn("没有可用的整段媒体", self._log_text(t1.id))
+
+    def test_normal_task_failure_does_not_fall_back(self):
+        self._register([{"url": self.MEDIA, "kind": "type=video/mp4", "size": 1336658}])
+        cfg = dict(self.host.cfg)
+        p1, p2 = self._patched([1, 0])
+        with p1, p2:
+            r = self.host.start_download([self.PAGE], cfg)
+            self.assertTrue(r["ok"], r)
+            t1 = self._settled(r["task_ids"][0])
+        self.assertEqual(t1.state, "failed")
+        self.assertEqual(len(self.host.queue.snapshot()["tasks"]), 1)
+        self.assertNotIn("改用本页嗅探到的整段媒体", self._log_text(t1.id))
+
+
 class UpdateMirrorFlowTest(unittest.TestCase):
     def test_official_failure_without_mirror_logs_hint(self):
         mod = load_host()

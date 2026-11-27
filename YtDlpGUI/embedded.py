@@ -900,11 +900,27 @@ def task_text(task, timeout=_BODY_TIMEOUT, limit=_BODY_MAX_BYTES):
         return ""
 
 
+def _cookie_expires(value):
+    """WebView2 的 cookie 过期时间：有的 SDK 给 unix 秒（double），有的给 DateTime。"""
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except Exception:
+        pass
+    try:                                   # System.DateTime（1601 起的 100ns 数）
+        return float(value.ToFileTimeUtc()) / 1e7 - 11644473600.0
+    except Exception:
+        return 0.0
+
+
 def cookies_from_webview2(cookies):
     """CoreWebView2Cookie 列表 → 服务端 write_cookie_jar 认的字典列表。
 
     只搬 yt-dlp 真正用得到的字段；会话 cookie 的 Expires 为负/0，统一按 0
     （服务端会补一年）。任何一条取字段失败都跳过，不影响整罐。
+
+    ⚠ 只能在 UI 线程调用（cookie 字段要从 COM 接口读，见 EmbeddedBrowser._post_ui）。
     """
     out = []
     for c in cookies or []:
@@ -912,10 +928,7 @@ def cookies_from_webview2(cookies):
             name = str(getattr(c, "Name", "") or "")
             if not name:
                 continue
-            try:
-                expires = float(getattr(c, "Expires", 0) or 0)
-            except (TypeError, ValueError):
-                expires = 0
+            expires = _cookie_expires(getattr(c, "Expires", 0))
             if bool(getattr(c, "IsSession", False)) or expires <= 0:
                 expires = 0
             out.append({
@@ -2616,8 +2629,11 @@ class EmbeddedBrowser:
     def export_cookies(self, url, timeout=2.0):
         """从 WebView2 的 CookieManager 取该 URL 会带的 cookie（含 httpOnly）。
 
-        必须在非 UI 线程调用：先 Invoke 到 UI 线程发出异步请求，再在调用线程
-        等结果（不阻塞 UI）。视图没开、内核没就绪或超时都返回空列表。
+        必须在非 UI 线程调用：调用线程只轮询普通 Python 状态，最多等 timeout 秒。
+        所有 WebView2 对象的访问（GetCookiesAsync、读 cookie 字段）都经 `_post_ui`
+        排在 UI 线程上做 —— cookie 对象在别的线程上读字段会抛 NotImplementedException
+        （COM 接口转换失败）把整罐静默丢光，个别时候还会把窗口挂死。
+        视图没开、内核没就绪或超时都返回空列表。
         """
         u = str(url or "").strip()
         if not u.lower().startswith(("http://", "https://")):
@@ -2637,14 +2653,22 @@ class EmbeddedBrowser:
                 return
             try:
                 box["task"] = core.CookieManager.GetCookiesAsync(u)
-            except Exception:
-                pass
+            except Exception as exc:
+                box["error"] = "获取 cookie 失败：%s" % (exc,)
 
-        self._ui(kick)
-        task = box.get("task")
-        if task is None:
+        if not self._post_ui(kick):
             return []
         deadline = time.time() + max(0.5, float(timeout or 2.0))
+        task = None
+        while time.time() < deadline:
+            task = box.get("task")
+            if task is not None:
+                break
+            if box.get("error"):
+                return []
+            time.sleep(0.02)
+        if task is None:
+            return []
         while time.time() < deadline:
             try:
                 if task.IsCompleted:
@@ -2654,10 +2678,21 @@ class EmbeddedBrowser:
             time.sleep(0.02)
         else:
             return []
-        try:
-            return cookies_from_webview2(task.Result)
-        except Exception:
+
+        def convert():
+            try:
+                box["cookies"] = cookies_from_webview2(task.Result)
+            except Exception as exc:
+                box["error"] = "读取 cookie 失败：%s" % (exc,)
+            box["read"] = True
+
+        if not self._post_ui(convert):
             return []
+        while time.time() < deadline:
+            if box.get("read"):
+                return list(box.get("cookies") or [])
+            time.sleep(0.02)
+        return []
 
     def _update_page_url(self, source):
         u = str(source or "")
@@ -2779,6 +2814,35 @@ class EmbeddedBrowser:
                 fn()
         except Exception:
             pass
+
+    def _post_ui(self, fn):
+        """把 fn 排到 UI 线程执行、立刻返回（不等待）。
+
+        WebView2 的 CoreWebView2Cookie 这类内核对象只能在自己的 UI 线程上读字段：
+        从 worker 线程读会抛 NotImplementedException（COM 接口转换失败），偶尔还会
+        在跨 apartment 调用里把整个窗口挂住。所以凡是要碰内核对象的委托都先投递，
+        调用线程只轮询普通 Python 状态。返回 True 表示已投递（或已就地执行）。
+        """
+        form = self._form
+        if form is None:
+            return False
+        try:
+            if not form.InvokeRequired:
+                fn()
+                return True
+        except Exception:
+            return False
+        try:
+            from System import Action
+            form.BeginInvoke(Action(fn))
+            return True
+        except Exception:
+            pass
+        try:                                   # 退路：BeginInvoke 不可用时同步 Invoke
+            self._ui(fn)
+            return True
+        except Exception:
+            return False
 
     def _set_status(self, text, bad=False, busy=False):
         self.last_status = text

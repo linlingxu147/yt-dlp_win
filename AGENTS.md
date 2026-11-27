@@ -31,6 +31,14 @@ WebView2 没有隔离世界注入，页面世界发来的 DOM / 正文钩子消�
 强制 `bv*+ba/b` 让 DASH 站点合并音视频；工具栏「下载本页」（`download_page()`）走同一条
 通道，地址取 WebView2 当前 `Source`（`_current_url()`，站点 `pushState` 换页也拿得准），
 取不到回退 `_page_url`，两条入口共用 `_submit_page_download`。
+WebView2 的 COM 对象不能跨线程碰：`CookieManager`、`CoreWebView2Cookie` 的字段只在 UI 线程访问
+（后台线程直读会抛 `E_NOINTERFACE`，`cookies_from_webview2` 里的逐条 `except` 会把整罐悄悄丢空，
+偶发还把界面卡死）。导出 cookie 用 `_post_ui`（`BeginInvoke` 投递、不等待）分两段做：worker 只轮询
+`box` 里的 .NET 属性，字段转换回 UI 线程完成；`cookies_from_webview2` / `_cookie_expires` 只许在
+UI 线程调用（`Expires` 在部分 SDK 上是 `DateTime`，`_cookie_expires` 兼容两种）。
+页面级下载失败（`source=="embedded-page"`）后由 `Host._page_fallback` 兜一次：改用本页、找不到
+就用同站点嗅探到的整段媒体再下一次（抖音把视频放在信息流弹层里，条目登记的页面是站点首页），
+候选由 `_page_media_items` 选——必须是整段、**必须有已知体积**，再取体积最大的，只兜一次。
 
 ## 运行目录
 
