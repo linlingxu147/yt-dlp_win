@@ -34,3 +34,6 @@ _local/
 # 运行时目录：exe / _internal / ffmpeg / downloads 留在本机，仅说明入库
 runtime/*
 !runtime/README.md
+
+# 发布包产物（tools/build_release.py 生成）
+dist/
