@@ -39,6 +39,10 @@ TASK_LABELS = {"download": "下载", "detect": "探测资源", "trouble": "自�
                "update": "更新 yt-dlp", "formats": "读取格式表"}
 # 整段媒体的常见容器后缀：条目既没有 cat=video、kind/mime 里也没有 "video" 时的兜底
 FULL_MEDIA_EXT = (".mp4", ".m4v", ".webm", ".mkv", ".mov", ".flv")
+# 页面解析失败后允许「改用嗅探到的整段媒体」兜底的来源：
+# 内嵌浏览器「下载本页」（embedded-page）、桌面粘贴的链接（gui）、扩展 / HTTP API 的页面任务（ext）。
+# 直链任务（sniff / embedded-link）不兜底——那本来就是「就下这一条」。
+PAGE_FALLBACK_SOURCES = ("embedded-page", "gui", "ext")
 
 
 def same_page(a, b):
@@ -46,6 +50,8 @@ def same_page(a, b):
 
     站点常用 pushState 追加 `?spm_id_from=...` 之类的参数，嗅探条目记的页面
     与点「下载本页」时读到的地址可能只差查询串。
+    抖音精选弹窗页 `/jingxuan?modal_id=<id>` 与标准视频页 `/video/<id>` 是同一
+    个作品（页面地址形态不同），交给 `core.normalize_site_url` 归一后再比一次。
     """
     a, b = str(a or "").strip(), str(b or "").strip()
     if not a or not b:
@@ -56,7 +62,13 @@ def same_page(a, b):
         x, y = urlsplit(a), urlsplit(b)
     except ValueError:
         return False
-    return (x.scheme, x.netloc, x.path.rstrip("/")) == (y.scheme, y.netloc, y.path.rstrip("/"))
+    if (x.scheme, x.netloc, x.path.rstrip("/")) == (y.scheme, y.netloc, y.path.rstrip("/")):
+        return True
+    try:
+        na, nb = core.normalize_site_url(a), core.normalize_site_url(b)
+    except Exception:
+        return False
+    return bool(na) and na == nb
 
 
 def site_of(url):
@@ -523,11 +535,41 @@ class Host:
         self.open_outdir(d)
 
     # ---------------- 扩展 / 嗅探提交 ----------------
+    def _webview_cookie_file(self, task, urls, cfg):
+        """API/扩展的「下载本页」没自带凭据时，借内嵌浏览器那份已登录的 WebView2 会话。
+
+        扩展提交会直接把当前页 cookie 送进来（server.py 写罐后塞进 cfg["cookie"]），
+        这里只兜没人送凭据的情况：调用方（脚本、Agent、桌面 UI 之外的入口）不必先
+        在内嵌浏览器里手动点一次「下载本页」。视图没开或导出为空就保持原样，
+        仍退回 yt-dlp 自己的浏览器库路径。
+        """
+        if cfg.get("cookie") or cfg.get("cookie_header"):
+            return
+        if str(task.get("kind") or "") != "page":
+            return
+        page = str(urls[0] if urls else "")
+        if not page.lower().startswith(("http://", "https://")):
+            return
+        jar = self._embedded_cookie_file({"url": page, "page_url": page,
+                                          "referer": cfg.get("referer") or page})
+        if not jar:
+            return
+        cfg["cookie"] = jar
+        cfg["_sniff_cookie_file"] = jar
+        # 已经有完整 cookie 了：别再让 yt-dlp 去读浏览器那个大概率被独占锁住的库
+        cfg["browser"] = "（不使用）"
+        cfg["browser_profile"] = ""
+
     def _ext_spec(self, task):
         cfg = dict(task.get("cfg") or {})
         urls = list(task.get("urls") or ([task["url"]] if task.get("url") else []))
+        # 扩展 / HTTP API 送来的页面地址也走一遍站点归一：抖音精选弹窗页
+        # `/jingxuan?modal_id=<id>` 要换成 `/video/<id>`，yt-dlp 才认（服务端
+        # `/api/sniff` 已经换过，这里兜住 MCP、旧扩展等其它调用方）。
+        urls = [core.normalize_site_url(u) for u in urls if str(u or "").strip()]
         if not urls:
             return None
+        self._webview_cookie_file(task, urls, cfg)
         outdir = cfg.get("outdir") or core.DOWNLOAD_DIR
         try:
             os.makedirs(outdir, exist_ok=True)
@@ -1174,6 +1216,89 @@ class Host:
         return r
 
     # ---------------- 内嵌浏览器 ----------------
+    QUEUE_ROWS_MAX = 8
+
+    def _queue_row(self, row):
+        """一条任务的显示字段（右上角展开面板用，不含下载参数）。"""
+        urls = row.get("urls") or []
+        label = str(row.get("title") or "") or (str(urls[0]) if urls else "")
+        try:
+            pct = int(round(float(row.get("pct") or 0)))
+        except Exception:
+            pct = 0
+        return {"id": row.get("id"), "label": short_url(label, 60),
+                "state": str(row.get("state") or ""), "pct": pct,
+                "speed": str(row.get("speed") or ""), "eta": str(row.get("eta") or ""),
+                "size": str(row.get("size") or ""), "file": str(row.get("file") or "")}
+
+    def queue_summary(self):
+        """右上角下载面板的摘要 + 任务列表（只给内嵌浏览器页面显示用）。
+
+        pct/speed/label 取第一个运行中的任务；tasks 是最新 8 条（新的在上），
+        页面拿不到下载参数，操作只走 embedded_queue_action。
+        """
+        snap = self.queue.snapshot()
+        rows = snap.get("tasks") or []
+        failed = sum(1 for r in rows if r.get("state") == "failed")
+        done = sum(1 for r in rows if r.get("state") == "done")
+        pct, speed, label = 0, "", ""
+        for row in rows:
+            if row.get("state") != "running":
+                continue
+            item = self._queue_row(row)
+            pct, speed, label = item["pct"], item["speed"], item["label"]
+            break
+        recent = [self._queue_row(r) for r in rows[-self.QUEUE_ROWS_MAX:]]
+        recent.reverse()
+        return {"running": int(snap.get("running") or 0),
+                "queued": int(snap.get("queued") or 0),
+                "failed": failed, "done": done,
+                "pct": pct, "speed": speed, "label": label,
+                "total": len(rows), "tasks": recent}
+
+    def embedded_queue_action(self, act, tid):
+        """内嵌浏览器下载面板里的操作：取消/暂停/继续/移除。
+
+        页面世界不可信，所以这里只认「act 是白名单里的动作 + id 真的在队列里」，
+        其它一律拒绝。取消/移除与桌面端同义：取消会清部分文件，移除只清列表
+        （失败/停止的任务还留着 .part 给历史页续传）。
+        """
+        act = str(act or "").strip()
+        if act not in ("cancel", "pause", "resume", "remove"):
+            return {"ok": False, "error": "不支持的队列操作"}
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "任务编号无效"}
+        task = self.queue.get(tid)
+        if task is None:
+            return {"ok": False, "error": "任务已不在队列里"}
+        if act == "cancel":
+            # 已结束的条目等价于「从列表移除」，活动任务才是真取消
+            if task.state in ytdlp_queue.ACTIVE:
+                ok = self.cancel_task(tid)
+            else:
+                ok = self.remove_task(tid)
+        elif act == "remove":
+            ok = self.remove_task(tid)
+        else:
+            ok = self.queue.pause(tid) if act == "pause" else self.queue.resume(tid)
+        if not ok:
+            return {"ok": False, "error": "这个状态不能%s" % {"cancel": "取消",
+                                                              "pause": "暂停",
+                                                              "resume": "继续",
+                                                              "remove": "移除"}[act]}
+        return {"ok": True}
+
+    def open_embedded_queue(self):
+        """内嵌浏览器右上角点了「下载队列」：切回下载器并打开「下载」页签。"""
+        emb = self.embedded
+        if emb is None:
+            return {"ok": False, "error": "内嵌浏览器未打开"}
+        emb.return_to_app()
+        self._put({"type": "open_tab", "tab": "download"})
+        return {"ok": True}
+
     def open_embedded_browser(self, window=None, theme=""):
         try:
             from embedded import EmbeddedBrowser
@@ -1182,7 +1307,11 @@ class Host:
         if self.embedded is None:
             self.embedded = EmbeddedBrowser(self.register_embedded_sniff,
                                             self.download_embedded_sniff,
-                                            self.download_embedded_page)
+                                            self.download_embedded_page,
+                                            self.download_embedded_link,
+                                            self.queue_summary,
+                                            self.open_embedded_queue,
+                                            self.embedded_queue_action)
         return self.embedded.open(window, theme)
 
     def _sniff_api(self):
@@ -1224,6 +1353,28 @@ class Host:
         if not items:
             return {"ok": False, "error": "这些地址不在本机嗅探列表里"}
         return self.sniff_download(items)
+
+    def download_embedded_link(self, url, page_url=""):
+        """页面直接触发的下载 → 直链通道（WebView2 的 DownloadStarting 给的地址）。
+
+        以前这里一律取消，页面上的「下载」按钮点了没反应。现在把浏览器实锤过的
+        地址当成嗅探条目提交：单条直链、带当前页 Referer 与 WebView2 会话 cookie，
+        进度、暂停、续传都在下载队列里。地址仍然只认 http(s)。
+        """
+        item = {"url": str(url or "").strip(),
+                "page_url": str(page_url or "").strip(),
+                "entry": "embedded",
+                "cat": "", "size": 0, "seg": False, "manifest": False}
+        if not item["page_url"].lower().startswith(("http://", "https://")):
+            item["page_url"] = ""
+        good, _bad = core.sanitize_urls([item["url"]])
+        if not good:
+            return {"ok": False, "error": "页面触发的下载地址无效"}
+        item["url"] = good[0]
+        if not item["page_url"]:
+            item["page_url"] = item["url"]
+        item["referer"] = item["page_url"]
+        return self.sniff_download([item], source="embedded-link")
 
     def download_embedded_page(self, page_url=""):
         """浮条「下载本页」：按页面 URL 走 yt-dlp 的站点解析。
@@ -1311,16 +1462,25 @@ class Host:
         抖音这类站点会挡住 yt-dlp 的页面解析（web detail JSON 返回 403），但页面
         自己请求过的整段 MP4 已经在嗅探列表里，直接下它反而拿得到带音轨的完整视频。
         只兜一次：兜底任务本身 source=sniff，不会再走回这里。
+
+        内嵌浏览器「下载本页」允许用本页或同站点的条目（抖音把视频放在信息流弹层里，
+        条目登记的页面是站点首页）；桌面粘贴 / 扩展提交的页面任务只认**同一个页面**的
+        条目，免得拿浏览器里正在看的另一条视频顶替。
         """
-        if task.source != "embedded-page" or task.cancel_requested or task.pause_requested:
+        source = str(getattr(task, "source", "") or "")
+        if source not in PAGE_FALLBACK_SOURCES:
+            return False
+        if task.cancel_requested or task.pause_requested:
             return False
         if getattr(task, "fallback_tried", False):
             return False
         task.fallback_tried = True
         page = str(task.urls[0] if task.urls else "").strip()
         items, exact = self._page_media_items(page)
-        if not items:
-            self._task_log(task, "[回退] 本页嗅探列表里没有可用的整段媒体，无法回退\n", "warn")
+        if not items or (source != "embedded-page" and not exact):
+            self._task_log(task, "[回退] 本页嗅探列表里没有可用的整段媒体，无法回退；"
+                                 "先让视频在页面里播一下（媒体流被嗅探到），"
+                                 "或直接点嗅探列表里那条 video/mp4\n", "warn")
             return False
         item = items[0]
         self._task_log(task, "[回退] 页面解析失败，改用%s嗅探到的整段媒体：%s\n"
@@ -1359,7 +1519,7 @@ class Host:
             mod.clear_sniff_items()
         return {"ok": True}
 
-    def sniff_download(self, items):
+    def sniff_download(self, items, source="sniff"):
         if not items:
             return {"ok": False, "error": "先选中要下载的条目"}
         if self.updating:
@@ -1403,7 +1563,7 @@ class Host:
             if jar:
                 c["_sniff_cookie_file"] = jar
             spec = {"urls": [it["url"]], "cfg": c, "outdir": outdir,
-                    "no_playlist": True, "source": "sniff",
+                    "no_playlist": True, "source": source,
                     "title": str(it.get("title") or ""),
                     "ext_cookie_file": c.get("_sniff_cookie_file")}
             try:

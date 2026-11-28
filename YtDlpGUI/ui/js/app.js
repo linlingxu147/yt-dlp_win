@@ -19,6 +19,13 @@ const results = initResults({ download, dialogs });
 initLog();
 const queue = initQueue({ dialogs });
 
+// 内嵌浏览器右上角点「下载队列」：宿主切回下载器后发一条 open_tab
+on('open_tab', ev => {
+  const want = `panel-${ev && ev.tab ? ev.tab : ''}`;
+  const target = tabs.tabs.find(t => t.dataset.panel === want);
+  if (target) tabs.select(target);
+});
+
 const r = await call('get_config');
 download.applyConfig(r.cfg, r);
 

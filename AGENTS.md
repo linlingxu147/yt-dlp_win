@@ -33,12 +33,34 @@ WebView2 没有隔离世界注入，页面世界发来的 DOM / 正文钩子消�
 取不到回退 `_page_url`，两条入口共用 `_submit_page_download`。
 WebView2 的 COM 对象不能跨线程碰：`CookieManager`、`CoreWebView2Cookie` 的字段只在 UI 线程访问
 （后台线程直读会抛 `E_NOINTERFACE`，`cookies_from_webview2` 里的逐条 `except` 会把整罐悄悄丢空，
-偶发还把界面卡死）。导出 cookie 用 `_post_ui`（`BeginInvoke` 投递、不等待）分两段做：worker 只轮询
+偶发还把界面卡死）。导出 cookie 用 `_begin_ui`（`BeginInvoke` 投递、不等待）分两段做：worker 只轮询
 `box` 里的 .NET 属性，字段转换回 UI 线程完成；`cookies_from_webview2` / `_cookie_expires` 只许在
 UI 线程调用（`Expires` 在部分 SDK 上是 `DateTime`，`_cookie_expires` 兼容两种）。
-页面级下载失败（`source=="embedded-page"`）后由 `Host._page_fallback` 兜一次：改用本页、找不到
-就用同站点嗅探到的整段媒体再下一次（抖音把视频放在信息流弹层里，条目登记的页面是站点首页），
-候选由 `_page_media_items` 选——必须是整段、**必须有已知体积**，再取体积最大的，只兜一次。
+页面级下载失败后由 `Host._page_fallback` 兜一次（`PAGE_FALLBACK_SOURCES = embedded-page / gui / ext`，
+直链任务 `sniff` / `embedded-link` 不兜）：内嵌浏览器「下载本页」可以用本页、找不到就用同站点
+嗅探到的整段媒体再下一次（抖音把视频放在信息流弹层里，条目登记的页面是站点首页），桌面粘贴的
+链接与扩展提交的页面任务只认**同一个页面**的条目；候选由 `_page_media_items` 选——必须是整段、
+**必须有已知体积**，再取体积最大的，只兜一次。
+页面直接触发的下载（`DownloadStarting`）浏览器那份一律 `args.Cancel = True`，但地址不再丢掉：
+只认 `DownloadOperation.Uri` 且必须是 `http(s)`，交给 `Host.download_embedded_link`
+（`_link_sink`，spec `source="embedded-link"`）走 `sniff_download` 的同一条直链通道，历史里显示
+「页面下载」；不要改成让 WebView2 自己落盘或弹 `SaveFileDialog`（会和队列重复管理同一份文件）。
+扩展 / HTTP API 送来的 `kind=page` 任务自己没带 `cookie` / `cookie_header` 时，`Host._ext_spec`
+经 `_webview_cookie_file` 借当前内嵌浏览器的 cookie 罐（`browser` 置 `"（不使用）"` 跳过
+`--cookies-from-browser`）——调用方不必先在内嵌浏览器里手动点一次「下载本页」。
+右上角下载入口（`_QUEUE_UI_JS`）与蓝色上浮提示同样只负责展示：小条 + 展开的列表数据来自
+`Host.queue_summary`（`_queue_loop` 每秒取一次，签名没变就不发；`tasks` 最多 8 条、新的在上，
+只有 `id/label/state/pct/speed/eta/size/file` 这些显示字段），面板里「打开下载器」只回一条
+`queue_open` → `Host.open_embedded_queue`（`return_to_app()` + `open_tab` 事件切到「下载」页签）；
+行内按钮只回一条 `queue_action`（`act` 白名单 `cancel/pause/resume/remove` + 任务编号），
+`EmbeddedBrowser._queue_action_from_ui` 只做粗筛，真正的合法性由 `Host.embedded_queue_action`
+判定——任务必须在队列里、状态得允许这个动作，取消 / 移除与桌面端同义（取消清部分文件，
+移除只清列表）。页面从头到尾拿不到任何下载参数；成功加入队列的三条路径（浮条单条、整页下载、
+页面触发下载）在成功分支各补一条 `toast`。
+页面地址入队前一律经 `core.normalize_site_url` 归一（抖音精选 `/jingxuan?modal_id=<id>` ⇄
+`/video/<id>`；规则在 `ytdlp_core` 里，别改行为），地址栏粘贴、扩展 / HTTP API、工具栏与浮条
+「下载本页」四条入口都不能漏；`Host._ext_spec` 也补一次，兜住 MCP / 旧扩展。`same_page` 与
+`_page_media_items` 认这两种写法是同一个页面——弹窗页里登记的整段媒体要算「本页」，不能退化成「同站点」。
 
 ## 运行目录
 

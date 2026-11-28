@@ -773,7 +773,14 @@ class TestPageSniffUi(unittest.TestCase):
         self.b._download_page_from_ui()
         self.assertTrue(done.wait(2))
         self.assertEqual(calls, ["https://page.example.com/watch"])
-        self.assertTrue(self.posted[-1]["ok"])
+        # 成功后还会补一条上浮提示，所以按类型取回包，不看最后一条
+        results = []
+        for _ in range(100):
+            results = [p for p in self.posted if p.get("__ytdlp") == "sniff_ui_result"]
+            if results:
+                break
+            time.sleep(0.02)
+        self.assertTrue(results[-1]["ok"])
 
     def test_page_download_requires_http_page(self):
         self.b._page_url = "about:blank"
@@ -876,6 +883,87 @@ class TestToolbarDownloadPage(unittest.TestCase):
         self.b.download_page()
         self.assertTrue(self.status[-1][1])
         self.assertIn("未接通", self.status[-1][0])
+
+
+class _DownloadOp:
+    def __init__(self, uri):
+        self.Uri = uri
+
+
+class _DownloadArgs:
+    """WebView2 DownloadStarting 事件的替身（Cancel 可写、DownloadOperation.Uri 只读）。"""
+
+    def __init__(self, uri=None):
+        self.Cancel = False
+        if uri is not None:
+            self.DownloadOperation = _DownloadOp(uri)
+
+
+class TestDownloadTakeover(unittest.TestCase):
+    """页面直接触发的下载不再一律丢弃：取消浏览器自己那份，交给宿主下载队列。"""
+
+    def setUp(self):
+        self.b = embedded.EmbeddedBrowser()
+        self.status = []
+        self.b._set_status = (lambda text, bad=False, busy=False:
+                              self.status.append((text, bad, busy)))
+        self.b._page_url = "https://page.example.com/watch"
+
+    @staticmethod
+    def _sink(calls, done, result):
+        def sink(url, page):
+            calls.append((url, page))
+            done.set()
+            return result
+        return sink
+
+    def test_takes_over_http_link(self):
+        done = threading.Event()
+        calls = []
+        self.b._link_sink = self._sink(calls, done, {"ok": True, "task_ids": [7]})
+        args = _DownloadArgs("https://cdn.example.com/files/a.zip")
+        self.b._on_download_starting(None, args)
+        self.assertTrue(args.Cancel)                 # 浏览器自己那份不落盘
+        self.assertTrue(self.status[0][2])            # 先报「已交给下载器」busy
+        self.assertTrue(done.wait(2))
+        self.assertEqual(calls, [("https://cdn.example.com/files/a.zip",
+                                  "https://page.example.com/watch")])
+        self.assertIn("已加入下载队列", self.status[-1][0])
+        self.assertFalse(self.status[-1][1])
+
+    def test_rejects_non_http_link(self):
+        done = threading.Event()
+        calls = []
+        self.b._link_sink = self._sink(calls, done, {"ok": True})
+        args = _DownloadArgs("blob:https://page.example.com/9f0c-1")
+        self.b._on_download_starting(None, args)
+        self.assertTrue(args.Cancel)
+        self.assertEqual(calls, [])
+        self.assertTrue(self.status[-1][1])
+        self.assertIn("http(s)", self.status[-1][0])
+
+    def test_reports_missing_channel(self):
+        args = _DownloadArgs("https://cdn.example.com/a.zip")
+        self.b._on_download_starting(None, args)
+        self.assertTrue(args.Cancel)
+        self.assertTrue(self.status[-1][1])
+        self.assertIn("未接通", self.status[-1][0])
+
+    def test_reports_sink_error(self):
+        done = threading.Event()
+        calls = []
+        self.b._link_sink = self._sink(calls, done, {"ok": False, "error": "防盗链"})
+        self.b._on_download_starting(None, _DownloadArgs("https://cdn.example.com/a.zip"))
+        self.assertTrue(done.wait(2))
+        self.assertTrue(self.status[-1][1])
+        self.assertIn("防盗链", self.status[-1][0])
+
+    def test_missing_download_operation_does_not_crash(self):
+        args = _DownloadArgs()                        # 没有 DownloadOperation 字段
+        self.b._on_download_starting(None, args)
+        self.assertTrue(args.Cancel)
+        self.assertTrue(self.status[-1][1])
+        self.assertIn("http(s)", self.status[-1][0])
 
 
 class _Cookie:
@@ -986,7 +1074,7 @@ class _FakeForm:
 class _SystemActionStub:
     """测试进程里没有 pythonnet：给 `from System import Action` 一个替身。
 
-    `_ui` / `_post_ui` 都靠 `System.Action` 编组委托，没它就整段被吞掉。
+    `_ui` / `_begin_ui` 都靠 `System.Action` 编组委托，没它就整段被吞掉。
     """
 
     def setUp(self):
@@ -1063,7 +1151,7 @@ class TestExportCookies(_SystemActionStub, unittest.TestCase):
         self.assertLess(time.time() - t0, 3.0)
 
     def test_channel_failure_returns_empty(self):
-        self.b._post_ui = lambda fn: False
+        self.b._begin_ui = lambda fn: False
         self.assertEqual(self.b.export_cookies("https://a/"), [])
 
     def test_begin_invoke_failure_falls_back_to_invoke(self):
@@ -1073,33 +1161,67 @@ class TestExportCookies(_SystemActionStub, unittest.TestCase):
         self.assertEqual(self.b._form.invoked, 2)      # kick + convert 各一次
 
 
-class TestPostUi(_SystemActionStub, unittest.TestCase):
-    """_post_ui：投递到 UI 线程执行、立刻返回；不可用时退回同步 Invoke。"""
+class TestBeginUi(_SystemActionStub, unittest.TestCase):
+    """_begin_ui：投递到 UI 线程执行、立刻返回；不可用时退回同步 Invoke。"""
 
     def setUp(self):
         super().setUp()
         self.b = embedded.EmbeddedBrowser()
 
     def test_no_form_is_false(self):
-        self.assertFalse(self.b._post_ui(lambda: None))
+        self.assertFalse(self.b._begin_ui(lambda: None))
 
     def test_runs_inline_when_already_on_ui_thread(self):
         self.b._form = _FakeForm(inline=True)
         seen = []
-        self.assertTrue(self.b._post_ui(lambda: seen.append(1)))
+        self.assertTrue(self.b._begin_ui(lambda: seen.append(1)))
         self.assertEqual(seen, [1])
 
     def test_posts_with_begin_invoke(self):
         self.b._form = _FakeForm()
         seen = []
-        self.assertTrue(self.b._post_ui(lambda: seen.append(threading.current_thread().name)))
+        self.assertTrue(self.b._begin_ui(lambda: seen.append(threading.current_thread().name)))
         self.assertEqual(seen, ["fake-ui"])
 
     def test_falls_back_to_invoke(self):
         self.b._form = _FakeForm(begin_fails=True)
         seen = []
-        self.assertTrue(self.b._post_ui(lambda: seen.append(1)))
+        self.assertTrue(self.b._begin_ui(lambda: seen.append(1)))
         self.assertEqual(seen, [1])
+
+
+class TestPostUiPayload(_SystemActionStub, unittest.TestCase):
+    """_post_ui（发页面消息）与 _begin_ui（投递委托）必须是两个不同的方法。
+
+    两者同名过一次：后定义的会盖掉前者，页面消息全被当成委托投递而静默发不出去。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.b = embedded.EmbeddedBrowser()
+        self.sent = []
+
+        class Core:
+            def PostWebMessageAsJson(self, text):
+                self_outer.sent.append(text)
+
+        self_outer = self
+        self.b._core = lambda: Core()
+        self.b._form = _FakeForm(inline=True)
+
+    def test_payload_goes_out_as_json(self):
+        self.b._toast("好了")
+        self.assertEqual(self.sent, ['{"__ytdlp":"toast","text":"好了"}'])
+
+    def test_payload_method_is_not_the_delegate_poster(self):
+        self.assertIsNot(embedded.EmbeddedBrowser._post_ui,
+                         embedded.EmbeddedBrowser._begin_ui)
+
+    def test_begin_ui_runs_the_callable(self):
+        seen = []
+        self.assertTrue(self.b._begin_ui(lambda: seen.append(1)))
+        self.assertEqual(seen, [1])
+        self.assertEqual(self.sent, [])
 
 
 class TestHostSniffSink(unittest.TestCase):
@@ -1350,6 +1472,189 @@ class TestHostLifecycle(unittest.TestCase):
             sys.modules.pop("embedded", None)
         self.assertFalse(r["ok"])
         self.assertIn("主窗口", r["error"])
+
+
+class TestQueueStrip(unittest.TestCase):
+    """右上角下载进度小条 + 成功提示字幕（只做展示，不接受下载参数）。"""
+
+    def setUp(self):
+        self.b = embedded.EmbeddedBrowser()
+        self.posted = []
+        self.b._post_ui = lambda payload: self.posted.append(payload)
+
+    @staticmethod
+    def _msg(payload):
+        class Args:
+            WebMessageAsJson = json.dumps(payload)
+            Source = "https://page.example.com/watch"
+        return Args()
+
+    def test_push_queue_ui_payload(self):
+        self.b._push_queue_ui({"running": 1, "pct": 42})
+        self.assertEqual(self.posted[-1]["__ytdlp"], "queue_ui")
+        self.assertEqual(self.posted[-1]["queue"]["pct"], 42)
+
+    def test_push_queue_ui_ignores_non_dict(self):
+        self.b._push_queue_ui("nope")
+        self.assertEqual(self.posted, [])
+
+    def test_queue_ready_resends_snapshot(self):
+        self.b._queue_sink = lambda: {"running": 1, "pct": 7}
+        self.b._on_web_message(None, self._msg({"__ytdlp": "queue_ready"}))
+        self.assertEqual(self.posted[-1]["__ytdlp"], "queue_ui")
+        self.assertEqual(self.posted[-1]["queue"]["pct"], 7)
+
+    def test_queue_ready_without_sink_posts_nothing(self):
+        self.b._on_web_message(None, self._msg({"__ytdlp": "queue_ready"}))
+        self.assertEqual(self.posted, [])
+
+    def test_queue_open_routes_to_sink(self):
+        done = threading.Event()
+        got = []
+
+        def opener():
+            got.append(True)
+            done.set()
+
+        self.b._queue_open = opener
+        self.b._on_web_message(None, self._msg({"__ytdlp": "queue_open"}))
+        self.assertTrue(done.wait(2))
+        self.assertEqual(got, [True])
+
+    def test_queue_open_without_channel_is_noop(self):
+        self.b._on_web_message(None, self._msg({"__ytdlp": "queue_open"}))
+        self.assertEqual(self.posted, [])
+
+    def test_toast_payload(self):
+        self.b._toast("已加入下载队列：2 个")
+        self.assertEqual(self.posted[-1],
+                         {"__ytdlp": "toast", "text": "已加入下载队列：2 个"})
+
+    def test_toast_ignores_empty(self):
+        self.b._toast("   ")
+        self.assertEqual(self.posted, [])
+
+    def test_successful_page_download_posts_toast(self):
+        done = threading.Event()
+        self.b._page_sink = lambda page: {"ok": True, "task_ids": [1]}
+
+        def report(text, ok, error=""):
+            done.set()
+
+        self.b._submit_page_download("https://page.example.com/watch", report)
+        self.assertTrue(done.wait(2))
+        for _ in range(100):
+            if any(p.get("__ytdlp") == "toast" for p in self.posted):
+                break
+            time.sleep(0.02)
+        toast = [p for p in self.posted if p.get("__ytdlp") == "toast"]
+        self.assertEqual(len(toast), 1)
+        self.assertIn("已加入下载队列", toast[0]["text"])
+
+    def test_failed_page_download_does_not_toast(self):
+        done = threading.Event()
+        self.b._page_sink = lambda page: {"ok": False, "error": "站点不支持"}
+
+        def report(text, ok, error=""):
+            done.set()
+
+        self.b._submit_page_download("https://page.example.com/watch", report)
+        self.assertTrue(done.wait(2))
+        self.assertEqual([p for p in self.posted if p.get("__ytdlp") == "toast"], [])
+
+    def test_queue_loop_not_started_without_sink(self):
+        self.b._start_queue_loop()
+        self.assertIsNone(self.b._queue_thread)
+
+    def test_queue_loop_started_with_sink(self):
+        self.b._queue_sink = lambda: {"running": 0}
+        self.b._start_queue_loop()
+        self.assertIsNotNone(self.b._queue_thread)
+        self.b._queue_stop = True          # 别把推送线程留给下一个用例
+
+    def test_queue_action_forwards_whitelisted_action(self):
+        done = threading.Event()
+        got = []
+
+        def act(name, tid):
+            got.append((name, tid))
+            done.set()
+            return {"ok": True}
+
+        self.b._queue_act = act
+        self.b._on_web_message(None, self._msg({"__ytdlp": "queue_action",
+                                                "act": "pause", "id": "3"}))
+        self.assertTrue(done.wait(2))
+        self.assertEqual(got, [("pause", 3)])
+
+    def test_queue_action_reports_success(self):
+        done = threading.Event()
+        self.b._queue_act = lambda name, tid: (done.set(), {"ok": True})[1]
+        self.b._on_web_message(None, self._msg({"__ytdlp": "queue_action",
+                                                "act": "remove", "id": 9}))
+        self.assertTrue(done.wait(2))
+        for _ in range(100):
+            if self.posted:
+                break
+            time.sleep(0.02)
+        self.assertEqual(self.posted[-1], {"__ytdlp": "queue_action_result",
+                                           "ok": True, "error": ""})
+
+    def test_queue_action_rejects_unknown_action(self):
+        self.b._on_web_message(None, self._msg({"__ytdlp": "queue_action",
+                                                "act": "drop", "id": 1}))
+        self.assertFalse(self.posted[-1]["ok"])
+        self.assertIn("不支持", self.posted[-1]["error"])
+
+    def test_queue_action_rejects_bad_id(self):
+        self.b._on_web_message(None, self._msg({"__ytdlp": "queue_action",
+                                                "act": "cancel", "id": "abc"}))
+        self.assertFalse(self.posted[-1]["ok"])
+        self.assertIn("编号", self.posted[-1]["error"])
+
+    def test_queue_action_without_channel(self):
+        self.b._on_web_message(None, self._msg({"__ytdlp": "queue_action",
+                                                "act": "cancel", "id": 2}))
+        self.assertFalse(self.posted[-1]["ok"])
+        self.assertIn("未接通", self.posted[-1]["error"])
+
+    def test_queue_action_reports_sink_error(self):
+        done = threading.Event()
+
+        def act(name, tid):
+            done.set()
+            return {"ok": False, "error": "任务已不在队列里"}
+
+        self.b._queue_act = act
+        self.b._on_web_message(None, self._msg({"__ytdlp": "queue_action",
+                                                "act": "cancel", "id": 4}))
+        self.assertTrue(done.wait(2))
+        for _ in range(100):
+            if any(p.get("__ytdlp") == "queue_action_result" for p in self.posted):
+                break
+            time.sleep(0.02)
+        result = [p for p in self.posted if p.get("__ytdlp") == "queue_action_result"][-1]
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "任务已不在队列里")
+
+    def test_queue_action_sink_exception_is_reported(self):
+        done = threading.Event()
+
+        def act(name, tid):
+            done.set()
+            raise RuntimeError("炸了")
+
+        self.b._queue_act = act
+        self.b._on_web_message(None, self._msg({"__ytdlp": "queue_action",
+                                                "act": "cancel", "id": 5}))
+        self.assertTrue(done.wait(2))
+        for _ in range(100):
+            if any(p.get("__ytdlp") == "queue_action_result" for p in self.posted):
+                break
+            time.sleep(0.02)
+        result = [p for p in self.posted if p.get("__ytdlp") == "queue_action_result"][-1]
+        self.assertFalse(result["ok"])
+        self.assertIn("炸了", result["error"])
 
 
 if __name__ == "__main__":

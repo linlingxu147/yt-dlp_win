@@ -635,6 +635,357 @@ _SNIFF_UI_JS = r"""
 })();
 """
 
+# 页面右上角的下载队列入口（可展开的下载列表）+ 成功提示。只做展示与提需求：
+# 进度来自宿主推来的 queue_ui；展开时补一条 queue_ready；行内操作只回 queue_action，
+# 由宿主按白名单校验后执行，页面拿不到任何下载参数。
+_QUEUE_UI_JS = r"""
+(() => {
+  if (window.top !== window) return;          // 只在顶层框架出现
+  if (window.__ytdlpQueueUI) return;
+  window.__ytdlpQueueUI = true;
+
+  const HOST_ID = "__ytdlp_queue_ui";
+  const TOAST_ID = "__ytdlp_toast_ui";
+  const MAX_ROWS = 8;
+  let host = null, root = null, pill = null, textEl = null, barEl = null;
+  let panel = null, listEl = null, noteEl = null, shown = false, noteTimer = 0;
+  let toastHost = null, toastRoot = null, toastBox = null;
+
+  // 与桌面端一致的队列操作：活动任务能暂停/继续/取消，已结束的只能从列表移除
+  const ACTS = {
+    running: [["pause", "暂停"], ["cancel", "取消"]],
+    queued: [["cancel", "取消"]],
+    paused: [["resume", "继续"], ["cancel", "取消"]],
+    done: [["remove", "移除"]],
+    failed: [["remove", "移除"]],
+    canceled: [["remove", "移除"]],
+    stopped: [["remove", "移除"]]
+  };
+  const STATE_TEXT = {
+    running: "下载中", queued: "排队中", paused: "已暂停", done: "已完成",
+    failed: "失败", canceled: "已取消", stopped: "已停止"
+  };
+
+  const CSS = `
+    :host { all: initial; }
+    * { box-sizing: border-box; font: 12px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    #wrap { position: relative; display: inline-block; }
+    #q { position: relative; display: inline-flex; align-items: center; gap: 6px;
+         background: rgba(31,35,40,.92); color: #fff; padding: 6px 12px 8px;
+         border-radius: 18px; cursor: pointer; user-select: none; overflow: hidden;
+         box-shadow: 0 2px 10px rgba(0,0,0,.35); white-space: nowrap; }
+    #q:hover { background: #1f2328; }
+    .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: #8b949e; }
+    #q.run .dot { background: #4493f8; animation: pulse 1.2s ease-in-out infinite; }
+    #q.ok .dot { background: #3fb950; }
+    #q.bad .dot { background: #f85149; }
+    #bar { position: absolute; left: 0; bottom: 0; height: 3px; width: 0;
+           background: #4493f8; transition: width .35s ease; }
+    @keyframes pulse { 0%, 100% { opacity: 1 } 50% { opacity: .35 } }
+    #panel { position: absolute; right: 0; top: 34px; width: 320px; max-height: 340px;
+             display: none; flex-direction: column; background: #ffffff; color: #1f2328;
+             border: 1px solid rgba(31,35,40,.15); border-radius: 12px; overflow: hidden;
+             box-shadow: 0 10px 28px rgba(0,0,0,.38); }
+    #panel.on { display: flex; }
+    #head { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+            padding: 8px 10px; border-bottom: 1px solid rgba(31,35,40,.12); font-weight: 600; }
+    #open { color: #0969da; font-weight: 500; cursor: pointer; }
+    #open:hover { text-decoration: underline; }
+    #list { overflow-y: auto; max-height: 268px; }
+    .empty { padding: 14px 10px; color: #59636e; text-align: center; }
+    .row { padding: 8px 10px; border-bottom: 1px solid rgba(31,35,40,.08); }
+    .row:last-child { border-bottom: 0; }
+    .top { display: flex; align-items: center; gap: 4px; }
+    .name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            font-weight: 600; }
+    .act { flex: none; border: 0; background: transparent; color: #0969da; cursor: pointer;
+           font: inherit; padding: 2px 5px; border-radius: 6px; }
+    .act:hover { background: rgba(9,105,218,.12); }
+    .track { height: 4px; margin: 6px 0 4px; border-radius: 3px;
+             background: rgba(31,35,40,.14); overflow: hidden; }
+    .fill { height: 100%; width: 0; background: #4493f8; transition: width .35s ease; }
+    .row.ok .fill { background: #3fb950; }
+    .row.bad .fill { background: #f85149; }
+    .meta { color: #59636e; }
+    #note { display: none; padding: 6px 10px; color: #f85149;
+            border-top: 1px solid rgba(31,35,40,.12); }
+    #note.on { display: block; }
+  `;
+
+  const TOAST_CSS = `
+    :host { all: initial; }
+    * { box-sizing: border-box;
+        font: 600 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    #box { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+    .line { color: #0969da; background: rgba(255,255,255,.94); padding: 4px 14px;
+            border-radius: 14px; box-shadow: 0 2px 10px rgba(9,105,218,.28);
+            text-shadow: 0 1px 0 rgba(255,255,255,.9); white-space: nowrap;
+            animation: rise 4.2s ease-out forwards; }
+    @keyframes rise {
+      0% { opacity: 0; transform: translateY(18px); }
+      12% { opacity: 1; transform: translateY(0); }
+      70% { opacity: 1; transform: translateY(-12px); }
+      100% { opacity: 0; transform: translateY(-58px); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .line { animation: fade 3.6s ease-out forwards; }
+      @keyframes fade { 0%, 72% { opacity: 1 } 100% { opacity: 0 } }
+    }
+  `;
+
+  function post(msg) {
+    try { window.chrome.webview.postMessage(msg); } catch (e) { /* ignore */ }
+  }
+
+  function setText(text, cls) {
+    if (textEl) textEl.textContent = text;
+    if (pill) pill.className = cls || "";
+  }
+
+  function showNote(text) {
+    if (!noteEl) return;
+    noteEl.textContent = String(text || "");
+    noteEl.className = text ? "on" : "";
+    if (noteTimer) { clearTimeout(noteTimer); noteTimer = 0; }
+    if (text) noteTimer = setTimeout(() => { noteEl.className = ""; }, 4000);
+  }
+
+  function toggle(force) {
+    shown = (force === undefined) ? !shown : !!force;
+    if (panel) panel.className = shown ? "on" : "";
+    if (shown) post({ __ytdlp: "queue_ready" });      // 展开时补一次最新进度
+  }
+
+  function shorten(text, limit) {
+    text = String(text || "");
+    return text.length > limit ? text.slice(0, limit - 1) + "…" : text;
+  }
+
+  function fillRows(tasks) {
+    if (!listEl) return;
+    listEl.textContent = "";
+    tasks = Array.isArray(tasks) ? tasks.slice(0, MAX_ROWS) : [];
+    if (!tasks.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "暂无下载任务";
+      listEl.appendChild(empty);
+      return;
+    }
+    for (const t of tasks) {
+      const state = String(t.state || "");
+      const row = document.createElement("div");
+      row.className = "row" + (state === "done" ? " ok" : (state === "failed" ? " bad" : ""));
+
+      const top = document.createElement("div");
+      top.className = "top";
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = shorten(t.label || t.file || "未命名任务", 60);
+      name.title = String(t.label || "");
+      top.appendChild(name);
+      for (const [act, label] of (ACTS[state] || [])) {
+        const btn = document.createElement("button");
+        btn.className = "act";
+        btn.type = "button";
+        btn.textContent = label;
+        btn.dataset.act = act;
+        btn.dataset.id = String(t.id);
+        top.appendChild(btn);
+      }
+      row.appendChild(top);
+
+      const pct = Math.max(0, Math.min(100, Number(t.pct) || 0));
+      const track = document.createElement("div");
+      track.className = "track";
+      const fill = document.createElement("i");
+      fill.className = "fill";
+      fill.style.width = (state === "done" ? 100 : pct) + "%";
+      track.appendChild(fill);
+      row.appendChild(track);
+
+      const bits = [STATE_TEXT[state] || state || "未知状态"];
+      if (state === "running" || state === "paused") bits.push(pct.toFixed(0) + "%");
+      if (t.speed) bits.push(String(t.speed));
+      if (t.eta) bits.push("剩余 " + String(t.eta));
+      else if (t.size && state !== "running") bits.push(String(t.size));
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = bits.filter(Boolean).join(" · ");
+      row.appendChild(meta);
+      listEl.appendChild(row);
+    }
+  }
+
+  function ensureHost() {
+    try {
+      if (!host) {
+        host = document.createElement("div");
+        host.id = HOST_ID;
+        host.setAttribute("style",
+          "all:initial;position:fixed;right:16px;top:16px;z-index:2147483647;display:block;");
+        root = host.attachShadow({ mode: "open" });
+        const style = document.createElement("style");
+        style.textContent = CSS;
+        root.appendChild(style);
+
+        const wrap = document.createElement("div");
+        wrap.id = "wrap";
+
+        pill = document.createElement("div");
+        pill.id = "q";
+        const dot = document.createElement("span");
+        dot.className = "dot";
+        textEl = document.createElement("span");
+        barEl = document.createElement("i");
+        barEl.id = "bar";
+        pill.appendChild(dot);
+        pill.appendChild(textEl);
+        pill.appendChild(barEl);
+        pill.title = "点击展开下载列表";
+        pill.addEventListener("click", (ev) => { ev.stopPropagation(); toggle(); });
+        wrap.appendChild(pill);
+
+        panel = document.createElement("div");
+        panel.id = "panel";
+        const head = document.createElement("div");
+        head.id = "head";
+        const title = document.createElement("span");
+        title.textContent = "下载";
+        const openLink = document.createElement("span");
+        openLink.id = "open";
+        openLink.textContent = "打开下载器";
+        openLink.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          post({ __ytdlp: "queue_open" });
+        });
+        head.appendChild(title);
+        head.appendChild(openLink);
+        panel.appendChild(head);
+
+        listEl = document.createElement("div");
+        listEl.id = "list";
+        listEl.addEventListener("click", (ev) => {
+          const el = ev.target && ev.target.closest ? ev.target.closest(".act") : null;
+          if (!el) return;
+          ev.stopPropagation();
+          post({ __ytdlp: "queue_action", act: el.dataset.act, id: el.dataset.id });
+        });
+        panel.appendChild(listEl);
+
+        noteEl = document.createElement("div");
+        noteEl.id = "note";
+        panel.appendChild(noteEl);
+
+        wrap.appendChild(panel);
+        root.appendChild(wrap);
+        setText("下载队列", "");
+        fillRows([]);
+
+        document.addEventListener("click", (ev) => {
+          try {
+            const path = ev.composedPath ? ev.composedPath() : [];
+            if (shown && path.indexOf(host) < 0) toggle(false);
+          } catch (e) { /* ignore */ }
+        }, true);
+        document.addEventListener("keydown", (ev) => {
+          if (shown && ev.key === "Escape") toggle(false);
+        }, true);
+      }
+      if (host && !host.isConnected && document.documentElement) {
+        document.documentElement.appendChild(host);
+      }
+    } catch (e) { /* 页面 DOM 被重写时下一轮再来 */ }
+  }
+
+  function render(q) {
+    ensureHost();
+    if (!textEl) return;
+    q = q || {};
+    const running = Number(q.running) || 0, queued = Number(q.queued) || 0;
+    const failed = Number(q.failed) || 0, done = Number(q.done) || 0;
+    const pct = Math.max(0, Math.min(100, Number(q.pct) || 0));
+    let text = "下载队列", cls = "";
+    if (running) {
+      text = "下载中 " + pct.toFixed(0) + "%" + (queued ? " · 排队 " + queued : "");
+      cls = "run";
+    } else if (queued) {
+      text = "排队 " + queued;
+      cls = "run";
+    } else if (failed) {
+      text = "失败 " + failed + (done ? " · 完成 " + done : "");
+      cls = "bad";
+    } else if (done) {
+      text = "完成 " + done;
+      cls = "ok";
+    }
+    setText(text, cls);
+    const hint = q.label ? String(q.label) + (q.speed ? "  " + q.speed : "") : "";
+    if (pill) pill.title = (hint ? hint + " —— " : "") + "点击展开下载列表";
+    if (barEl) barEl.style.width = (running ? pct : 0) + "%";
+    if (shown) fillRows(q.tasks);
+    else if (listEl) fillRows(q.tasks);      // 先填好，展开即见
+  }
+
+  function ensureToast() {
+    try {
+      if (!toastHost) {
+        toastHost = document.createElement("div");
+        toastHost.id = TOAST_ID;
+        toastHost.setAttribute("style",
+          "all:initial;position:fixed;left:50%;bottom:14%;z-index:2147483647;" +
+          "transform:translateX(-50%);display:block;pointer-events:none;");
+        toastRoot = toastHost.attachShadow({ mode: "open" });
+        const style = document.createElement("style");
+        style.textContent = TOAST_CSS;
+        toastRoot.appendChild(style);
+        toastBox = document.createElement("div");
+        toastBox.id = "box";
+        toastRoot.appendChild(toastBox);
+      }
+      if (toastHost && !toastHost.isConnected && document.documentElement) {
+        document.documentElement.appendChild(toastHost);
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  function toast(text) {
+    text = String(text || "").trim();
+    if (!text) return;
+    ensureToast();
+    try {
+      const line = document.createElement("div");
+      line.className = "line";
+      line.textContent = text;
+      toastBox.appendChild(line);
+      setTimeout(() => { try { line.remove(); } catch (e) { /* ignore */ } }, 4600);
+    } catch (e) { /* ignore */ }
+  }
+
+  try {
+    window.chrome.webview.addEventListener("message", (ev) => {
+      const d = (ev && ev.data) || {};
+      if (d.__ytdlp === "queue_ui") render(d.queue || {});
+      else if (d.__ytdlp === "toast") toast(d.text);
+      else if (d.__ytdlp === "queue_action_result") {
+        showNote(d.ok ? "" : (d.error || "操作没有生效"));
+        if (d.ok) post({ __ytdlp: "queue_ready" });
+      }
+    });
+  } catch (e) { /* 没有 webview 桥时只当展示脚本 */ }
+
+  // 通知宿主补发一次队列快照：脚本可能晚于队列首条进度才就绪
+  post({ __ytdlp: "queue_ready" });
+
+  const boot = () => { try { ensureHost(); ensureToast(); } catch (e) { /* ignore */ } };
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", boot, { once: true });
+  } else {
+    boot();
+  }
+  setInterval(() => { try { ensureHost(); ensureToast(); } catch (e) { /* ignore */ } }, 2500);
+})();
+"""
 _ALLOWED_SCHEMES = ("http", "https")
 # 这些「没有 //」的伪协议不能被补成 https://javascript:...
 _BLOCKED_PREFIXES = (
@@ -920,7 +1271,7 @@ def cookies_from_webview2(cookies):
     只搬 yt-dlp 真正用得到的字段；会话 cookie 的 Expires 为负/0，统一按 0
     （服务端会补一年）。任何一条取字段失败都跳过，不影响整罐。
 
-    ⚠ 只能在 UI 线程调用（cookie 字段要从 COM 接口读，见 EmbeddedBrowser._post_ui）。
+    ⚠ 只能在 UI 线程调用（cookie 字段要从 COM 接口读，见 EmbeddedBrowser._begin_ui）。
     """
     out = []
     for c in cookies or []:
@@ -952,10 +1303,18 @@ class EmbeddedBrowser:
     # 下面挂着本对象，不挡住的话它会一路反射进 WinForms/WebView2 对象图（日志刷屏）。
     _serializable = False
 
-    def __init__(self, sniff_sink=None, download_sink=None, page_sink=None):
+    def __init__(self, sniff_sink=None, download_sink=None, page_sink=None,
+                 link_sink=None, queue_sink=None, queue_open=None,
+                 queue_act=None):
         self._sniff_sink = sniff_sink
         self._download_sink = download_sink      # 页面浮条 → 宿主下载队列（单条/批量）
         self._page_sink = page_sink              # 页面浮条「下载本页」→ yt-dlp 整段
+        self._link_sink = link_sink              # 页面直接触发的下载 → 直链通道
+        self._queue_sink = queue_sink            # → 队列进度摘要（右上角小条）
+        self._queue_open = queue_open            # 展开面板里的「打开下载器」→ 回下载器看队列
+        self._queue_act = queue_act              # 展开面板里的取消/暂停/继续/移除 → 宿主校验后执行
+        self._queue_thread = None
+        self._queue_stop = True
         self._sniff_q = None
         self._sniff_thread = None
         self._sniff_stop = False
@@ -1102,6 +1461,8 @@ class EmbeddedBrowser:
         self._sniff_stop = True
         self._sniff_q = None
         self._sniff_thread = None
+        self._queue_thread = None
+        self._queue_stop = True
         self._sniff_warned = False
         self._page_url = ""
         self._ua = ""
@@ -2051,6 +2412,7 @@ class EmbeddedBrowser:
         self._attach_accelerators()
         self._sync_addr()
         self._update_buttons()
+        self._start_queue_loop()
         if self._pending_nav:
             target, self._pending_nav = self._pending_nav, ""
             self.navigate(target)
@@ -2119,6 +2481,12 @@ class EmbeddedBrowser:
                 core.AddScriptToExecuteOnDocumentCreatedAsync(_SNIFF_UI_JS)
             except Exception:
                 pass
+        # 右上角队列小条 + 成功提示：同样只做展示，点击回一条 queue_open
+        if _QUEUE_UI_JS:
+            try:
+                core.AddScriptToExecuteOnDocumentCreatedAsync(_QUEUE_UI_JS)
+            except Exception:
+                pass
         try:
             self._ua = str(core.Settings.UserAgent or "")
         except Exception:
@@ -2153,6 +2521,12 @@ class EmbeddedBrowser:
                 self._download_page_from_ui()
             elif tag == "ui_ready":
                 self._sync_ui()          # 页面脚本晚于首批结果就绪时补发快照
+            elif tag == "queue_ready":
+                self._push_queue_now()   # 右上角小条晚就绪时补发一次队列进度
+            elif tag == "queue_open":
+                self._open_queue_from_ui()
+            elif tag == "queue_action":
+                self._queue_action_from_ui(msg)
         except Exception:
             pass
 
@@ -2179,6 +2553,111 @@ class EmbeddedBrowser:
         with self._ui_lock:
             snapshot = list(self._ui_items.values())[-80:]
         self._post_ui({"__ytdlp": "sniff_ui", "items": snapshot})
+
+    # ---------------- 右上角队列小条 + 成功提示 ----------------
+    def _push_queue_ui(self, data):
+        """把队列进度摘要发给页面右上角小条；页面只用来显示，改不了下载参数。"""
+        if not isinstance(data, dict):
+            return
+        self._post_ui({"__ytdlp": "queue_ui", "queue": data})
+
+    def _push_queue_now(self):
+        """小条就绪时补发一次当前进度（没有 queue_sink 就什么都不发）。"""
+        if self._queue_sink is None:
+            return
+        try:
+            data = self._queue_sink() or {}
+        except Exception:
+            data = {}
+        if data:
+            self._push_queue_ui(data)
+
+    def _toast(self, text):
+        """成功开始下载时给页面发一条蓝色上浮提示（纯展示）。"""
+        text = str(text or "").strip()
+        if text:
+            self._post_ui({"__ytdlp": "toast", "text": text})
+
+    def _open_queue_from_ui(self):
+        """页面右上角点了「下载队列」→ 回下载器并切到「下载」页签。
+
+        交给后台线程做：切视图与前端事件都不能占住 WebView2 的消息线程。
+        """
+        if self._queue_open is None:
+            return
+
+        def work():
+            try:
+                self._queue_open()
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _queue_action_from_ui(self, msg):
+        """展开面板里的取消/暂停/继续/移除。
+
+        页面世界不可信：这里只做「有没有通道 + 动作白名单 + 任务编号是整数」的
+        粗筛，真正的合法性（任务在不在队列、这个状态能不能这么做）由宿主的
+        embedded_queue_action 判定；动作走后台线程，结果回一条 queue_action_result。
+        """
+        act = str((msg or {}).get("act") or "").strip()
+        if act not in ("cancel", "pause", "resume", "remove"):
+            self._push_queue_action_result(False, "不支持的队列操作")
+            return
+        try:
+            tid = int((msg or {}).get("id"))
+        except (TypeError, ValueError):
+            self._push_queue_action_result(False, "任务编号无效")
+            return
+        if self._queue_act is None:
+            self._push_queue_action_result(False, "下载队列未接通")
+            return
+
+        def work():
+            try:
+                res = self._queue_act(act, tid) or {}
+            except Exception as exc:
+                res = {"ok": False, "error": str(exc)}
+            self._push_queue_action_result(bool(res.get("ok")),
+                                           str(res.get("error") or ""))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _push_queue_action_result(self, ok, error=""):
+        """把队列操作结果回给展开面板（失败显示一行红字）。"""
+        self._post_ui({"__ytdlp": "queue_action_result", "ok": bool(ok),
+                       "error": str(error or "")})
+
+    def _start_queue_loop(self):
+        """进度小条的推送线程：每秒问一次摘要，变了才发。"""
+        if self._queue_sink is None:
+            return
+        if self._queue_thread is not None and self._queue_thread.is_alive():
+            return
+        self._queue_stop = False
+        self._queue_thread = threading.Thread(target=self._queue_loop, daemon=True)
+        self._queue_thread.start()
+
+    def _queue_loop(self):
+        last = ""
+        while not self._queue_stop:
+            time.sleep(1.0)
+            if self._queue_sink is None:
+                continue
+            try:
+                data = self._queue_sink() or {}
+            except Exception:
+                data = {}
+            try:
+                sig = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                sig = repr(data)
+            if sig == last:
+                continue
+            last = sig
+            if data:
+                self._push_queue_ui(data)
 
     def _push_ui(self, items):
         """一批嗅探结果 → 当前顶层页的浮条条目。
@@ -2248,6 +2727,7 @@ class EmbeddedBrowser:
             if res.get("ok"):
                 ids = res.get("task_ids") or []
                 text = "已加入下载队列：%d 个" % (len(ids) or len(wanted))
+                self._toast(text)          # 成功开始下载：页面上给一条蓝色上浮提示
             else:
                 text = "下载失败：%s" % (res.get("error") or "未知原因")
             self._post_ui({"__ytdlp": "sniff_ui_result",
@@ -2274,7 +2754,9 @@ class EmbeddedBrowser:
                 res = {"ok": False, "error": "提交失败：%s" % e}
             if res.get("ok"):
                 ids = res.get("task_ids") or []
-                report("已加入下载队列：%d 个" % (len(ids) or 1), True)
+                text = "已加入下载队列：%d 个" % (len(ids) or 1)
+                report(text, True)
+                self._toast(text)
             else:
                 report("下载失败：%s" % (res.get("error") or "未知原因"), False,
                        str(res.get("error") or ""))
@@ -2285,6 +2767,32 @@ class EmbeddedBrowser:
         """整页下载结果 → 页面浮条状态行。"""
         self._post_ui({"__ytdlp": "sniff_ui_result", "ok": bool(ok),
                        "error": str(error or ""), "text": text})
+
+    def _submit_link_download(self, url, report):
+        """页面触发的下载：后台把浏览器给的直链交给 _link_sink，report(text, ok) 回报。
+
+        浏览器自己的那份下载已经被取消，落盘统一走宿主下载队列（进度、暂停、
+        续传、历史都在那儿）；cookie 导出与队列提交都不能占 UI 线程。
+        """
+        if self._link_sink is None:
+            report("下载通道未接通", False)
+            return
+
+        def work():
+            try:
+                res = self._link_sink(url, self._page_url) or {}
+            except Exception as e:
+                res = {"ok": False, "error": "提交失败：%s" % e}
+            if res.get("ok"):
+                ids = res.get("task_ids") or []
+                text = "已加入下载队列：%d 个" % (len(ids) or 1)
+                report(text, True)
+                self._toast("页面下载已交给下载器：" + text.split("：")[-1])
+            else:
+                report("下载失败：%s" % (res.get("error") or "未知原因"), False,
+                       str(res.get("error") or ""))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def download_page(self):
         """工具栏「下载本页」→ 当前页交给 yt-dlp 做站点解析并合并音视频。
@@ -2630,7 +3138,7 @@ class EmbeddedBrowser:
         """从 WebView2 的 CookieManager 取该 URL 会带的 cookie（含 httpOnly）。
 
         必须在非 UI 线程调用：调用线程只轮询普通 Python 状态，最多等 timeout 秒。
-        所有 WebView2 对象的访问（GetCookiesAsync、读 cookie 字段）都经 `_post_ui`
+        所有 WebView2 对象的访问（GetCookiesAsync、读 cookie 字段）都经 `_begin_ui`
         排在 UI 线程上做 —— cookie 对象在别的线程上读字段会抛 NotImplementedException
         （COM 接口转换失败）把整罐静默丢光，个别时候还会把窗口挂死。
         视图没开、内核没就绪或超时都返回空列表。
@@ -2656,7 +3164,7 @@ class EmbeddedBrowser:
             except Exception as exc:
                 box["error"] = "获取 cookie 失败：%s" % (exc,)
 
-        if not self._post_ui(kick):
+        if not self._begin_ui(kick):
             return []
         deadline = time.time() + max(0.5, float(timeout or 2.0))
         task = None
@@ -2686,7 +3194,7 @@ class EmbeddedBrowser:
                 box["error"] = "读取 cookie 失败：%s" % (exc,)
             box["read"] = True
 
-        if not self._post_ui(convert):
+        if not self._begin_ui(convert):
             return []
         while time.time() < deadline:
             if box.get("read"):
@@ -2794,12 +3302,36 @@ class EmbeddedBrowser:
         self.navigate(uri)
 
     def _on_download_starting(self, sender, args):
-        """页面直接触发的下载一律取消：整段走「下载本页」，单条走嗅探列表。"""
+        """页面直接触发的下载不再一味丢弃：取消浏览器自己那份，交给宿主下载队列。
+
+        这条直链来自 WebView2 的下载事件（不是页面世界发来的消息），可信；但仍然
+        只认 http(s)：`blob:` / `data:` / `file:` 一律拦掉并说明原因，不静默丢弃。
+        地址栏输入或站点点击都能触发这里，浮条/工具栏的「下载本页」走的是另一条
+        页面级解析通道。
+        """
+        uri = ""
         try:
-            args.Cancel = True
+            op = getattr(args, "DownloadOperation", None)
+            uri = str(getattr(op, "Uri", "") or "").strip()
+        except Exception:
+            uri = ""
+        try:
+            args.Cancel = True          # 浏览器自己的下载不落盘，统一走下载队列
         except Exception:
             pass
-        self._set_status("已取消页面触发的下载；整段视频点「下载本页」")
+        if uri.lower() in _BLANK_URLS or not is_allowed_navigation(uri):
+            self._set_status("已取消页面触发的下载：%s 不是 http(s) 地址"
+                             % _short(uri or "空地址", 40), bad=True)
+            return
+        if self._link_sink is None:
+            self._set_status("已取消页面触发的下载：下载通道未接通", bad=True)
+            return
+        self._set_status("页面触发的下载已交给下载器：%s" % _short(uri, 60), busy=True)
+        self._submit_link_download(uri, self._status_report)
+
+    def _status_report(self, text, ok, error=""):
+        """直链接管结果 → 工具栏状态栏（与「下载本页」同一套回报口吻）。"""
+        self._set_status(text, bad=not ok)
 
     # ---------------- UI 小工具 ----------------
     def _ui(self, fn):
@@ -2815,7 +3347,7 @@ class EmbeddedBrowser:
         except Exception:
             pass
 
-    def _post_ui(self, fn):
+    def _begin_ui(self, fn):
         """把 fn 排到 UI 线程执行、立刻返回（不等待）。
 
         WebView2 的 CoreWebView2Cookie 这类内核对象只能在自己的 UI 线程上读字段：

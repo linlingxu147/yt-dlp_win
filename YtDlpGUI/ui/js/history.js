@@ -1,7 +1,8 @@
 import { call, on } from './bridge.js';
 
 const STATUS = { ok: '成功', failed: '失败', stopped: '已停止', canceled: '已取消' };
-const SOURCE = { gui: '桌面', ext: '扩展', sniff: '嗅探页' };
+const SOURCE = { gui: '桌面', ext: '扩展', sniff: '嗅探页',
+                 'embedded-page': '下载本页', 'embedded-link': '页面下载' };
 
 async function refresh() {
   const r = await call('history_list');

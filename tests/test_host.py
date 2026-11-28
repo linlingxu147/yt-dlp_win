@@ -820,6 +820,140 @@ class SniffServiceTest(unittest.TestCase):
         self.assertIsNone(captured["queue_status"])
 
 
+class EmbeddedLinkTest(unittest.TestCase):
+    """页面直接触发的下载（DownloadStarting）与 API「下载本页」的 WebView2 凭据。"""
+
+    PAGE = "https://www.douyin.com/video/7679426956026187035"
+    COOKIES = [{"name": "sid", "value": "v", "domain": ".douyin.com", "path": "/"}]
+
+    def setUp(self):
+        self.mod = load_host()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.events = []
+        self.host = self.mod.Host(os.path.join(self.tmp.name, "config.json"),
+                                  emit=self.events.append)
+        self.host.mark_ready()
+        self.host.sniff_clear()
+        self.host.cfg.update({"outdir": os.path.join(self.tmp.name, "out"),
+                              "open_after": False})
+        self.jars = []
+
+    def tearDown(self):
+        for p in self.jars:
+            self.host._drop_cookie_file(p)
+        self.host.sniff_clear()
+        self.host.queue.close()
+        self.tmp.cleanup()
+
+    def _capture(self):
+        captured = []
+        self.host.queue.submit = lambda spec, exe: captured.append(spec) or len(captured)
+        return captured
+
+    def _fake_view(self, calls):
+        """只实现 export_cookies 的内嵌浏览器替身（记录被问过哪些地址）。"""
+        cookies = list(self.COOKIES)
+
+        class View:
+            def export_cookies(self, url, timeout=2.0):
+                calls.append(url)
+                return list(cookies)
+        self.host.embedded = View()
+
+    def _remember_jar(self, spec):
+        jar = str((spec.get("cfg") or {}).get("_sniff_cookie_file") or "")
+        if jar:
+            self.jars.append(jar)
+        return jar
+
+    def test_link_download_submits_direct_link(self):
+        captured = self._capture()
+        r = self.host.download_embedded_link("https://cdn.example.com/files/a.zip",
+                                             self.PAGE)
+        self.assertTrue(r["ok"])
+        spec = captured[0]
+        self.assertEqual(spec["urls"], ["https://cdn.example.com/files/a.zip"])
+        self.assertEqual(spec["cfg"]["fmt"], "b")
+        self.assertEqual(spec["cfg"]["referer"], self.PAGE)
+        self.assertTrue(spec["cfg"]["_referer_explicit"])
+        self.assertEqual(spec["source"], "embedded-link")
+
+    def test_link_download_rejects_non_http(self):
+        self._capture()
+        r = self.host.download_embedded_link("blob:https://www.douyin.com/9f0c", self.PAGE)
+        self.assertFalse(r["ok"])
+        self.assertIn("无效", r["error"])
+
+    def test_link_download_falls_back_to_url_as_referer(self):
+        captured = self._capture()
+        r = self.host.download_embedded_link("https://cdn.example.com/a.zip", "about:blank")
+        self.assertTrue(r["ok"])
+        self.assertEqual(captured[0]["cfg"]["referer"], "https://cdn.example.com/a.zip")
+
+    def test_link_download_uses_webview_cookies(self):
+        captured = self._capture()
+        calls = []
+        self._fake_view(calls)
+        r = self.host.download_embedded_link("https://cdn.example.com/a.zip", self.PAGE)
+        self.assertTrue(r["ok"])
+        jar = self._remember_jar(captured[0])
+        self.assertTrue(jar and os.path.isfile(jar))
+        self.assertEqual(captured[0]["cfg"]["_sniff_cookie_file"], jar)
+        self.assertEqual(captured[0]["ext_cookie_file"], jar)
+        self.assertEqual(calls, ["https://cdn.example.com/a.zip"])
+
+    def test_api_page_task_uses_webview_cookies(self):
+        captured = self._capture()
+        calls = []
+        self._fake_view(calls)
+        tid = self.host.submit_server_task({"url": self.PAGE, "kind": "page",
+                                            "cfg": {"fmt": "bv*+ba/b"}})
+        self.assertTrue(tid)
+        cfg = captured[0]["cfg"]
+        jar = self._remember_jar(captured[0])
+        self.assertTrue(jar)
+        self.assertEqual(cfg["cookie"], jar)
+        self.assertEqual(cfg["browser"], "（不使用）")
+        self.assertEqual(calls, [self.PAGE])
+
+    def test_api_page_task_normalizes_douyin_modal_url(self):
+        # 抖音精选弹窗页地址换成标准视频页再入队：yt-dlp 不认 jingxuan 形式，
+        # 队列/历史里也该是能直接看懂的 /video/<id>
+        captured = self._capture()
+        tid = self.host.submit_server_task({
+            "url": "https://www.douyin.com/jingxuan?modal_id=7679426956026187035",
+            "kind": "page", "cfg": {}})
+        self.assertTrue(tid)
+        self.assertEqual(captured[0]["urls"], [self.PAGE])
+
+    def test_api_page_task_keeps_supplied_cookies(self):
+        captured = self._capture()
+        calls = []
+        self._fake_view(calls)
+        tid = self.host.submit_server_task({"url": self.PAGE, "kind": "page",
+                                            "cfg": {"cookie": "C:/tmp/ext.txt"}})
+        self.assertTrue(tid)
+        self.assertEqual(captured[0]["cfg"]["cookie"], "C:/tmp/ext.txt")
+        self.assertEqual(calls, [])
+
+    def test_api_media_task_does_not_borrow_webview_cookies(self):
+        captured = self._capture()
+        calls = []
+        self._fake_view(calls)
+        tid = self.host.submit_server_task({"url": "https://cdn.example.com/a.mp4",
+                                            "kind": "media", "cfg": {}})
+        self.assertTrue(tid)
+        self.assertNotIn("cookie", captured[0]["cfg"])
+        self.assertEqual(calls, [])
+
+    def test_api_page_task_without_view_is_untouched(self):
+        captured = self._capture()
+        self.host.embedded = None
+        tid = self.host.submit_server_task({"url": self.PAGE, "kind": "page", "cfg": {}})
+        self.assertTrue(tid)
+        self.assertNotIn("cookie", captured[0]["cfg"])
+
+
 class PageFallbackTest(unittest.TestCase):
     """页面解析失败后的兜底：改用本页嗅探到的整段媒体（Host._page_fallback）。"""
 
@@ -931,6 +1065,32 @@ class PageFallbackTest(unittest.TestCase):
             self._wait_count(2)
         self.assertIn("[回退]", self._log_text(t1.id))
 
+    def test_same_page_understands_douyin_modal_form(self):
+        # 精选弹窗页与标准视频页是同一个作品：「下载本页」交给 yt-dlp 的是
+        # /video/<id>，而弹窗页里登记下来的条目记的是 /jingxuan?modal_id=<id>
+        modal = "https://www.douyin.com/jingxuan?modal_id=7679426956026187035"
+        self.assertTrue(self.mod.same_page(modal, self.PAGE))
+        self.assertTrue(self.mod.same_page(self.PAGE, modal))
+        self.assertFalse(self.mod.same_page(modal, "https://www.douyin.com/video/1"))
+        self.assertFalse(self.mod.same_page(modal, "https://other.example/video/1"))
+
+    def test_page_fallback_from_modal_page_counts_as_this_page(self):
+        # 弹窗页登记的条目要算「本页」，不能退化成「同站点」
+        modal = "https://www.douyin.com/jingxuan?modal_id=7679426956026187035"
+        self._register([{"url": self.MEDIA, "kind": "type=video/mp4", "size": 1336658}],
+                       page=modal)
+        items, exact = self.host._page_media_items(self.PAGE)
+        self.assertTrue(exact)
+        self.assertEqual([it["url"] for it in items], [self.MEDIA])
+        p1, p2 = self._patched([1, 0])
+        with p1, p2:
+            r = self.host.download_embedded_page(self.PAGE)
+            t1 = self._settled(r["task_ids"][0])
+            self._wait_count(2)
+        log = self._log_text(t1.id)
+        self.assertIn("改用本页嗅探到的整段媒体", log)
+        self.assertNotIn("同站点", log)
+
     def test_page_fallback_prefers_biggest_over_static_asset(self):
         # 抖音页自己的静态素材（`uuu_265.mp4`）也是整段 MP4，体积小得多
         self._register([{"url": "https://lf-douyin-pc-web.douyinstatic.com/obj/uuu_265.mp4",
@@ -989,17 +1149,244 @@ class PageFallbackTest(unittest.TestCase):
         self.assertEqual(len(self.host.queue.snapshot()["tasks"]), 1)
         self.assertIn("没有可用的整段媒体", self._log_text(t1.id))
 
-    def test_normal_task_failure_does_not_fall_back(self):
+    def test_desktop_task_falls_back_for_its_own_page(self):
+        # 桌面端粘贴的页面链接失败时，只要内嵌浏览器开过同一页并嗅探到整段媒体，也兜底
         self._register([{"url": self.MEDIA, "kind": "type=video/mp4", "size": 1336658}])
-        cfg = dict(self.host.cfg)
         p1, p2 = self._patched([1, 0])
         with p1, p2:
-            r = self.host.start_download([self.PAGE], cfg)
+            r = self.host.start_download([self.PAGE], dict(self.host.cfg))
             self.assertTrue(r["ok"], r)
+            t1 = self._settled(r["task_ids"][0])
+            tasks = self._wait_count(2)
+            fb = [t for t in tasks if t["id"] != t1.id][0]
+        self.assertEqual(t1.source, "gui")
+        self.assertEqual(t1.state, "failed")
+        self.assertEqual(fb["urls"], [self.MEDIA])
+        self.assertEqual(fb["source"], "sniff")
+        self.assertIn("改用本页嗅探到的整段媒体", self._log_text(t1.id))
+
+    def test_desktop_task_ignores_sibling_page_items(self):
+        # 同站点但不同页面（信息流首页）的条目不能顶替桌面端粘贴的那条链接
+        self._register([{"url": self.MEDIA, "kind": "type=video/mp4", "size": 1336658}],
+                       page="https://www.douyin.com/")
+        p1, p2 = self._patched([1, 0])
+        with p1, p2:
+            r = self.host.start_download([self.PAGE], dict(self.host.cfg))
             t1 = self._settled(r["task_ids"][0])
         self.assertEqual(t1.state, "failed")
         self.assertEqual(len(self.host.queue.snapshot()["tasks"]), 1)
-        self.assertNotIn("改用本页嗅探到的整段媒体", self._log_text(t1.id))
+        self.assertIn("没有可用的整段媒体", self._log_text(t1.id))
+
+    def test_sniff_task_failure_does_not_fall_back(self):
+        self._register([{"url": self.MEDIA, "kind": "type=video/mp4", "size": 1336658}])
+        items = self.host._sniff_api().sniff_items_json()["items"]
+        p1, p2 = self._patched([1, 0])
+        with p1, p2:
+            r = self.host.sniff_download(items)
+            self.assertTrue(r["ok"], r)
+            t1 = self._settled(r["task_ids"][0])
+        self.assertEqual(t1.source, "sniff")
+        self.assertEqual(len(self.host.queue.snapshot()["tasks"]), 1)
+        self.assertNotIn("[回退]", self._log_text(t1.id))
+
+
+class EmbeddedQueueTest(unittest.TestCase):
+    """内嵌浏览器右上角进度小条：摘要字段与「点开下载队列」。"""
+
+    def setUp(self):
+        self.mod = load_host()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.events = []
+        self.host = self.mod.Host(os.path.join(self.tmp.name, "config.json"),
+                                  emit=self.events.append)
+        self.host.mark_ready()
+        self.host.cfg.update({"outdir": os.path.join(self.tmp.name, "out"),
+                              "open_after": False})
+
+    def tearDown(self):
+        self.host.queue.close()
+        self.tmp.cleanup()
+
+    def test_summary_fields_on_empty_queue(self):
+        s = self.host.queue_summary()
+        for key in ("running", "queued", "failed", "done", "pct", "speed", "label"):
+            self.assertIn(key, s)
+        self.assertEqual((s["running"], s["queued"], s["failed"], s["done"]), (0,) * 4)
+        self.assertEqual((s["pct"], s["speed"], s["label"]), (0, "", ""))
+
+    def test_summary_reads_running_task(self):
+        self.host.queue.snapshot = lambda: {
+            "running": 1, "queued": 2, "paused": 0, "max": 3,
+            "tasks": [{"state": "done"}, {"state": "failed"},
+                      {"state": "running", "pct": 42.6, "speed": "1.2 MB/s",
+                       "title": "片子"}]}
+        s = self.host.queue_summary()
+        self.assertEqual(s["running"], 1)
+        self.assertEqual(s["queued"], 2)
+        self.assertEqual(s["failed"], 1)
+        self.assertEqual(s["done"], 1)
+        self.assertEqual(s["pct"], 43)
+        self.assertEqual(s["speed"], "1.2 MB/s")
+        self.assertEqual(s["label"], "片子")
+
+    def test_summary_falls_back_to_url_label(self):
+        self.host.queue.snapshot = lambda: {
+            "running": 1, "queued": 0,
+            "tasks": [{"state": "running", "pct": None,
+                       "urls": ["https://cdn.example.com/a.mp4"]}]}
+        s = self.host.queue_summary()
+        self.assertEqual(s["label"], "https://cdn.example.com/a.mp4")
+        self.assertEqual(s["pct"], 0)
+
+    def test_open_queue_without_browser(self):
+        self.host.embedded = None
+        r = self.host.open_embedded_queue()
+        self.assertFalse(r["ok"])
+        self.assertIn("内嵌浏览器", r["error"])
+
+    def test_open_queue_returns_and_switches_tab(self):
+        calls = []
+
+        class View:
+            def return_to_app(self):
+                calls.append(True)
+
+        self.host.embedded = View()
+        r = self.host.open_embedded_queue()
+        self.host.pump_once()
+        self.assertTrue(r["ok"])
+        self.assertEqual(calls, [True])
+        self.assertIn({"type": "open_tab", "tab": "download"}, self.events)
+
+    def test_open_browser_passes_both_queue_sinks(self):
+        got = {}
+
+        class Fake:
+            def __init__(self, *args, **kw):
+                got["args"] = args
+
+            def open(self, window=None, theme=""):
+                return {"ok": True}
+
+        class Mod:
+            EmbeddedBrowser = Fake
+
+        sys.modules["embedded"] = Mod()
+        try:
+            r = self.host.open_embedded_browser(None)
+        finally:
+            sys.modules.pop("embedded", None)
+        self.assertTrue(r["ok"])
+        self.assertEqual(got["args"][:4],
+                         (self.host.register_embedded_sniff,
+                          self.host.download_embedded_sniff,
+                          self.host.download_embedded_page,
+                          self.host.download_embedded_link))
+        self.assertEqual(got["args"][4:],
+                         (self.host.queue_summary, self.host.open_embedded_queue,
+                          self.host.embedded_queue_action))
+
+    def test_summary_lists_recent_tasks_newest_first(self):
+        rows = [{"id": i, "state": "done", "pct": 100, "title": "第%d条" % i,
+                 "urls": ["https://cdn.example.com/%d.mp4" % i]} for i in range(1, 11)]
+        self.host.queue.snapshot = lambda: {"running": 0, "queued": 0, "tasks": rows}
+        s = self.host.queue_summary()
+        self.assertEqual(s["total"], 10)
+        self.assertEqual(len(s["tasks"]), self.mod.Host.QUEUE_ROWS_MAX)
+        ids = [t["id"] for t in s["tasks"]]
+        self.assertEqual(ids, [10, 9, 8, 7, 6, 5, 4, 3])
+        first = s["tasks"][0]
+        for key in ("id", "label", "state", "pct", "speed", "eta", "size", "file"):
+            self.assertIn(key, first)
+        self.assertEqual(first["label"], "第10条")
+
+    def test_summary_row_label_falls_back_to_url(self):
+        self.host.queue.snapshot = lambda: {
+            "running": 0, "queued": 0,
+            "tasks": [{"id": 1, "state": "failed",
+                       "urls": ["https://cdn.example.com/very/long/path/a.mp4"]}]}
+        row = self.host.queue_summary()["tasks"][0]
+        self.assertEqual(row["label"], "https://cdn.example.com/very/long/path/a.mp4")
+        self.assertEqual(row["pct"], 0)
+
+    def _running_task(self, wait=5.0):
+        """造一条真的在跑的任务：执行器按队列契约收一个 task，暂停/取消时退出。"""
+        release = threading.Event()
+
+        def exe(task):
+            while not release.is_set():
+                if task.cancel_requested or task.pause_requested:
+                    return
+                task.pstate["pct"] = min(95.0, float(task.pstate.get("pct") or 0.0) + 5.0)
+                task.pstate["speed"] = "1.00MiB/s"
+                time.sleep(0.05)
+            task.exit_code = 0        # 与真实执行器一致：正常跑完才记 done
+
+        tid = self.host.queue.submit({"urls": ["https://cdn.example.com/a.mp4"],
+                                      "cfg": {}, "outdir": self.host.cfg["outdir"],
+                                      "source": "gui"}, exe)
+        for _ in range(int(wait / 0.01)):
+            task = self.host.queue.get(tid)
+            if task is not None and task.state == "running" and task.pstate.get("pct"):
+                break
+            time.sleep(0.01)
+        return tid, release
+
+    def _wait_state(self, tid, states, wait=5.0):
+        for _ in range(int(wait / 0.01)):
+            task = self.host.queue.get(tid)
+            if task is not None and task.state in states:
+                return task.state
+            time.sleep(0.01)
+        task = self.host.queue.get(tid)
+        return task.state if task is not None else None
+
+    def test_queue_action_unknown_action_rejected(self):
+        r = self.host.embedded_queue_action("drop", 1)
+        self.assertFalse(r["ok"])
+        self.assertIn("不支持", r["error"])
+
+    def test_queue_action_bad_id_rejected(self):
+        r = self.host.embedded_queue_action("cancel", "abc")
+        self.assertFalse(r["ok"])
+        self.assertIn("编号", r["error"])
+
+    def test_queue_action_missing_task_rejected(self):
+        r = self.host.embedded_queue_action("cancel", 999)
+        self.assertFalse(r["ok"])
+        self.assertIn("不在队列", r["error"])
+
+    def test_queue_action_pause_and_resume(self):
+        tid, release = self._running_task()
+        try:
+            r = self.host.embedded_queue_action("pause", tid)
+            self.assertTrue(r["ok"])
+            self.assertEqual(self._wait_state(tid, ("paused",)), "paused")
+            r = self.host.embedded_queue_action("resume", tid)
+            self.assertTrue(r["ok"])
+            self.assertIn(self._wait_state(tid, ("running", "queued")),
+                          ("running", "queued"))
+        finally:
+            release.set()
+            self.host.queue.close()
+
+    def test_queue_action_cancel_running_task(self):
+        tid, release = self._running_task()
+        try:
+            r = self.host.embedded_queue_action("cancel", tid)
+            self.assertTrue(r["ok"])
+            self.assertEqual(self._wait_state(tid, ("canceled",)), "canceled")
+        finally:
+            release.set()
+            self.host.queue.close()
+
+    def test_queue_action_cancel_finished_removes_row_only(self):
+        tid, release = self._running_task()
+        release.set()
+        self.assertEqual(self._wait_state(tid, ("done",)), "done")
+        r = self.host.embedded_queue_action("cancel", tid)
+        self.assertTrue(r["ok"])
+        self.assertIsNone(self.host.queue.get(tid))
 
 
 class UpdateMirrorFlowTest(unittest.TestCase):
